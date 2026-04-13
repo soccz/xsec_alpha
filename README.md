@@ -173,7 +173,7 @@ BTC 7d return × 7d vol로 4구간 분류:
 
 ---
 
-### 10. Long 실행 가능성 검증
+### 10. Long 실행 가능성 검증 — 첫 시도와 실패
 
 같은 계약(6h, lag=1, buffer=10)에서 long-only 5를 테스트:
 
@@ -187,6 +187,174 @@ BTC 7d return × 7d vol로 4구간 분류:
 | 음수 윈도우 | 3/6 |
 
 **판정:** IC는 있지만 long-only로 수익 전환 실패. 현재 모델은 **short 신호 전문**.
+
+---
+
+### 10-1. Long 전용 모델 연구 — v1 (momentum/trend 접근)
+
+short 모델이 short 전문이므로, **long은 완전히 별도 모델로 분리**하기로 결정.
+
+**v1 설계 가설:** "short 모델이 역추세(reversal)라면, long 모델은 순추세(momentum/trend)로 가야 한다."
+
+v1 팩터 세트:
+- momentum_12h, momentum_24h, breakout_24h, volume_surge_6h
+- bullish_order_flow, volatility_inv_24h, binance_lead_1h
+
+BTC 레짐 게이트 추가: bull(BTC 7d > 0%, 30d > -10%)일 때만 long 모델 활성.
+
+**v1 holdout 결과:**
+| 지표 | 값 |
+|------|-----|
+| Holdout IC | +0.1766 |
+| t-stat | 5.99 |
+| Hit rate | 72.7% |
+| pred_std | 0.0027 (경고: 근상수 예측) |
+
+겉으로는 좋아 보였다. **하지만 13개 에이전트 다각도 감사에서 심각한 문제 발견:**
+
+---
+
+### 10-2. 다각도 감사 — v1의 근본 결함 발견
+
+**20+ 에이전트, 4라운드 검증** 결과:
+
+**1) 모멘텀 IC가 전 구간에서 음수:**
+| 팩터 | 6h | 12h | 24h | 48h | 72h |
+|------|-----|------|------|------|------|
+| momentum_12h | -0.080 | -0.074 | -0.082 | -0.070 | -0.059 |
+| momentum_24h | -0.071 | -0.068 | -0.065 | -0.055 | — |
+| relative_strength_6h | -0.093 | -0.073 | -0.068 | -0.058 | -0.048 |
+| vol_weighted_mom_6h | -0.085 | -0.068 | -0.062 | -0.052 | -0.039 |
+
+**어떤 호라이즌에서도 모멘텀 IC가 양수로 전환되지 않았다.** Bull 레짐에서도 크립토는 단기 mean-reversion이 지배적.
+
+**2) 모델이 자동으로 부호를 뒤집고 있었음:**
+- Ridge가 음수 IC 팩터에 음수 계수를 부여 → 사실상 reversal 신호로 사용
+- "long 모델"이라고 불렀지만 실체는 "bull 레짐 한정 reversal 모델"
+
+**3) Long leg는 사실상 작동 안 함:**
+- Backtest long hit rate: **43.6%** (동전 던지기보다 나쁨)
+- 수익의 **90.5%가 short leg**에서 발생
+- Long avg return: +0.0008/period (거의 제로)
+
+**4) 콜리니어리티:**
+- momentum_12h × momentum_24h: r=0.633
+- momentum_12h × breakout_24h: r=0.636
+- 3개 팩터가 사실상 같은 정보를 중복 표현
+
+**5) pred_std 문제:**
+- pred_std=0.0027 (top5-bottom5 gap이 1.03%에 불과)
+- 원인은 정규화가 아니라 **피처 예측력 부재** (R²=1%)
+- alpha를 1.0→0.01로 바꿔도 계수가 동일
+
+**핵심 결론:**
+> "long이 안 되는 게 아니라, short 철학의 변형판을 long에 얹은 것이 문제였다."
+
+---
+
+### 10-3. 대안 팩터 탐색 — "조용한 코인이 터진다"
+
+10개 대안 팩터를 bull 레짐 + top100에서 측정한 결과, **range_contraction_12h**가 발견됐다.
+
+**IC > +0.05 달성 팩터 (long 시그널로 유효):**
+| 팩터 | 6h IC | 12h IC | 24h IC | 해석 |
+|------|-------|--------|--------|------|
+| **range_contraction_12h** | +0.109 | +0.137 | **+0.179** | 고저폭 압축 → 폭발 전 횡보 |
+| volatility_inv_24h | +0.112 | +0.144 | +0.168 | 저변동성 프리미엄 |
+| binance_lead_1h | +0.117 | +0.088 | +0.064 | 글로벌 선행 (단기) |
+| reversal_1h | +0.102 | +0.078 | +0.062 | 단기 딥 매수 |
+| reversal_4h | +0.094 | +0.073 | +0.062 | 중기 딥 매수 |
+
+**IC < 0 탈락 팩터:**
+| 팩터 | 결과 |
+|------|------|
+| dip_from_7d_high | 추가 하락 예측 |
+| upside_capture_24h | 과열 신호 |
+| recovery_speed_6h | 이미 반등 완료 |
+
+**range_contraction_12h 안정성 검증 (4분기 split):**
+| 구간 | 6h IC | 12h IC | 24h IC |
+|------|-------|--------|--------|
+| Q1 | +0.097 | +0.113 | +0.155 |
+| Q2 | +0.102 | +0.122 | +0.193 |
+| Q3 | +0.095 | +0.136 | +0.170 |
+| Q4 | +0.141 | +0.178 | +0.198 |
+
+4개 분기 전부 양수, 모든 호라이즌에서. Rolling 7d 최솟값도 양수. 운이 아님.
+
+**콜리니어리티 체크:**
+- range_contraction × vol_inv: r=**0.785** → 둘 다 "조용한 코인"을 측정, 하나만 남겨야 함
+- range_contraction IC가 더 높으므로 채택, vol_inv 제거
+- 나머지 쌍(reversal_1h × reversal_4h = 0.411, reversal_1h × binance_lead = 0.414)은 허용 범위
+
+---
+
+### 10-4. Long v3 — compression + reversal 모델
+
+**설계 원칙:**
+- 모멘텀/트렌드 팩터 전부 제거 (전 호라이즌 음수 IC)
+- range_contraction이 핵심 (IC +0.179, 4분기 안정)
+- reversal은 bull 레짐에서도 양수 IC → 유지
+- 호라이즌 12h (range_contraction이 12h에서 더 강하고, 24h는 holdout 시점 부족)
+
+**v3 팩터 세트 (4개):**
+| 팩터 | IC (12h, bull) | 역할 |
+|------|---------------|------|
+| range_contraction_12h | +0.137 | 고저폭 압축 → 다음 폭발 |
+| reversal_1h | +0.078 | 단기 딥 매수 |
+| reversal_4h | +0.073 | 중기 딥 매수 |
+| binance_lead_1h | +0.088 | 글로벌 선행 |
+
+**4모델 비교 (holdout, 12h horizon):**
+| 모델 | IC | t-stat | Net spread | Pred std |
+|------|-----|--------|------------|----------|
+| Ridge | +0.1835 | 3.16 | +0.0198 | 0.0031 |
+| XGBoost | +0.1677 | 3.61 | +0.0115 | 0.0059 |
+| LightGBM | +0.1787 | 4.56 | +0.0195 | 0.0050 |
+| **Ensemble** | **+0.2158** | **4.24** | **+0.0238** | 0.0034 |
+
+**Ensemble(Ridge+LightGBM) 채택.**
+
+**v3 vs v1 비교:**
+| 지표 | v1 (momentum) | v3 (compression) |
+|------|--------------|------------------|
+| 팩터 설계 | 순추세 (IC 전부 음수) | 압축+반전 (IC 전부 양수) |
+| Ridge 계수 부호 | 혼재 (모델이 반전시킴) | **전부 양수** (설계=결과 일치) |
+| Long hit rate | 43.6% | **52.6%** |
+| Long vs Random | 미측정 | **73.8%에서 초과** (p<0.0001) |
+| Holdout IC | +0.1766 | **+0.2158** |
+
+**Long vs Random 검증 (122기간):**
+- 모델 top5 vs 랜덤 5: 초과수익 +0.57%/period
+- 73.8%의 기간에서 모델이 랜덤 초과
+- t-stat=7.34, p<0.0001
+- Long 모델이 랜덤보다 유의미하게 나음
+
+---
+
+### 10-5. Long 모델 현재 상태 — watch 유지
+
+**확인된 것:**
+- v3 설계와 결과가 일치한다 (계수 전부 양수, IC 전부 양수)
+- Bull 레짐에서 랜덤 대비 유의미한 long 선택 능력
+- Short 모델과 독립적인 12h cadence로 운영 가능
+
+**아직 부족한 것:**
+- Holdout 11~22 시점 (6일) — 60+ 필요
+- pred_std=0.0034 — 피처 예측력 한계 (R²=1%)
+- Long hit rate 52.6% — 유의미하지만 strong은 아님
+- Long contribution 18% — 수익 대부분은 여전히 short leg
+
+**승격 조건 (config에 명시):**
+- holdout >= 60 timestamps
+- pred_std >= 0.01
+- long-only IC > 0
+
+**EXECUTION_MODE = "watch"** — 스코어링하고 CSV/텔레그램에 WATCH_LONG으로 기록하되, 실제 매매 신호로는 올리지 않음. 조건 충족 시 `config.py`에서 `"long_only"`로 전환.
+
+**핵심 교훈:**
+> "크립토에서 bull 레짐이라도 단기(6h~72h) 모멘텀은 mean-reversion에 밀린다.
+> Long 신호는 '올라갈 코인'이 아니라 '조용해진 뒤 터질 코인'에서 나온다."
 
 ---
 
@@ -237,39 +405,43 @@ Bitget USDT perp 공개 API로 실제 숏 가능 여부 확인:
 
 ---
 
-### 14. 라이브 프로브 계약 (2026-04-13 확정)
+### 14. 라이브 프로브 계약 (2026-04-14 갱신)
 
-| 항목 | 값 |
-|------|-----|
-| 분석 데이터 | Upbit KRW (200+ 코인) |
-| 활성 유니버스 | 24h 거래대금 top 100 |
-| 실행 대상 | Bitget USDT perp tradable만 |
-| Horizon | 6h |
-| 모델 | Ensemble (Ridge + LightGBM) |
-| SHORT | 5개 (실행) |
-| LONG | 5개 (watch-only, 참고용) |
-| Rebal buffer | 10 |
-| 연구 기준 short cost | 10bps baseline / 20bps stress |
-| 기간 | 2~4주 |
-| 변경 금지 | 이 기간 중 팩터/호라이즌/포지션 수 조정 없음 |
+| 항목 | Short 모델 | Long 모델 |
+|------|-----------|-----------|
+| 분석 데이터 | Upbit KRW (200+ 코인) | 동일 |
+| 활성 유니버스 | 24h 거래대금 top 100 | 동일 |
+| 실행 대상 | Bitget USDT perp tradable | 동일 |
+| Horizon | **6h** | **12h** |
+| 모델 | Ensemble (Ridge + LightGBM) | Ensemble (Ridge + LightGBM) |
+| 팩터 | reversal, volatility_inv, kimchi_inv, binance_lead, order_flow_bear | range_contraction, reversal_1h/4h, binance_lead |
+| 포지션 | **SHORT 5 (실행)** | **WATCH LONG 5 (관찰)** |
+| 리밸런싱 | 매 run (6h마다) | 12h마다 (11:00/23:00 UTC) |
+| 오프사이클 동작 | 새로 스코어링 | 이전 포지션 carry |
+| 레짐 게이트 | 없음 (전 레짐 실행) | BTC 7d > 0% AND 30d > -10% |
+| EXECUTION_MODE | short_only | **watch** (승격 조건 충족 전까지) |
 
-**텔레그램 알림 구성:**
-- 이전 추천 성적표 (SHORT 실현 손익)
-- 현재 추천: SHORT 5 (실행) + WATCH LONG 5 (참고)
-- 각 코인: 현재가, 목표가, 손절가, 신호 강도
+**관측 인프라:**
+- `output/recommendation_ledger.csv` — 만기 포지션 실현 손익 자동 누적
+- `output/ic_history.json` — short 6h IC 추적
+- `output/ic_history_long.json` — long 12h IC 추적 (bull 레짐만)
+- 텔레그램: 이전 추천 성적표 + SHORT 5 실행 + WATCH LONG 5 참고
 
-**프로브 종료 후 판단 기준:**
-- 실제 net PnL
-- 체결 가능률
-- 실제 비용 (슬리피지 + 펀딩비)
-- 종목 의존도
+**Long 승격 조건 (config.py에 명시):**
+- holdout timestamps >= 60
+- pred_std >= 0.01
+- long-only IC > 0
+- 충족 시 `LongModel.EXECUTION_MODE = "long_only"`로 전환
 
 ---
 
-### 15. 다음 단계 (프로브 병렬)
+### 15. 다음 단계
 
 - [ ] 2~4주 라이브 프로브 실행 및 데이터 수집
-- [ ] Long 전용 모델 연구 (별도 팩터/타깃/레짐 게이트)
+- [x] Long 전용 모델 연구 → v3 완성 (compression+reversal, 12h, Ensemble)
+- [ ] Long 승격 판정: 60+ holdout timestamps 축적 후 재평가
+- [ ] app.py 대시보드에 ledger/next_rebalance/refresh_reason 노출
+- [ ] Short 모델 재저장 (Ridge feature names 경고 제거)
 - [ ] 360일+ 데이터로 추세장 포함 재검증
 - [ ] 프로브 종료 후: 계속/조정/중단 결정
 
@@ -278,24 +450,31 @@ Bitget USDT perp 공개 API로 실제 숏 가능 여부 확인:
 ## 시스템 구조
 
 ```
-Upbit API ──→ SQLite ──→ 8개 팩터 (크로스섹션 z-score)
+Upbit API ──→ SQLite ──→ 팩터 계산 (크로스섹션 z-score)
                               │
 Binance API ─────────────────→│
                               ↓
-                    XGBoost/LGBM/Ridge 앙상블
-                              │
-                    Bitget tradable 필터
-                              │
                  ┌─────────────┴─────────────┐
                  │                           │
-          SHORT 5 (실행)           WATCH LONG 5 (참고)
+          Short 모델 (6h)          Long 모델 (12h)
+          reversal, vol_inv,       range_contraction,
+          kimchi, binance_lead     reversal, binance_lead
+          order_flow_bear          + BTC 레짐 게이트
+                 │                           │
+          Bitget tradable 필터     Bitget tradable 필터
+                 │                           │
+          SHORT 5 (실행)          WATCH LONG 5 (관찰)
                  │                           │
                  └─────────────┬─────────────┘
                                │
                     CSV + 텔레그램 + 대시보드
+                               │
+                    실현 성과 ledger (자동 누적)
 ```
 
-**스케줄:** systemd timer, 12h 간격 (00:00, 12:00 KST)
+**스케줄:** systemd timer, 6h 간격
+- Short: 매 run 리밸런스
+- Long: 12h마다 리밸런스 (오프사이클은 carry)
 
 ---
 
@@ -305,23 +484,24 @@ Binance API ─────────────────→│
 # 데이터 수집
 python scripts/update_data.py --days 120
 
-# IC 측정
-python scripts/measure_ic.py --days 120 --top-liquidity 100
+# --- Short 모델 ---
+python scripts/measure_ic.py --days 120 --top-liquidity 100                  # IC 측정
+python scripts/train.py --days 120 --model-type ensemble                     # 학습
+python scripts/evaluate_holdout.py --days 120 --execution-lag-bars 1         # Holdout 평가
+python scripts/backtest.py --days 90 --long-n 5 --short-n 5                  # 백테스트
 
-# 모델 학습
-python scripts/train.py --days 120 --model-type ensemble
+# --- Long 모델 (자동 12h horizon, bull 레짐 필터) ---
+python scripts/measure_ic.py --days 120 --side long --top-liquidity 100      # IC 측정
+python scripts/train.py --days 120 --side long --model-type ensemble         # 학습
+python scripts/evaluate_holdout.py --days 120 --side long --long-n 5 --short-n 5  # Holdout 평가
+python scripts/backtest.py --days 90 --side long --long-n 5 --short-n 5      # 백테스트
 
-# Holdout 평가
-python scripts/evaluate_holdout.py --days 120 --horizon 6 --execution-lag-bars 1
+# --- IC 모니터링 (short + long 동시) ---
+python scripts/track_ic.py --days 30 --side both
 
-# Walk-forward 백테스트
-python scripts/backtest_wf.py --days 180 --train-days 60 --test-days 14 --rebalance-hours 6 --execution-lag-bars 1
-
-# 추천 생성 (dry-run)
-python scripts/fetch_and_rank.py --dry-run --no-telegram
-
-# 추천 생성 (실제 전송)
-python scripts/fetch_and_rank.py
+# --- 추천 생성 ---
+python scripts/fetch_and_rank.py --dry-run --no-telegram   # dry-run
+python scripts/fetch_and_rank.py                           # 실제 전송 + ledger 갱신
 ```
 
 ---
