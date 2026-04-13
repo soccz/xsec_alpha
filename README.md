@@ -463,34 +463,6 @@ Binance API ─────────────────→│
 
 ---
 
-## 실행 방법
-
-```bash
-# 데이터 수집
-python scripts/update_data.py --days 120
-
-# --- Short 모델 ---
-python scripts/measure_ic.py --days 120 --top-liquidity 100                  # IC 측정
-python scripts/train.py --days 120 --model-type ensemble                     # 학습
-python scripts/evaluate_holdout.py --days 120 --execution-lag-bars 1         # Holdout 평가
-python scripts/backtest.py --days 90 --long-n 5 --short-n 5                  # 백테스트
-
-# --- Long 모델 (자동 12h horizon, bull 레짐 필터) ---
-python scripts/measure_ic.py --days 120 --side long --top-liquidity 100      # IC 측정
-python scripts/train.py --days 120 --side long --model-type ensemble         # 학습
-python scripts/evaluate_holdout.py --days 120 --side long --long-n 5 --short-n 5  # Holdout 평가
-python scripts/backtest.py --days 90 --side long --long-n 5 --short-n 5      # 백테스트
-
-# --- IC 모니터링 (short + long 동시) ---
-python scripts/track_ic.py --days 30 --side both
-
-# --- 추천 생성 ---
-python scripts/fetch_and_rank.py --dry-run --no-telegram   # dry-run
-python scripts/fetch_and_rank.py                           # 실제 전송 + ledger 갱신
-```
-
----
-
 ## 라이선스
 
 개인 연구용. 투자 조언이 아님.
