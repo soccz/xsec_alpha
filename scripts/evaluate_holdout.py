@@ -51,6 +51,7 @@ def main():
     parser.add_argument("--fee-bps",       type=float, default=5.0,                   help="One-way fee in bps")
     parser.add_argument("--slippage-bps",  type=float, default=0.0,                   help="One-way slippage assumption in bps")
     parser.add_argument("--short-extra-cost-bps", type=float, default=10.0,          help="Additional per-period cost charged to the short leg (research baseline: 10bps)")
+    parser.add_argument("--side",              type=str,   default="short", choices=["short", "long"], help="Model side: short or long")
     args = parser.parse_args()
 
     logger.info(
@@ -64,8 +65,8 @@ def main():
     # ------------------------------------------------------------------
     # 1. Build dataset (same split as training)
     # ------------------------------------------------------------------
-    logger.info("Building dataset...")
-    ds = build_dataset(days=args.days, holdout_ratio=args.holdout_ratio, horizon=args.horizon)
+    logger.info("Building dataset (side=%s)...", args.side)
+    ds = build_dataset(days=args.days, holdout_ratio=args.holdout_ratio, horizon=args.horizon, side=args.side)
 
     X_holdout          = ds["X_holdout"]
     closes             = ds["closes"]
@@ -108,6 +109,12 @@ def main():
     # 2. Load model
     # ------------------------------------------------------------------
     model_path = args.model_path
+    # Only auto-redirect to long model when user didn't explicitly set --model-path
+    user_set_model_path = any(
+        a in sys.argv for a in ("--model-path",)
+    ) or any(a.startswith("--model-path=") for a in sys.argv)
+    if not user_set_model_path and args.side == "long":
+        model_path = "models/xsec_long.pkl"
     if not os.path.isabs(model_path):
         model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), model_path)
 

@@ -56,7 +56,8 @@ def _confidence(score, std):
 def format_report(longs, shorts, timestamp, prices: dict = None,
                   horizon_h: int = 6, all_scores=None, min_sigma: float = 1.0,
                   capital: float = None, stop_loss_pct: float = None,
-                  long_header: str = "LONG", long_watch_only: bool = False) -> str:
+                  long_header: str = "LONG", long_watch_only: bool = False,
+                  long_horizon_h: int | None = None, short_horizon_h: int | None = None) -> str:
     """
     Format a trading report. Only shows coins above min_sigma confidence.
 
@@ -74,6 +75,14 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
 
     prices = prices or {}
     ts_str = str(timestamp)[:16]
+
+    long_horizon_h = long_horizon_h or horizon_h
+    short_horizon_h = short_horizon_h or horizon_h
+    header_horizon = (
+        f"L{long_horizon_h}h / S{short_horizon_h}h"
+        if long_horizon_h != short_horizon_h
+        else f"{horizon_h}h"
+    )
 
     # Calculate std from all scores for confidence levels
     if all_scores is not None and len(all_scores) > 0:
@@ -99,7 +108,7 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━",
         f"  📊 <b>xsec_alpha</b>",
-        f"  <code>{ts_str} | {horizon_h}h</code>",
+        f"  <code>{ts_str} | {header_horizon}</code>",
         "━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
@@ -114,7 +123,7 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
     # LONG section
     if filtered_longs:
         long_icon = "🟡" if long_watch_only else "🟢"
-        lines.append(f"{long_icon} <b>{long_header} ({len(filtered_longs)})</b>")
+        lines.append(f"{long_icon} <b>{long_header} ({len(filtered_longs)})</b> <code>{long_horizon_h}h</code>")
         lines.append("")
         for i, (mkt, score) in enumerate(filtered_longs, 1):
             coin = mkt.replace("KRW-", "")
@@ -142,12 +151,12 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
     else:
         empty_label = long_header if long_watch_only else "LONG"
         empty_icon = "🟡" if long_watch_only else "🟢"
-        lines.append(f"{empty_icon} <b>{empty_label}</b> — 신뢰할 만한 신호 없음")
+        lines.append(f"{empty_icon} <b>{empty_label}</b> <code>{long_horizon_h}h</code> — 신뢰할 만한 신호 없음")
         lines.append("")
 
     # SHORT section
     if filtered_shorts:
-        lines.append(f"🔴 <b>SHORT ({len(filtered_shorts)})</b>")
+        lines.append(f"🔴 <b>SHORT ({len(filtered_shorts)})</b> <code>{short_horizon_h}h</code>")
         lines.append("")
         for i, (mkt, score) in enumerate(filtered_shorts, 1):
             coin = mkt.replace("KRW-", "")
@@ -168,7 +177,7 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
                 lines.append(f"  {icon} <b>{coin}</b>  (<b>{exp_pct:+.2f}%</b>)")
         lines.append("")
     else:
-        lines.append("🔴 <b>SHORT</b> — 신뢰할 만한 신호 없음")
+        lines.append(f"🔴 <b>SHORT</b> <code>{short_horizon_h}h</code> — 신뢰할 만한 신호 없음")
         lines.append("")
 
     # Legend

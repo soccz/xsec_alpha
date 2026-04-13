@@ -73,6 +73,22 @@ def _compute_score(latest_factors: "pd.DataFrame", args) -> "pd.Series":
         return latest_factors.mean(axis=1)
 
 
+def _load_previous_recommendations(path: str) -> pd.DataFrame:
+    try:
+        if os.path.exists(path):
+            return pd.read_csv(os.path.realpath(path))
+    except Exception as e:
+        logger.warning(f"Could not load previous recommendations ({e})")
+    return pd.DataFrame()
+
+
+def _is_rebalance_slot(ts, horizon_h: int, anchor_hour_utc: int) -> bool:
+    if horizon_h <= 0:
+        return True
+    ts_hour = pd.Timestamp(ts).tz_convert("UTC").hour if pd.Timestamp(ts).tzinfo else pd.Timestamp(ts).hour
+    return ((ts_hour - anchor_hour_utc) % horizon_h) == 0
+
+
 def _run(args):
     logger.info("=== fetch_and_rank START ===")
 
@@ -87,9 +103,12 @@ def _run(args):
         load_and_pivot,
         load_binance_pivot,
         compute_factors,
+        compute_long_factors,
+        compute_btc_regime,
         crosssection_zscore,
         build_top_liquidity_universe_index,
         filter_long_frame_by_universe,
+        LONG_CALENDAR_COLS,
     )
 
     closes, opens, highs, lows, volumes = load_and_pivot(days=30)
@@ -119,20 +138,69 @@ def _run(args):
 
     # 3. Use latest timestamp
     latest_ts = factor_df.index.get_level_values("timestamp").max()
+    short_horizon_h = config.Data.PREDICT_HORIZON
+    long_horizon_h = getattr(config.LongModel, "PREDICT_HORIZON", short_horizon_h)
+    long_anchor_hour = getattr(config.LongModel, "REBALANCE_ANCHOR_HOUR_UTC", 11)
+    long_rebalance_due = _is_rebalance_slot(latest_ts, long_horizon_h, long_anchor_hour)
     latest_factors = factor_df.xs(latest_ts, level="timestamp")
     # Binance factors may be NaN if binance data lags — fill with 0 (neutral signal)
     latest_factors = latest_factors.fillna(0)
     # Drop coins with all zeros (truly no data)
     latest_factors = latest_factors[latest_factors.any(axis=1)]
 
-    # Composite score: XGBoost model if available, else equal-weight fallback
+    # Composite score (short model): XGBoost model if available, else equal-weight fallback
     score = _compute_score(latest_factors, args)
     score_sorted = score.sort_values(ascending=False)
+
+    # --- Long model scoring (independent, regime-gated, execution-mode-gated) ---
+    long_model_score_sorted = None
+    long_model_active = False
+    long_execution_mode = getattr(config.LongModel, "EXECUTION_MODE", "disabled")
+    try:
+        long_model_path = getattr(config.LongModel, "MODEL_PATH", "models/xsec_long.pkl")
+        abs_long_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), long_model_path)
+
+        if long_execution_mode == "disabled":
+            logger.info("Long model DISABLED (LongModel.EXECUTION_MODE='disabled')")
+        elif os.path.exists(abs_long_model_path) and not args.no_model:
+            # Check BTC regime gate
+            btc_regime = compute_btc_regime(closes)
+            latest_regime = btc_regime.loc[latest_ts] if latest_ts in btc_regime.index else None
+
+            if latest_regime is not None and latest_regime["regime_bull"] == 1.0:
+                # Compute long factors for latest timestamp
+                long_factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+                long_cal_cols = LONG_CALENDAR_COLS
+                long_zscore_cols = [c for c in long_factor_df.columns if c not in long_cal_cols]
+                long_factor_df = crosssection_zscore(long_factor_df, cols=long_zscore_cols)
+                long_factor_df = filter_long_frame_by_universe(long_factor_df, selected_index)
+                latest_long_factors = long_factor_df.xs(latest_ts, level="timestamp")
+                latest_long_factors = latest_long_factors.fillna(0)
+                latest_long_factors = latest_long_factors[latest_long_factors.any(axis=1)]
+
+                from models.xgb_ranker import XSecRanker
+                long_model = XSecRanker.load(abs_long_model_path)
+                long_scores = long_model.predict(latest_long_factors)
+                long_model_score_sorted = pd.Series(long_scores, index=latest_long_factors.index).sort_values(ascending=False)
+                long_model_active = True
+                logger.info(
+                    f"Long model ACTIVE (regime_bull=1, btc_7d={latest_regime['btc_ret_7d']:+.2%}, "
+                    f"btc_30d={latest_regime['btc_ret_30d']:+.2%}): {len(long_model_score_sorted)} coins scored"
+                )
+            else:
+                regime_info = ""
+                if latest_regime is not None:
+                    regime_info = f" (btc_7d={latest_regime['btc_ret_7d']:+.2%}, btc_30d={latest_regime['btc_ret_30d']:+.2%})"
+                logger.info(f"Long model INACTIVE: BTC regime not bullish{regime_info}")
+    except Exception as e:
+        logger.warning(f"Long model scoring failed: {e}")
 
     execution_mode = getattr(config.Portfolio, "LIVE_EXECUTION_MODE", "short_only")
     watch_long_n = getattr(config.Portfolio, "LIVE_WATCH_LONG_N", config.Portfolio.LONG_N)
     exec_short_n = getattr(config.Portfolio, "LIVE_EXEC_SHORT_N", config.Portfolio.SHORT_N)
     require_bitget = getattr(config.Portfolio, "LIVE_REQUIRE_BITGET_TRADABLE", False)
+    prev_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output", "latest.csv")
+    prev_df = _load_previous_recommendations(prev_path)
 
     contract_map = {}
     tradable_score_sorted = score_sorted
@@ -165,17 +233,14 @@ def _run(args):
 
     # --- Rebalancing buffer: reduce turnover by keeping existing positions ---
     rebal_buffer = config.Portfolio.REBAL_BUFFER
-    prev_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output", "latest.csv")
     prev_longs = set()
     prev_shorts = set()
-    try:
-        if os.path.exists(prev_path):
-            prev_df = pd.read_csv(os.path.realpath(prev_path))
-            side_col = prev_df["side"].astype(str).str.lower()
-            prev_longs = set(prev_df[side_col.str.contains("long", na=False)]["market"])
-            prev_shorts = set(prev_df[side_col.str.contains("short", na=False)]["market"])
-    except Exception:
-        pass
+    prev_long_rows = pd.DataFrame()
+    if not prev_df.empty and "side" in prev_df.columns and "market" in prev_df.columns:
+        side_col = prev_df["side"].astype(str).str.lower()
+        prev_long_rows = prev_df[side_col.str.contains("long", na=False)].copy()
+        prev_longs = set(prev_long_rows["market"])
+        prev_shorts = set(prev_df[side_col.str.contains("short", na=False)]["market"])
 
     selection_scores = tradable_score_sorted if require_bitget else score_sorted
 
@@ -195,6 +260,50 @@ def _run(args):
         longs = selection_scores.head(long_n) if long_n > 0 else pd.Series(dtype=float)
         shorts = selection_scores.tail(short_n)
 
+    # --- Override long picks with long-specialist model if active ---
+    carry_longs = False
+    if long_model_active and long_model_score_sorted is not None:
+        long_model_n = getattr(config.LongModel, "LONG_N", 5)
+        if require_bitget:
+            tradable_long = filter_markets_to_bitget(long_model_score_sorted.index.tolist(), contract_map)
+            long_model_tradable = long_model_score_sorted.loc[tradable_long]
+        else:
+            long_model_tradable = long_model_score_sorted
+
+        if long_rebalance_due or prev_long_rows.empty:
+            longs = long_model_tradable.head(long_model_n)
+            carry_longs = False
+            logger.info(
+                "Long model rebalance due: refreshing %s picks (h=%sh, anchor=%s UTC)",
+                len(longs), long_horizon_h, long_anchor_hour,
+            )
+        else:
+            carry_longs = True
+            prev_long_rows = prev_long_rows.drop_duplicates(subset=["market"], keep="last")
+            carry_markets = [m for m in prev_long_rows["market"].tolist() if m in long_model_tradable.index]
+            if carry_markets:
+                longs = prev_long_rows.set_index("market").loc[carry_markets, "score"]
+                logger.info(
+                    "Long model HOLD: carrying %s previous picks until next %sh rebalance",
+                    len(longs), long_horizon_h,
+                )
+            else:
+                longs = long_model_tradable.head(long_model_n)
+                carry_longs = False
+                logger.info("Long model carry unavailable: seeding fresh picks")
+
+        # Only upgrade to actionable LONG if execution mode permits
+        if long_execution_mode == "long_only":
+            long_side_label = "LONG"
+            if carry_longs:
+                logger.info("Long model EXECUTE HOLD: carrying existing LONG basket")
+            else:
+                logger.info(f"Long model EXECUTE: {len(longs)} positions (EXECUTION_MODE=long_only)")
+        else:
+            long_side_label = "WATCH_LONG"
+            mode_note = "HOLD" if carry_longs else "WATCH"
+            logger.info(f"Long model {mode_note}: {len(longs)} picks (EXECUTION_MODE={long_execution_mode}, not yet approved)")
+
     # Guard: need minimum coins
     if len(longs) < 5 and long_n > 0:
         logger.warning(f"Too few long candidates: {len(longs)} → watch-only for longs")
@@ -202,12 +311,8 @@ def _run(args):
         logger.warning(f"Too few coins for ranking: shorts={len(shorts)} → watch-only")
 
     logger.info(f"As of {latest_ts}")
-    if execution_mode == "short_only":
-        logger.info(f"WATCH LONG ({len(longs)}): {longs.index.tolist()}")
-        logger.info(f"SHORT EXEC ({len(shorts)}): {shorts.index.tolist()}")
-    else:
-        logger.info(f"LONG  ({len(longs)}): {longs.index.tolist()}")
-        logger.info(f"SHORT ({len(shorts)}): {shorts.index.tolist()}")
+    logger.info(f"{long_side_label} ({len(longs)}): {longs.index.tolist()}")
+    logger.info(f"SHORT {'EXEC' if execution_mode == 'short_only' else ''} ({len(shorts)}): {shorts.index.tolist()}")
 
     if not args.dry_run:
         _save_recommendations(
@@ -217,6 +322,11 @@ def _run(args):
             long_side_label=long_side_label,
             short_side_label="SHORT",
             contract_map=contract_map,
+            long_model_active=long_model_active,
+            long_horizon_h=long_horizon_h if long_model_active else short_horizon_h,
+            short_horizon_h=short_horizon_h,
+            carry_longs=carry_longs,
+            prev_long_rows=prev_long_rows,
         )
 
     # Telegram notification with live prices + previous performance
@@ -228,12 +338,15 @@ def _run(args):
 
             # --- Previous recommendations performance ---
             perf_msg = ""
-            prev_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output", "latest.csv")
             try:
-                if os.path.exists(prev_path):
-                    prev_df = pd.read_csv(os.path.realpath(prev_path))
-                    if "entry_price" in prev_df.columns:
-                        prev_active = prev_df[prev_df["side"].isin(["LONG", "SHORT"])].copy()
+                if not prev_df.empty and "entry_price" in prev_df.columns:
+                    prev_active = prev_df[prev_df["side"].isin(["LONG", "SHORT"])].copy()
+                    if len(prev_active) > 0:
+                        if "entry_time" in prev_active.columns and "horizon_h" in prev_active.columns:
+                            entry_ts = pd.to_datetime(prev_active["entry_time"], utc=True, errors="coerce")
+                            horizon_vals = pd.to_numeric(prev_active["horizon_h"], errors="coerce")
+                            age_hours = (pd.Timestamp(latest_ts) - entry_ts).dt.total_seconds() / 3600.0
+                            prev_active = prev_active[age_hours >= horizon_vals]
                         if len(prev_active) > 0:
                             now_prices = {}
                             for mkt in prev_active["market"]:
@@ -242,7 +355,7 @@ def _run(args):
                                     now_prices[mkt] = p
                                 _time.sleep(0.1)
                             perf_msg = format_performance(prev_active, now_prices)
-                            logger.info(f"Previous performance: {len(now_prices)} coins checked")
+                            logger.info(f"Previous performance: {len(now_prices)} matured coins checked")
             except Exception as e:
                 logger.warning(f"Performance calc failed: {e}")
 
@@ -256,7 +369,6 @@ def _run(args):
                 _time.sleep(0.1)
             logger.info(f"Fetched {len(prices)}/{len(all_coins)} live prices")
 
-            horizon = config.Data.PREDICT_HORIZON
             capital = getattr(config.Portfolio, "TOTAL_CAPITAL_KRW", 10_000_000)
             stop_loss = getattr(config.Portfolio, "STOP_LOSS_PCT", 3.0)
             msg = format_report(
@@ -264,13 +376,15 @@ def _run(args):
                 shorts,
                 latest_ts,
                 prices=prices,
-                horizon_h=horizon,
+                horizon_h=short_horizon_h,
                 all_scores=selection_scores,
                 min_sigma=0.0,
                 capital=capital,
                 stop_loss_pct=stop_loss,
-                long_header="WATCH LONG" if execution_mode == "short_only" else "LONG",
-                long_watch_only=(execution_mode == "short_only"),
+                long_header="LONG" if (long_model_active and long_execution_mode == "long_only") else "WATCH LONG",
+                long_watch_only=not (long_model_active and long_execution_mode == "long_only"),
+                long_horizon_h=long_horizon_h if long_model_active else short_horizon_h,
+                short_horizon_h=short_horizon_h,
             )
 
             # Send performance first, then new recommendations
@@ -285,7 +399,19 @@ def _run(args):
     logger.info("=== fetch_and_rank END ===")
 
 
-def _save_recommendations(ts, longs, shorts, long_side_label="LONG", short_side_label="SHORT", contract_map=None):
+def _save_recommendations(
+    ts,
+    longs,
+    shorts,
+    long_side_label="LONG",
+    short_side_label="SHORT",
+    contract_map=None,
+    long_model_active=False,
+    long_horizon_h=6,
+    short_horizon_h=6,
+    carry_longs=False,
+    prev_long_rows=None,
+):
     out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -297,18 +423,31 @@ def _save_recommendations(ts, longs, shorts, long_side_label="LONG", short_side_
     import time as _time
 
     rows = []
+    prev_long_meta = {}
+    if prev_long_rows is not None and not prev_long_rows.empty and "market" in prev_long_rows.columns:
+        prev_long_meta = prev_long_rows.drop_duplicates(subset=["market"], keep="last").set_index("market").to_dict("index")
+
     for market, score in longs.items():
         side = long_side_label
-        entry_price = None
-        entry_price = get_current_price(market)
-        _time.sleep(0.1)
+        prev_meta = prev_long_meta.get(market, {})
+        if carry_longs and prev_meta:
+            entry_price = prev_meta.get("entry_price")
+            entry_time = prev_meta.get("entry_time", pd.Timestamp(ts).isoformat())
+            bitget_symbol = prev_meta.get("bitget_symbol") or market_to_bitget_symbol(market, contract_map or {})
+        else:
+            entry_price = get_current_price(market)
+            entry_time = pd.Timestamp(ts).isoformat()
+            bitget_symbol = market_to_bitget_symbol(market, contract_map or {})
+            _time.sleep(0.1)
         rows.append({
             "market": market,
             "score": round(float(score), 4),
             "side": side,
             "entry_price": entry_price,
-            "bitget_symbol": market_to_bitget_symbol(market, contract_map or {}),
-            "actionable": side == "SHORT",
+            "entry_time": entry_time,
+            "horizon_h": long_horizon_h,
+            "bitget_symbol": bitget_symbol,
+            "actionable": (side == "SHORT") or (side == "LONG" and long_model_active),
         })
 
     for market, score in shorts.items():
@@ -319,6 +458,8 @@ def _save_recommendations(ts, longs, shorts, long_side_label="LONG", short_side_
             "score": round(float(score), 4),
             "side": short_side_label,
             "entry_price": entry_price,
+            "entry_time": pd.Timestamp(ts).isoformat(),
+            "horizon_h": short_horizon_h,
             "bitget_symbol": market_to_bitget_symbol(market, contract_map or {}),
             "actionable": True,
         })

@@ -53,8 +53,21 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--model-path",
         type=str,
-        default=_MODEL_PATH,
-        help="Output path for trained model pickle",
+        default=None,
+        help="Output path for trained model pickle (default: auto from --side)",
+    )
+    p.add_argument(
+        "--side",
+        type=str,
+        choices=["short", "long"],
+        default="short",
+        help="Model side: short (default, reversal factors) or long (momentum/breakout factors)",
+    )
+    p.add_argument(
+        "--ridge-alpha",
+        type=float,
+        default=None,
+        help="Ridge regularization alpha (default: 1.0 for short, 0.1 for long)",
     )
     return p.parse_args()
 
@@ -96,11 +109,8 @@ def main() -> None:
     # ------------------------------------------------------------------ #
     # 1. Build dataset
     # ------------------------------------------------------------------ #
-    print(
-        f"[train] Building dataset: days={args.days}, holdout_ratio={args.holdout_ratio}, "
-        f"horizon={args.horizon or _PREDICT_HORIZON}"
-    )
-    ds = build_dataset(days=args.days, holdout_ratio=args.holdout_ratio, horizon=args.horizon)
+    print(f"[train] Building dataset: days={args.days}, holdout_ratio={args.holdout_ratio}, side={args.side}")
+    ds = build_dataset(days=args.days, holdout_ratio=args.holdout_ratio, horizon=args.horizon, side=args.side)
 
     X_train: np.ndarray = ds["X_train"]
     y_train: np.ndarray = ds["y_train"]
@@ -141,15 +151,23 @@ def main() -> None:
         print("[train] Training XSecRanker (XGBoost) ...")
         model = XSecRanker()
     else:
-        print("[train] Training RidgeRanker (alpha=1.0) ...")
-        model = RidgeRanker(alpha=1.0)
+        ridge_alpha = args.ridge_alpha if args.ridge_alpha is not None else (0.1 if args.side == "long" else 1.0)
+        print(f"[train] Training RidgeRanker (alpha={ridge_alpha}) ...")
+        model = RidgeRanker(alpha=ridge_alpha)
     model.fit(X_train, y_train)
     print(f"[train] Training complete ({type(model).__name__}).")
 
     # ------------------------------------------------------------------ #
     # 5. Save model
     # ------------------------------------------------------------------ #
-    model_path = args.model_path
+    if args.model_path is not None:
+        model_path = args.model_path
+    elif args.side == "long":
+        model_path = getattr(
+            getattr(Config, "LongModel", None), "MODEL_PATH", "models/xsec_long.pkl"
+        )
+    else:
+        model_path = _MODEL_PATH
     if not os.path.isabs(model_path):
         model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), model_path)
     os.makedirs(os.path.dirname(os.path.abspath(model_path)), exist_ok=True)

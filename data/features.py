@@ -305,6 +305,140 @@ def compute_factors(
 
 
 # ---------------------------------------------------------------------------
+# Long-specialist factors (trend / breakout / momentum)
+# ---------------------------------------------------------------------------
+
+LONG_CALENDAR_COLS = ["dow_bull", "hour_vol"]  # same calendar cols
+
+
+def compute_long_factors(
+    closes: pd.DataFrame,
+    opens: pd.DataFrame,
+    highs: pd.DataFrame,
+    lows: pd.DataFrame,
+    volumes: pd.DataFrame,
+    binance_closes: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """
+    Compute long-specialist cross-sectional factors (v3).
+
+    v3 design principles (from 10-agent Loop 1 review):
+      - All momentum/trend factors removed (IC negative at every horizon)
+      - range_contraction replaces vol_inv (IC +0.179 vs +0.168, lower collinearity with others)
+      - reversal factors restored (IC positive in bull regime: buy the dip works)
+      - Only factors with empirically verified positive IC in bull regime retained
+
+    Cross-sectional factors (z-scored per timestamp):
+        range_contraction_12h — avg intrabar range shrinking = compression before expansion
+                                IC: +0.109 (6h), +0.137 (12h), +0.179 (24h). Stable across Q1-Q4.
+        reversal_1h           — 1h losers bounce. IC: +0.102 (6h), +0.078 (12h)
+        reversal_4h           — 4h losers bounce. IC: +0.094 (6h), +0.073 (12h)
+
+    Calendar factors (NOT z-scored):
+        dow_bull     — Mon/Tue/Wed KST=+1, Thu=0, Fri/Sat/Sun=-1
+        hour_vol     — 1 if KST hour in [7,8,9,22,23,0]
+    """
+    returns_1h = closes.pct_change(1)
+
+    # --- Cross-sectional factors ---
+
+    # 1. Range contraction 12h: shrinking intrabar range = compression before breakout
+    #    IC=+0.179 at 24h (strongest single factor), stable across all quarters
+    intrabar_range = (highs - lows) / closes.replace(0, np.nan)
+    range_contraction_12h = -intrabar_range.rolling(12).mean()
+
+    # 2. Reversal 1h: recent 1h losers bounce (IC=+0.102 at 6h in bull regime)
+    reversal_1h = -closes.pct_change(1)
+
+    # 3. Reversal 4h: recent 4h losers bounce (IC=+0.094 at 6h in bull regime)
+    reversal_4h = -closes.pct_change(4)
+
+    factor_dict = {
+        "range_contraction_12h": range_contraction_12h,
+        "reversal_1h":           reversal_1h,
+        "reversal_4h":           reversal_4h,
+    }
+
+    # --- Binance cross-exchange factors (optional) ---
+    if binance_closes is not None and not binance_closes.empty:
+        common_ts = closes.index.intersection(binance_closes.index)
+        common_coins = [c for c in closes.columns if c in binance_closes.columns]
+
+        if len(common_ts) > 0 and len(common_coins) > 0:
+            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1)
+            bn_r1 = binance_closes[common_coins].loc[common_ts].pct_change(1)
+
+            # binance_lead_1h: same as short model — global leads local
+            bl1h = (bn_r1 - upbit_r1).reindex(index=closes.index, columns=closes.columns)
+            factor_dict["binance_lead_1h"] = bl1h
+
+            logger.info(f"Binance factors added (long): {len(common_coins)} coins, {len(common_ts)} timestamps")
+
+    stacked = pd.concat(
+        {name: df.stack(future_stack=True) for name, df in factor_dict.items()},
+        axis=1,
+    )
+    stacked.index.names = ["timestamp", "market"]
+
+    # --- Calendar factors (same as short model) ---
+    timestamps = closes.index
+    kst = timestamps + pd.Timedelta(hours=9)
+
+    dow = kst.dayofweek
+    dow_bull_vals = np.where(dow < 3, 1.0, np.where(dow == 3, 0.0, -1.0))
+
+    hour = kst.hour
+    hour_vol_vals = (((hour >= 7) & (hour <= 9)) | (hour >= 22) | (hour <= 1)).astype(float)
+
+    n_coins = len(closes.columns)
+    stacked["dow_bull"] = np.repeat(dow_bull_vals, n_coins)
+    stacked["hour_vol"] = np.repeat(hour_vol_vals, n_coins)
+
+    return stacked
+
+
+# ---------------------------------------------------------------------------
+# BTC regime gate for long model
+# ---------------------------------------------------------------------------
+
+def compute_btc_regime(closes: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute BTC regime indicators for long model gating.
+
+    Returns DataFrame indexed by timestamp with columns:
+        btc_ret_7d:  BTC 7-day return
+        btc_ret_30d: BTC 30-day return
+        btc_above_sma20: 1 if BTC close > 20-day SMA, else 0
+        regime_bull: 1 if btc_ret_7d > gate AND btc_ret_30d > floor
+    """
+    btc_col = "KRW-BTC"
+    if btc_col not in closes.columns:
+        raise ValueError("KRW-BTC not in universe — cannot compute BTC regime")
+
+    btc = closes[btc_col]
+    btc_ret_7d = btc.pct_change(7 * 24)   # 7 days in hourly bars
+    btc_ret_30d = btc.pct_change(30 * 24)  # 30 days
+    btc_sma20 = btc.rolling(20 * 24).mean()
+    btc_above_sma20 = (btc > btc_sma20).astype(float)
+
+    regime = pd.DataFrame({
+        "btc_ret_7d": btc_ret_7d,
+        "btc_ret_30d": btc_ret_30d,
+        "btc_above_sma20": btc_above_sma20,
+    }, index=closes.index)
+
+    from config import config
+    gate_7d = getattr(config.LongModel, "BTC_7D_RETURN_GATE", 0.0)
+    floor_30d = getattr(config.LongModel, "BTC_30D_RETURN_FLOOR", -0.10)
+    # NaN-safe: if 30d return is NaN (insufficient data), only check 7d gate
+    cond_7d = btc_ret_7d > gate_7d
+    cond_30d = (btc_ret_30d > floor_30d) | btc_ret_30d.isna()
+    regime["regime_bull"] = (cond_7d & cond_30d).astype(float)
+
+    return regime
+
+
+# ---------------------------------------------------------------------------
 # Cross-sectional normalization
 # ---------------------------------------------------------------------------
 

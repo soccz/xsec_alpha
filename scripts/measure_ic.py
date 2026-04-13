@@ -22,10 +22,14 @@ from data.features import (
     load_and_pivot,
     load_binance_pivot,
     compute_factors,
+    compute_long_factors,
+    compute_btc_regime,
     compute_residual_returns,
     crosssection_zscore,
     compute_ic_series,
     summarize_ic,
+    CALENDAR_COLS,
+    LONG_CALENDAR_COLS,
     build_top_liquidity_universe_index,
     filter_long_frame_by_universe,
     filter_long_series_by_universe,
@@ -44,9 +48,16 @@ def main():
         default=0,
         help="Restrict IC calculation to top N coins by 24h traded value at each timestamp (0 = no filter)",
     )
+    parser.add_argument(
+        "--side",
+        type=str,
+        default="short",
+        choices=["short", "long"],
+        help="Factor set to measure: short (default) or long (momentum/breakout)",
+    )
     args = parser.parse_args()
 
-    logger.info(f"=== measure_ic.py | days={args.days} zscore={not args.no_zscore} ===")
+    logger.info(f"=== measure_ic.py | days={args.days} zscore={not args.no_zscore} side={args.side} ===")
 
     # 1. Load data
     closes, opens, highs, lows, volumes = load_and_pivot(days=args.days)
@@ -66,12 +77,18 @@ def main():
     binance_closes = load_binance_pivot(closes.columns.tolist(), days=args.days)
     if not binance_closes.empty:
         binance_closes = binance_closes.iloc[warmup:]
-    logger.info("Computing factors...")
-    factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+    if args.side == "long":
+        logger.info("Computing LONG-specialist factors...")
+        factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+    else:
+        logger.info("Computing factors...")
+        factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
 
     if not args.no_zscore:
         logger.info("Applying cross-sectional z-score normalization...")
-        factor_df = crosssection_zscore(factor_df)
+        cal_cols = LONG_CALENDAR_COLS if args.side == "long" else CALENDAR_COLS
+        zscore_cols = [c for c in factor_df.columns if c not in cal_cols]
+        factor_df = crosssection_zscore(factor_df, cols=zscore_cols)
 
     # 4. Compute residual returns
     logger.info("Computing residual returns (this may take a moment)...")
@@ -80,6 +97,18 @@ def main():
     residuals_wide = compute_residual_returns(closes, horizon=horizon, beta_window=beta_window)
     residuals_long = residuals_wide.stack(future_stack=True)
     residuals_long.index.names = ["timestamp", "market"]
+
+    # Regime filter for long side: IC only on bull timestamps
+    if args.side == "long":
+        btc_regime = compute_btc_regime(closes)
+        bull_ts = btc_regime.index[btc_regime["regime_bull"] == 1.0]
+        pre_len = len(factor_df)
+        factor_df = factor_df[factor_df.index.get_level_values("timestamp").isin(bull_ts)]
+        residuals_long = residuals_long[residuals_long.index.get_level_values("timestamp").isin(bull_ts)]
+        logger.info(
+            "Regime filter (long): kept %d/%d rows (%.1f%% bull)",
+            len(factor_df), pre_len, len(factor_df) / max(pre_len, 1) * 100,
+        )
 
     universe_note = "full universe"
     if args.top_liquidity > 0:

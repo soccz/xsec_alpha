@@ -48,5 +48,21 @@ class Config:
         XGB_MIN_CHILD_WEIGHT = 20
         XGB_RANDOM_STATE = 42
 
+    class LongModel:
+        MODEL_PATH = "models/xsec_long.pkl"
+        PREDICT_HORIZON = 12            # long model uses 12h (short uses 6h)
+        REBALANCE_ANCHOR_HOUR_UTC = 11  # 11/23 UTC under the current 6h timer cadence
+
+        # Regime gate: long model only active when BTC is bullish
+        # BTC 7d return > threshold AND BTC not in severe drawdown (30d > floor)
+        BTC_7D_RETURN_GATE = 0.0       # BTC 7d return must be > 0%
+        BTC_30D_RETURN_FLOOR = -0.10   # BTC 30d return must be > -10%
+
+        # Long-specific portfolio
+        LONG_N = 5                      # top 5 for execution
+        # "long_only" = actionable LONG, "watch" = score but WATCH only, "disabled" = skip entirely
+        # Production approval requires: holdout >= 60 timestamps, pred_std >= 0.01, long-only IC > 0
+        EXECUTION_MODE = "watch"
+
 
 config = Config()

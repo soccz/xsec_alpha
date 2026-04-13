@@ -24,9 +24,12 @@ from data.features import (
     load_and_pivot,
     load_binance_pivot,
     compute_factors,
+    compute_long_factors,
+    compute_btc_regime,
     compute_residual_returns,
     crosssection_zscore,
     CALENDAR_COLS,
+    LONG_CALENDAR_COLS,
     build_top_liquidity_universe_index,
     filter_long_frame_by_universe,
     filter_long_series_by_universe,
@@ -41,13 +44,22 @@ def main():
     parser.add_argument("--short-n", type=int, default=20)
     parser.add_argument("--fee-bps", type=float, default=5, help="One-way fee in bps (5 = 0.05%%)")
     parser.add_argument("--model-path", default="models/xsec_xgb.pkl")
+    parser.add_argument("--side", type=str, default="short", choices=["short", "long"], help="Model side: short or long")
     parser.add_argument("--holdout-ratio", type=float, default=0.2)
-    parser.add_argument("--rebalance-hours", type=int, default=config.Data.PREDICT_HORIZON)
+    parser.add_argument("--rebalance-hours", type=int, default=None,
+                        help="Rebalance interval in hours (default: auto from side)")
     args = parser.parse_args()
+
+    # Auto-resolve rebalance hours from side if not explicitly set
+    if args.rebalance_hours is None:
+        if args.side == "long" and hasattr(config, "LongModel"):
+            args.rebalance_hours = getattr(config.LongModel, "PREDICT_HORIZON", config.Data.PREDICT_HORIZON)
+        else:
+            args.rebalance_hours = config.Data.PREDICT_HORIZON
 
     fee = args.fee_bps / 10000  # 5 bps = 0.0005
 
-    logger.info(f"=== BACKTEST | days={args.days} long={args.long_n} short={args.short_n} fee={args.fee_bps}bps ===")
+    logger.info(f"=== BACKTEST | side={args.side} days={args.days} long={args.long_n} short={args.short_n} fee={args.fee_bps}bps ===")
 
     # 1. Load data
     closes, opens, highs, lows, volumes = load_and_pivot(days=args.days)
@@ -63,8 +75,13 @@ def main():
         binance_closes = binance_closes.iloc[warmup:]
 
     # 2. Compute factors
-    factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
-    zscore_cols = [c for c in factor_df.columns if c not in CALENDAR_COLS]
+    if args.side == "long":
+        factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+        logger.info("Using LONG-specialist factors (momentum/breakout/trend)")
+    else:
+        factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+    cal_cols = LONG_CALENDAR_COLS if args.side == "long" else CALENDAR_COLS
+    zscore_cols = [c for c in factor_df.columns if c not in cal_cols]
     factor_df = crosssection_zscore(factor_df, cols=zscore_cols)
     top_n = getattr(config.Data, "LIQUIDITY_TOP_N", 0)
     selected_index, coverage = build_top_liquidity_universe_index(closes, volumes, top_n=top_n)
@@ -79,7 +96,14 @@ def main():
     )
 
     # 3. Load model
-    abs_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), args.model_path)
+    model_path = args.model_path
+    # Auto-redirect to long model when user didn't explicitly set --model-path
+    user_set_model_path = any(
+        a in sys.argv for a in ("--model-path",)
+    ) or any(a.startswith("--model-path=") for a in sys.argv)
+    if not user_set_model_path and args.side == "long":
+        model_path = "models/xsec_long.pkl"
+    abs_model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), model_path)
     model = XSecRanker.load(abs_model_path)
     logger.info(f"Model: {type(model).__name__}")
 
@@ -88,6 +112,18 @@ def main():
     n_holdout = max(1, int(len(all_timestamps) * args.holdout_ratio))
     holdout_start = all_timestamps[-n_holdout]
     logger.info(f"Holdout: {holdout_start} → {all_timestamps[-1]} ({n_holdout} hours)")
+
+    # 4b. Regime filter for long side: only backtest on bull timestamps
+    if args.side == "long":
+        btc_regime = compute_btc_regime(closes)
+        bull_timestamps = btc_regime.index[btc_regime["regime_bull"] == 1.0]
+        n_all_holdout = len(all_timestamps[all_timestamps >= holdout_start])
+        holdout_bull = all_timestamps[(all_timestamps >= holdout_start) & all_timestamps.isin(bull_timestamps)]
+        logger.info(
+            "Regime filter (long): %d/%d holdout timestamps are bull (%.1f%%)",
+            len(holdout_bull), n_all_holdout,
+            len(holdout_bull) / max(n_all_holdout, 1) * 100,
+        )
 
     # 5. Forward returns (actual, not residual — this is what you earn)
     horizon = args.rebalance_hours
@@ -101,7 +137,10 @@ def main():
     residuals_long = filter_long_series_by_universe(residuals_long, selected_index)
 
     # 6. Simulate: rebalance every `horizon` hours
-    rebalance_ts = all_timestamps[all_timestamps >= holdout_start][::horizon]
+    holdout_ts = all_timestamps[all_timestamps >= holdout_start]
+    if args.side == "long":
+        holdout_ts = holdout_ts[holdout_ts.isin(bull_timestamps)]
+    rebalance_ts = holdout_ts[::horizon]
     logger.info(f"Rebalance points: {len(rebalance_ts)}")
 
     pnl_rows = []
@@ -231,7 +270,8 @@ def main():
     # Save detailed results
     out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
     os.makedirs(out_dir, exist_ok=True)
-    csv_path = os.path.join(out_dir, "backtest_result.csv")
+    csv_suffix = f"_long" if args.side == "long" else ""
+    csv_path = os.path.join(out_dir, f"backtest_result{csv_suffix}.csv")
     df.to_csv(csv_path)
     print(f"\n  Detailed results: {csv_path}")
 

@@ -10,10 +10,13 @@ from data.features import (
     load_and_pivot,
     load_binance_pivot,
     compute_factors,
+    compute_long_factors,
     compute_forward_returns,
     compute_residual_returns,
+    compute_btc_regime,
     crosssection_zscore,
     CALENDAR_COLS,
+    LONG_CALENDAR_COLS,
     build_top_liquidity_universe_index,
     filter_long_frame_by_universe,
     filter_long_series_by_universe,
@@ -33,6 +36,7 @@ def build_dataset(
     days: int = 90,
     holdout_ratio: float = _HOLDOUT_RATIO_CONFIG,
     horizon: int | None = None,
+    side: str = "short",
 ) -> dict:
     """
     Load data, compute factors and residual returns, split temporally.
@@ -52,11 +56,20 @@ def build_dataset(
     # ------------------------------------------------------------------
     closes, opens, highs, lows, volumes = load_and_pivot(days=days)
 
-    horizon     = horizon if horizon is not None else config.Data.PREDICT_HORIZON
+    if horizon is not None:
+        pass  # explicit override
+    elif side == "long" and hasattr(config, "LongModel"):
+        horizon = getattr(config.LongModel, "PREDICT_HORIZON", config.Data.PREDICT_HORIZON)
+    else:
+        horizon = config.Data.PREDICT_HORIZON
     beta_window = config.Data.BETA_ROLLING_WINDOW   # 168
 
     binance_closes = load_binance_pivot(closes.columns.tolist(), days=days)
-    factor_df  = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+    if side == "long":
+        factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+        logger.info("Using LONG-specialist factors (momentum/breakout/trend)")
+    else:
+        factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
     residuals  = compute_residual_returns(closes, horizon=horizon, beta_window=beta_window)
     fwd_returns = compute_forward_returns(closes, horizon=horizon)
 
@@ -64,7 +77,8 @@ def build_dataset(
     # 2. Normalise factors (cross-sectional z-score per timestamp)
     # ------------------------------------------------------------------
     factor_cols  = factor_df.columns.tolist()
-    zscore_cols  = [c for c in factor_cols if c not in CALENDAR_COLS]
+    cal_cols = LONG_CALENDAR_COLS if side == "long" else CALENDAR_COLS
+    zscore_cols  = [c for c in factor_cols if c not in cal_cols]
     factor_df    = crosssection_zscore(factor_df, cols=zscore_cols)
 
     # ------------------------------------------------------------------
@@ -93,6 +107,26 @@ def build_dataset(
     import pandas as pd
 
     combined = factor_df.join(residuals_long, how="inner").dropna()
+
+    # ------------------------------------------------------------------
+    # 4b. Regime filter for long side: keep only bull timestamps
+    # ------------------------------------------------------------------
+    if side == "long":
+        btc_regime = compute_btc_regime(closes)
+        bull_timestamps = btc_regime.index[btc_regime["regime_bull"] == 1.0]
+        pre_regime = len(combined)
+        combined = combined[combined.index.get_level_values("timestamp").isin(bull_timestamps)]
+        n_filtered = pre_regime - len(combined)
+        bull_pct = len(combined) / max(pre_regime, 1) * 100
+        logger.info(
+            f"Regime filter (long): kept {len(combined)} rows ({bull_pct:.1f}%), "
+            f"dropped {n_filtered} bear/sideways rows"
+        )
+        if combined.empty:
+            raise ValueError(
+                "Regime filter removed all rows — no bull timestamps in data. "
+                "Try increasing --days or check BTC regime thresholds."
+            )
 
     # ------------------------------------------------------------------
     # 5. Drop extreme outliers: |y| > 0.5 (data error)
