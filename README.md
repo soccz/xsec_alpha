@@ -7,21 +7,6 @@ gan_t(절대 수익률 예측)에서 실패한 교훈을 바탕으로,
 
 ## 연구 일지
 
-### 0. 외부 아이디어 검토
-
-두 개의 YouTube 영상을 검토했다:
-- **"Claude Just Changed the Stock Market Forever"** — Claude + Alpaca MCP 자동매매 튜토리얼
-- **"giving the worlds most expensive AI $10,000 to trade crypto"** — AI 3개 크립토 대결 (Claude Opus가 ETH 50x 숏으로 65% 수익)
-
-**판정:** 정확도/알파 관점에서 줄 수 있는 게 거의 없다.
-- 영상 1은 자동 주문 실행 레이어 이야기지, 신호 품질과는 무관
-- 영상 2는 36시간 레버리지 트레이딩 = 재현 불가능한 n=1 결과
-- xsec_alpha는 이미 이 영상들보다 체계적인 검증 구조(IC 게이트, temporal holdout, 베타 중립)를 갖고 있음
-
-유일하게 참고 가능한 건 자동 주문 연결 패턴이지만, IC < 0.05인 상태에서 자동화는 "손실을 자동화"하는 것뿐이므로 **신호 품질 확인이 먼저**라는 결론.
-
----
-
 ### 1. 출발점 — gan_t에서 배운 것
 
 gan_t는 CVAE/GAN 기반 절대 수익률 예측 시스템이었다.
