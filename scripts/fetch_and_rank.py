@@ -89,6 +89,143 @@ def _is_rebalance_slot(ts, horizon_h: int, anchor_hour_utc: int) -> bool:
     return ((ts_hour - anchor_hour_utc) % horizon_h) == 0
 
 
+def _next_rebalance_ts(ts, horizon_h: int, anchor_hour_utc: int | None = None):
+    base = pd.Timestamp(ts)
+    if horizon_h <= 0:
+        return base
+    if anchor_hour_utc is None:
+        return base + pd.Timedelta(hours=horizon_h)
+    probe = base
+    for _ in range(1, horizon_h + 2):
+        probe = probe + pd.Timedelta(hours=1)
+        if _is_rebalance_slot(probe, horizon_h, anchor_hour_utc):
+            return probe
+    return base + pd.Timedelta(hours=horizon_h)
+
+
+def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
+    out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
+    ledger_path = os.path.join(out_dir, "recommendation_ledger.csv")
+    os.makedirs(out_dir, exist_ok=True)
+    ledger_cols = [
+        "market",
+        "side",
+        "actionable",
+        "entry_time",
+        "exit_time_target",
+        "exit_time_actual",
+        "horizon_h",
+        "entry_price",
+        "exit_price",
+        "realized_return",
+        "refresh_reason",
+        "source_file",
+    ]
+
+    key_cols = ["market", "side", "entry_time", "horizon_h"]
+    if os.path.exists(ledger_path):
+        try:
+            ledger_df = pd.read_csv(ledger_path)
+        except Exception as e:
+            logger.warning(f"Could not read ledger ({e}) — rebuilding from scratch")
+            ledger_df = pd.DataFrame()
+    else:
+        ledger_df = pd.DataFrame()
+
+    existing_keys = set()
+    if not ledger_df.empty and set(key_cols).issubset(ledger_df.columns):
+        for row in ledger_df[key_cols].itertuples(index=False):
+            existing_keys.add((str(row.market), str(row.side), str(row.entry_time), int(row.horizon_h)))
+
+    latest_ts = pd.Timestamp(latest_ts)
+    matured_rows = []
+
+    for fname in sorted(os.listdir(out_dir)):
+        if not (fname.startswith("recommendations_") and fname.endswith(".csv")):
+            continue
+        fpath = os.path.join(out_dir, fname)
+        try:
+            rec_df = pd.read_csv(fpath)
+        except Exception:
+            continue
+        required = {"market", "side", "entry_price", "entry_time", "horizon_h"}
+        if not required.issubset(rec_df.columns):
+            continue
+
+        for row in rec_df.to_dict(orient="records"):
+            market = str(row.get("market", ""))
+            side = str(row.get("side", ""))
+            entry_price = pd.to_numeric(row.get("entry_price"), errors="coerce")
+            horizon_h = pd.to_numeric(row.get("horizon_h"), errors="coerce")
+            entry_time = pd.to_datetime(row.get("entry_time"), utc=True, errors="coerce")
+            if not market or pd.isna(entry_price) or entry_price <= 0 or pd.isna(horizon_h) or pd.isna(entry_time):
+                continue
+
+            horizon_h = int(horizon_h)
+            key = (market, side, entry_time.isoformat(), horizon_h)
+            if key in existing_keys:
+                continue
+
+            target_exit_ts = entry_time + pd.Timedelta(hours=horizon_h)
+            if target_exit_ts > latest_ts:
+                continue
+            if market not in closes.columns:
+                continue
+
+            eligible = closes.index[closes.index <= target_exit_ts]
+            if len(eligible) == 0:
+                continue
+            exit_ts = eligible[-1]
+            exit_price = closes.at[exit_ts, market]
+            if pd.isna(exit_price):
+                continue
+
+            side_lower = side.lower()
+            if "short" in side_lower:
+                realized_return = (entry_price - exit_price) / entry_price
+            else:
+                realized_return = (exit_price - entry_price) / entry_price
+
+            matured_rows.append({
+                "market": market,
+                "side": side,
+                "actionable": bool(row.get("actionable", False)),
+                "entry_time": entry_time.isoformat(),
+                "exit_time_target": target_exit_ts.isoformat(),
+                "exit_time_actual": pd.Timestamp(exit_ts).isoformat(),
+                "horizon_h": horizon_h,
+                "entry_price": float(entry_price),
+                "exit_price": float(exit_price),
+                "realized_return": float(realized_return),
+                "refresh_reason": row.get("refresh_reason", ""),
+                "source_file": fname,
+            })
+            existing_keys.add(key)
+
+    if not matured_rows:
+        if not os.path.exists(ledger_path):
+            pd.DataFrame(columns=ledger_cols).to_csv(ledger_path, index=False)
+            logger.info("Ledger initialized with no matured positions yet -> %s", ledger_path)
+            return
+        logger.info("Ledger unchanged: no newly matured positions")
+        return
+
+    append_df = pd.DataFrame(matured_rows)
+    ledger_df = pd.concat([ledger_df, append_df], ignore_index=True) if not ledger_df.empty else append_df
+    ledger_df = ledger_df.sort_values(["entry_time", "market", "side"]).reset_index(drop=True)
+    ledger_df.to_csv(ledger_path, index=False)
+
+    long_mask = ~append_df["side"].astype(str).str.lower().str.contains("short", na=False)
+    short_mask = append_df["side"].astype(str).str.lower().str.contains("short", na=False)
+    logger.info(
+        "Ledger updated: +%s matured positions (long/watch=%s, short=%s) -> %s",
+        len(append_df),
+        int(long_mask.sum()),
+        int(short_mask.sum()),
+        ledger_path,
+    )
+
+
 def _run(args):
     logger.info("=== fetch_and_rank START ===")
 
@@ -138,10 +275,13 @@ def _run(args):
 
     # 3. Use latest timestamp
     latest_ts = factor_df.index.get_level_values("timestamp").max()
+    _update_realized_ledger(closes, latest_ts)
     short_horizon_h = config.Data.PREDICT_HORIZON
     long_horizon_h = getattr(config.LongModel, "PREDICT_HORIZON", short_horizon_h)
     long_anchor_hour = getattr(config.LongModel, "REBALANCE_ANCHOR_HOUR_UTC", 11)
     long_rebalance_due = _is_rebalance_slot(latest_ts, long_horizon_h, long_anchor_hour)
+    next_short_rebalance_ts = _next_rebalance_ts(latest_ts, short_horizon_h)
+    next_long_rebalance_ts = _next_rebalance_ts(latest_ts, long_horizon_h, long_anchor_hour)
     latest_factors = factor_df.xs(latest_ts, level="timestamp")
     # Binance factors may be NaN if binance data lags — fill with 0 (neutral signal)
     latest_factors = latest_factors.fillna(0)
@@ -262,6 +402,7 @@ def _run(args):
 
     # --- Override long picks with long-specialist model if active ---
     carry_longs = False
+    long_refresh_reason = "watch_seed"
     if long_model_active and long_model_score_sorted is not None:
         long_model_n = getattr(config.LongModel, "LONG_N", 5)
         if require_bitget:
@@ -273,12 +414,14 @@ def _run(args):
         if long_rebalance_due or prev_long_rows.empty:
             longs = long_model_tradable.head(long_model_n)
             carry_longs = False
+            long_refresh_reason = "refresh_12h"
             logger.info(
                 "Long model rebalance due: refreshing %s picks (h=%sh, anchor=%s UTC)",
                 len(longs), long_horizon_h, long_anchor_hour,
             )
         else:
             carry_longs = True
+            long_refresh_reason = "carry_12h"
             prev_long_rows = prev_long_rows.drop_duplicates(subset=["market"], keep="last")
             carry_markets = [m for m in prev_long_rows["market"].tolist() if m in long_model_tradable.index]
             if carry_markets:
@@ -290,19 +433,24 @@ def _run(args):
             else:
                 longs = long_model_tradable.head(long_model_n)
                 carry_longs = False
+                long_refresh_reason = "refresh_12h"
                 logger.info("Long model carry unavailable: seeding fresh picks")
+    elif long_execution_mode == "disabled":
+        long_refresh_reason = "disabled"
+    elif not long_model_active:
+        long_refresh_reason = "regime_off"
 
-        # Only upgrade to actionable LONG if execution mode permits
-        if long_execution_mode == "long_only":
-            long_side_label = "LONG"
-            if carry_longs:
-                logger.info("Long model EXECUTE HOLD: carrying existing LONG basket")
-            else:
-                logger.info(f"Long model EXECUTE: {len(longs)} positions (EXECUTION_MODE=long_only)")
+    # Only upgrade to actionable LONG if execution mode permits
+    if long_model_active and long_execution_mode == "long_only":
+        long_side_label = "LONG"
+        if carry_longs:
+            logger.info("Long model EXECUTE HOLD: carrying existing LONG basket")
         else:
-            long_side_label = "WATCH_LONG"
-            mode_note = "HOLD" if carry_longs else "WATCH"
-            logger.info(f"Long model {mode_note}: {len(longs)} picks (EXECUTION_MODE={long_execution_mode}, not yet approved)")
+            logger.info(f"Long model EXECUTE: {len(longs)} positions (EXECUTION_MODE=long_only)")
+    elif long_model_active:
+        long_side_label = "WATCH_LONG"
+        mode_note = "HOLD" if carry_longs else "WATCH"
+        logger.info(f"Long model {mode_note}: {len(longs)} picks (EXECUTION_MODE={long_execution_mode}, not yet approved)")
 
     # Guard: need minimum coins
     if len(longs) < 5 and long_n > 0:
@@ -327,6 +475,9 @@ def _run(args):
             short_horizon_h=short_horizon_h,
             carry_longs=carry_longs,
             prev_long_rows=prev_long_rows,
+            long_refresh_reason=long_refresh_reason,
+            next_long_rebalance_ts=next_long_rebalance_ts,
+            next_short_rebalance_ts=next_short_rebalance_ts,
         )
 
     # Telegram notification with live prices + previous performance
@@ -340,7 +491,7 @@ def _run(args):
             perf_msg = ""
             try:
                 if not prev_df.empty and "entry_price" in prev_df.columns:
-                    prev_active = prev_df[prev_df["side"].isin(["LONG", "SHORT"])].copy()
+                    prev_active = prev_df[prev_df["side"].isin(["LONG", "WATCH_LONG", "SHORT"])].copy()
                     if len(prev_active) > 0:
                         if "entry_time" in prev_active.columns and "horizon_h" in prev_active.columns:
                             entry_ts = pd.to_datetime(prev_active["entry_time"], utc=True, errors="coerce")
@@ -385,6 +536,8 @@ def _run(args):
                 long_watch_only=not (long_model_active and long_execution_mode == "long_only"),
                 long_horizon_h=long_horizon_h if long_model_active else short_horizon_h,
                 short_horizon_h=short_horizon_h,
+                next_long_rebalance_at=next_long_rebalance_ts,
+                next_short_rebalance_at=next_short_rebalance_ts,
             )
 
             # Send performance first, then new recommendations
@@ -411,6 +564,9 @@ def _save_recommendations(
     short_horizon_h=6,
     carry_longs=False,
     prev_long_rows=None,
+    long_refresh_reason="watch_seed",
+    next_long_rebalance_ts=None,
+    next_short_rebalance_ts=None,
 ):
     out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -446,6 +602,8 @@ def _save_recommendations(
             "entry_price": entry_price,
             "entry_time": entry_time,
             "horizon_h": long_horizon_h,
+            "refresh_reason": long_refresh_reason,
+            "next_rebalance_at": pd.Timestamp(next_long_rebalance_ts).isoformat() if next_long_rebalance_ts is not None else None,
             "bitget_symbol": bitget_symbol,
             "actionable": (side == "SHORT") or (side == "LONG" and long_model_active),
         })
@@ -460,6 +618,8 @@ def _save_recommendations(
             "entry_price": entry_price,
             "entry_time": pd.Timestamp(ts).isoformat(),
             "horizon_h": short_horizon_h,
+            "refresh_reason": "refresh_6h",
+            "next_rebalance_at": pd.Timestamp(next_short_rebalance_ts).isoformat() if next_short_rebalance_ts is not None else None,
             "bitget_symbol": market_to_bitget_symbol(market, contract_map or {}),
             "actionable": True,
         })

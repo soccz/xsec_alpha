@@ -18,6 +18,8 @@ _ROOT = os.path.dirname(os.path.abspath(__file__))
 _OUTPUT = os.path.join(_ROOT, "output")
 _LATEST_CSV = os.path.join(_OUTPUT, "latest.csv")
 _IC_HISTORY = os.path.join(_OUTPUT, "ic_history.json")
+_IC_HISTORY_LONG = os.path.join(_OUTPUT, "ic_history_long.json")
+_LEDGER_CSV = os.path.join(_OUTPUT, "recommendation_ledger.csv")
 _MODEL_PATH = os.path.join(_ROOT, config.Model.MODEL_PATH)
 
 
@@ -71,6 +73,27 @@ def _load_ic_history():
         return None
 
 
+def _load_long_ic_history():
+    if not os.path.exists(_IC_HISTORY_LONG):
+        return None
+    try:
+        with open(_IC_HISTORY_LONG) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _load_ledger_csv():
+    import pandas as pd
+
+    if not os.path.exists(_LEDGER_CSV):
+        return None
+    try:
+        return pd.read_csv(_LEDGER_CSV)
+    except Exception:
+        return None
+
+
 def _model_age():
     """Return model file mtime as UTC datetime, or None."""
     if not os.path.exists(_MODEL_PATH):
@@ -85,6 +108,121 @@ def _fmt_ts(dt):
     if dt is None:
         return "N/A"
     return dt.strftime("%Y-%m-%d %H:%M UTC")
+
+
+def _safe_float(v):
+    try:
+        v = float(v)
+    except Exception:
+        return None
+    if math.isnan(v) or math.isinf(v):
+        return None
+    return v
+
+
+def _latest_ic_point(history):
+    if not history:
+        return None
+    try:
+        last = history[-1]
+    except Exception:
+        return None
+    return {
+        "timestamp": last.get("timestamp"),
+        "ic": _safe_float(last.get("ic")),
+        "n_coins": last.get("n_coins"),
+        "horizon_h": last.get("horizon_h"),
+        "side": last.get("side"),
+    }
+
+
+def _live_meta(df):
+    meta = {
+        "long_count": 0,
+        "short_count": 0,
+        "long_next_rebalance": None,
+        "short_next_rebalance": None,
+        "long_refresh_reason": None,
+        "short_refresh_reason": None,
+        "long_mode": "WATCH",
+        "short_mode": "EXEC",
+    }
+    if df is None or df.empty or "side" not in df.columns:
+        return meta
+
+    side_series = df["side"].astype(str)
+    long_df = df[side_series.str.contains("long", case=False, na=False)].copy()
+    short_df = df[side_series.str.contains("short", case=False, na=False)].copy()
+
+    meta["long_count"] = int(len(long_df))
+    meta["short_count"] = int(len(short_df))
+
+    if not long_df.empty:
+        meta["long_next_rebalance"] = long_df["next_rebalance_at"].iloc[0] if "next_rebalance_at" in long_df.columns else None
+        meta["long_refresh_reason"] = long_df["refresh_reason"].iloc[0] if "refresh_reason" in long_df.columns else None
+        if long_df["side"].astype(str).str.upper().eq("LONG").any():
+            meta["long_mode"] = "EXEC"
+
+    if not short_df.empty:
+        meta["short_next_rebalance"] = short_df["next_rebalance_at"].iloc[0] if "next_rebalance_at" in short_df.columns else None
+        meta["short_refresh_reason"] = short_df["refresh_reason"].iloc[0] if "refresh_reason" in short_df.columns else None
+
+    return meta
+
+
+def _ledger_summary(df):
+    import pandas as pd
+
+    summary = {
+        "total_closed": 0,
+        "actionable_closed": 0,
+        "watch_long_closed": 0,
+        "short_closed": 0,
+        "mean_return_all": None,
+        "mean_return_actionable": None,
+        "mean_return_watch_long": None,
+        "mean_return_short": None,
+        "last_exit_time": None,
+    }
+    if df is None or df.empty:
+        return summary
+
+    summary["total_closed"] = int(len(df))
+    if "actionable" in df.columns:
+        actionable_mask = df["actionable"].fillna(False).astype(bool)
+        summary["actionable_closed"] = int(actionable_mask.sum())
+    else:
+        actionable_mask = None
+
+    if "side" in df.columns:
+        side_series = df["side"].astype(str)
+        long_mask = side_series.str.contains("long", case=False, na=False)
+        short_mask = side_series.str.contains("short", case=False, na=False)
+        watch_long_mask = side_series.str.upper().eq("WATCH_LONG")
+        summary["watch_long_closed"] = int(watch_long_mask.sum())
+        summary["short_closed"] = int(short_mask.sum())
+    else:
+        long_mask = short_mask = watch_long_mask = None
+
+    if "realized_return" in df.columns:
+        rr = df["realized_return"].apply(_safe_float)
+        summary["mean_return_all"] = rr.dropna().mean() if rr.notna().any() else None
+        if actionable_mask is not None and actionable_mask.any():
+            ar = rr[actionable_mask].dropna()
+            summary["mean_return_actionable"] = ar.mean() if not ar.empty else None
+        if watch_long_mask is not None and watch_long_mask.any():
+            wr = rr[watch_long_mask].dropna()
+            summary["mean_return_watch_long"] = wr.mean() if not wr.empty else None
+        if short_mask is not None and short_mask.any():
+            sr = rr[short_mask].dropna()
+            summary["mean_return_short"] = sr.mean() if not sr.empty else None
+
+    if "exit_time_actual" in df.columns:
+        exits = pd.to_datetime(df["exit_time_actual"], utc=True, errors="coerce").dropna()
+        if not exits.empty:
+            summary["last_exit_time"] = exits.max().isoformat()
+
+    return summary
 
 
 # ---------------------------------------------------------------------------
@@ -106,10 +244,29 @@ def api_recommendations():
 
 @app.route("/api/ic")
 def api_ic():
-    ic = _load_ic_history()
-    if ic is None:
+    short_ic = _load_ic_history()
+    long_ic = _load_long_ic_history()
+    if short_ic is None and long_ic is None:
         return _json_response({"error": "No IC history yet", "data": {}}, 200)
-    return _json_response(ic)
+    return _json_response({
+        "short": short_ic or [],
+        "long": long_ic or [],
+        "latest_short": _latest_ic_point(short_ic),
+        "latest_long": _latest_ic_point(long_ic),
+    })
+
+
+@app.route("/api/ledger")
+def api_ledger():
+    df = _load_ledger_csv()
+    if df is None:
+        return _json_response({"error": "No ledger yet", "summary": _ledger_summary(None), "data": []}, 200)
+    records = df.to_dict(orient="records")
+    return _json_response({
+        "summary": _ledger_summary(df),
+        "count": len(records),
+        "data": records[-100:],
+    })
 
 
 @app.route("/api/status")
@@ -121,7 +278,10 @@ def api_status():
     except Exception:
         markets = []
 
-    _, rec_mtime = _load_latest_csv()
+    latest_df, rec_mtime = _load_latest_csv()
+    ledger_df = _load_ledger_csv()
+    meta = _live_meta(latest_df)
+    ledger = _ledger_summary(ledger_df)
 
     now = datetime.now(timezone.utc)
     db_age_h = round((now - db_ts).total_seconds() / 3600, 1) if db_ts else None
@@ -134,6 +294,15 @@ def api_status():
         "model_age_hours": model_age_h,
         "universe_size": len(markets),
         "last_recommendation": rec_mtime.isoformat() if rec_mtime else None,
+        "long_mode": meta["long_mode"],
+        "short_mode": meta["short_mode"],
+        "long_count": meta["long_count"],
+        "short_count": meta["short_count"],
+        "long_next_rebalance": meta["long_next_rebalance"],
+        "short_next_rebalance": meta["short_next_rebalance"],
+        "long_refresh_reason": meta["long_refresh_reason"],
+        "short_refresh_reason": meta["short_refresh_reason"],
+        "ledger_summary": ledger,
     })
 
 
@@ -188,12 +357,33 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="stat"><span class="label">Universe Size</span><span class="value">{{universe_size}}</span></div>
     <div class="stat"><span class="label">Model Updated</span><span class="value">{{model_updated}}</span></div>
     <div class="stat"><span class="label">Last Run</span><span class="value">{{last_run}}</span></div>
+    <div class="stat"><span class="label">Long Mode</span><span class="value">{{long_mode}}</span></div>
+    <div class="stat"><span class="label">Short Mode</span><span class="value">{{short_mode}}</span></div>
+    <div class="stat"><span class="label">Long Next Rebalance</span><span class="value">{{long_next_rebalance}}</span></div>
+    <div class="stat"><span class="label">Short Next Rebalance</span><span class="value">{{short_next_rebalance}}</span></div>
+    <div class="stat"><span class="label">Long Refresh</span><span class="value">{{long_refresh_reason}}</span></div>
+    <div class="stat"><span class="label">Short Refresh</span><span class="value">{{short_refresh_reason}}</span></div>
   </div>
 
   <!-- IC card -->
   <div class="card">
     <h2>IC Summary</h2>
     {{ic_block}}
+  </div>
+
+  <!-- Ledger card -->
+  <div class="card">
+    <h2>Realized Ledger</h2>
+    {{ledger_block}}
+  </div>
+
+  <!-- Live meta card -->
+  <div class="card">
+    <h2>Live Mix</h2>
+    <div class="stat"><span class="label">{{long_label}} Count</span><span class="value">{{long_count}}</span></div>
+    <div class="stat"><span class="label">{{short_label}} Count</span><span class="value">{{short_count}}</span></div>
+    <div class="stat"><span class="label">{{long_label}} Horizon</span><span class="value">{{long_horizon}}</span></div>
+    <div class="stat"><span class="label">{{short_label}} Horizon</span><span class="value">{{short_horizon}}</span></div>
   </div>
 
   <!-- Long positions -->
@@ -267,9 +457,25 @@ def _render_ic_block(ic_data):
     if ic_data is None:
         return '<div class="empty">No IC data yet</div>'
 
-    # Handle both dict-of-stats and list-of-records formats
+    if isinstance(ic_data, dict) and ("latest_short" in ic_data or "latest_long" in ic_data):
+        html = []
+        for label, point in [("Short", ic_data.get("latest_short")), ("Long", ic_data.get("latest_long"))]:
+            if not point:
+                html.append(f'<div class="stat"><span class="label">{label} IC</span><span class="value">N/A</span></div>')
+                continue
+            ic_val = point.get("ic")
+            ic_disp = f"{ic_val:+.4f}" if ic_val is not None else "N/A"
+            ts_disp = point.get("timestamp", "N/A")
+            n_disp = point.get("n_coins", "N/A")
+            h_disp = point.get("horizon_h", "N/A")
+            html.append(f'<div class="stat"><span class="label">{label} IC</span><span class="value">{ic_disp}</span></div>')
+            html.append(f'<div class="stat"><span class="label">{label} Horizon</span><span class="value">{h_disp}h</span></div>')
+            html.append(f'<div class="stat"><span class="label">{label} Coins</span><span class="value">{n_disp}</span></div>')
+            html.append(f'<div class="stat"><span class="label">{label} Timestamp</span><span class="value">{ts_disp}</span></div>')
+        return "".join(html)
+
+    # Handle generic dict-of-stats formats
     if isinstance(ic_data, dict):
-        # Try common keys
         stats = ic_data.get("summary", ic_data.get("stats", ic_data))
         if isinstance(stats, dict):
             html = []
@@ -285,6 +491,29 @@ def _render_ic_block(ic_data):
             return "".join(html) if html else '<div class="empty">No IC stats</div>'
 
     return '<div class="empty">IC data format not recognized</div>'
+
+
+def _render_ledger_block(summary):
+    if not summary or summary.get("total_closed", 0) == 0:
+        return '<div class="empty">No matured positions yet</div>'
+
+    def _pct(v):
+        if v is None:
+            return "N/A"
+        return f"{v:+.2%}"
+
+    html = [
+        f'<div class="stat"><span class="label">Closed Positions</span><span class="value">{summary["total_closed"]}</span></div>',
+        f'<div class="stat"><span class="label">Actionable Closed</span><span class="value">{summary["actionable_closed"]}</span></div>',
+        f'<div class="stat"><span class="label">Watch Long Closed</span><span class="value">{summary["watch_long_closed"]}</span></div>',
+        f'<div class="stat"><span class="label">Short Closed</span><span class="value">{summary["short_closed"]}</span></div>',
+        f'<div class="stat"><span class="label">Mean Return All</span><span class="value">{_pct(summary["mean_return_all"])}</span></div>',
+        f'<div class="stat"><span class="label">Mean Return Actionable</span><span class="value">{_pct(summary["mean_return_actionable"])}</span></div>',
+        f'<div class="stat"><span class="label">Mean Return Watch Long</span><span class="value">{_pct(summary["mean_return_watch_long"])}</span></div>',
+        f'<div class="stat"><span class="label">Mean Return Short</span><span class="value">{_pct(summary["mean_return_short"])}</span></div>',
+        f'<div class="stat"><span class="label">Last Exit</span><span class="value">{summary["last_exit_time"] or "N/A"}</span></div>',
+    ]
+    return "".join(html)
 
 
 def _live_recommendation_labels():
@@ -325,6 +554,9 @@ def dashboard():
 
     # Recommendations
     df, rec_mtime = _load_latest_csv()
+    meta = _live_meta(df)
+    ledger_df = _load_ledger_csv()
+    ledger = _ledger_summary(ledger_df)
 
     # Split long/short
     long_df = short_df = None
@@ -339,7 +571,10 @@ def dashboard():
             short_df = df[df[sig_col].str.lower().str.contains("short", na=False)]
 
     # IC
-    ic_data = _load_ic_history()
+    ic_data = {
+        "latest_short": _latest_ic_point(_load_ic_history()),
+        "latest_long": _latest_ic_point(_load_long_ic_history()),
+    }
     live_labels = _live_recommendation_labels()
 
     html = _DASHBOARD_HTML
@@ -348,15 +583,26 @@ def dashboard():
     html = html.replace("{{universe_size}}", str(len(markets)))
     html = html.replace("{{model_updated}}", _fmt_ts(model_ts))
     html = html.replace("{{last_run}}", _fmt_ts(rec_mtime))
+    html = html.replace("{{long_mode}}", meta["long_mode"])
+    html = html.replace("{{short_mode}}", meta["short_mode"])
+    html = html.replace("{{long_next_rebalance}}", str(meta["long_next_rebalance"] or "N/A"))
+    html = html.replace("{{short_next_rebalance}}", str(meta["short_next_rebalance"] or "N/A"))
+    html = html.replace("{{long_refresh_reason}}", str(meta["long_refresh_reason"] or "N/A"))
+    html = html.replace("{{short_refresh_reason}}", str(meta["short_refresh_reason"] or "N/A"))
     html = html.replace("{{long_label}}", live_labels["long_label"])
     html = html.replace("{{short_label}}", live_labels["short_label"])
     html = html.replace("{{long_n}}", str(live_labels["long_n"]))
     html = html.replace("{{short_n}}", str(live_labels["short_n"]))
+    html = html.replace("{{long_count}}", str(meta["long_count"]))
+    html = html.replace("{{short_count}}", str(meta["short_count"]))
+    html = html.replace("{{long_horizon}}", "12h")
+    html = html.replace("{{short_horizon}}", "6h")
     html = html.replace("{{long_table}}", _render_rec_table(long_df, max_rows=live_labels["long_n"]))
     html = html.replace("{{short_table}}", _render_rec_table(short_df, max_rows=live_labels["short_n"]))
     html = html.replace("{{total_count}}", str(len(df)) if df is not None else "0")
     html = html.replace("{{full_table}}", _render_rec_table(df, max_rows=100))
     html = html.replace("{{ic_block}}", _render_ic_block(ic_data))
+    html = html.replace("{{ledger_block}}", _render_ledger_block(ledger))
     html = html.replace("{{now_utc}}", now.strftime("%Y-%m-%d %H:%M UTC"))
 
     return Response(html, mimetype="text/html")

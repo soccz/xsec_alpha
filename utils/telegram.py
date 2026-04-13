@@ -57,7 +57,8 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
                   horizon_h: int = 6, all_scores=None, min_sigma: float = 1.0,
                   capital: float = None, stop_loss_pct: float = None,
                   long_header: str = "LONG", long_watch_only: bool = False,
-                  long_horizon_h: int | None = None, short_horizon_h: int | None = None) -> str:
+                  long_horizon_h: int | None = None, short_horizon_h: int | None = None,
+                  next_long_rebalance_at=None, next_short_rebalance_at=None) -> str:
     """
     Format a trading report. Only shows coins above min_sigma confidence.
 
@@ -112,6 +113,12 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
         "━━━━━━━━━━━━━━━━━━━━━━",
         "",
     ]
+
+    if next_long_rebalance_at is not None or next_short_rebalance_at is not None:
+        next_long_str = str(next_long_rebalance_at)[:16] if next_long_rebalance_at is not None else "N/A"
+        next_short_str = str(next_short_rebalance_at)[:16] if next_short_rebalance_at is not None else "N/A"
+        lines.append(f"⏱ LONG 다음 {next_long_str} | SHORT 다음 {next_short_str}")
+        lines.append("")
 
     # Summary line
     if capital and total_weight > 0:
@@ -202,10 +209,12 @@ def format_performance(prev_df, now_prices: dict) -> str:
     ]
 
     long_pnl = []
+    watch_long_pnl = []
     short_pnl = []
 
     for side_name, side_label, pnl_list in [
         ("LONG", "🟢 LONG", long_pnl),
+        ("WATCH_LONG", "🟡 WATCH LONG", watch_long_pnl),
         ("SHORT", "🔴 SHORT", short_pnl),
     ]:
         rows = prev_df[prev_df["side"] == side_name]
@@ -237,18 +246,22 @@ def format_performance(prev_df, now_prices: dict) -> str:
         lines.append("")
 
     # Summary
-    all_pnl = long_pnl + short_pnl
+    all_pnl = long_pnl + watch_long_pnl + short_pnl
     if all_pnl:
         avg = sum(all_pnl) / len(all_pnl) * 100
         wins = sum(1 for p in all_pnl if p > 0)
         total = len(all_pnl)
         long_avg = sum(long_pnl) / len(long_pnl) * 100 if long_pnl else 0
+        watch_long_avg = sum(watch_long_pnl) / len(watch_long_pnl) * 100 if watch_long_pnl else 0
         short_avg = sum(short_pnl) / len(short_pnl) * 100 if short_pnl else 0
 
         lines.append(f"<b>요약</b>")
         lines.append(f"  적중 {wins}/{total} ({wins/total*100:.0f}%)")
         lines.append(f"  평균 수익: <b>{avg:+.2f}%</b>")
-        lines.append(f"  LONG {long_avg:+.2f}% | SHORT {short_avg:+.2f}%")
+        if watch_long_pnl:
+            lines.append(f"  LONG {long_avg:+.2f}% | WATCH {watch_long_avg:+.2f}% | SHORT {short_avg:+.2f}%")
+        else:
+            lines.append(f"  LONG {long_avg:+.2f}% | SHORT {short_avg:+.2f}%")
     else:
         lines.append("  이전 데이터 없음")
 

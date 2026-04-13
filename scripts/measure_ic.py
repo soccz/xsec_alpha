@@ -92,7 +92,11 @@ def main():
 
     # 4. Compute residual returns
     logger.info("Computing residual returns (this may take a moment)...")
-    horizon    = config.Data.PREDICT_HORIZON
+    horizon = (
+        getattr(config.LongModel, "PREDICT_HORIZON", config.Data.PREDICT_HORIZON)
+        if args.side == "long"
+        else config.Data.PREDICT_HORIZON
+    )
     beta_window = config.Data.BETA_ROLLING_WINDOW
     residuals_wide = compute_residual_returns(closes, horizon=horizon, beta_window=beta_window)
     residuals_long = residuals_wide.stack(future_stack=True)
