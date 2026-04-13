@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Environment / Secrets
+.env
+.env.*
+.claude/
+
+# Output artifacts
+output/
+logs/
+
+# Model binaries
+models/*.pkl
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
+
+# Temporary
+/tmp/
+*.tmp

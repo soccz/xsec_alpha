@@ -1,0 +1,15 @@
+[Unit]
+Description=xsec_alpha cross-sectional ranking
+After=network.target
+
+[Service]
+Type=oneshot
+User=soccz
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+EnvironmentFile=/mnt/20t/main/gan_t/.env
+ExecStartPre=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/update_data.py
+ExecStartPre=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/track_ic.py
+ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/fetch_and_rank.py
+TimeoutStartSec=600
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/logs/systemd.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/logs/systemd.log

@@ -1,0 +1,14 @@
+[Unit]
+Description=xsec_alpha 12h rebalancing timer
+
+[Timer]
+# 6h rebalance — KST 08/14/20/02 = UTC 23/05/11/17
+OnCalendar=*-*-* 23:00:00 UTC
+OnCalendar=*-*-* 05:00:00 UTC
+OnCalendar=*-*-* 11:00:00 UTC
+OnCalendar=*-*-* 17:00:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target
