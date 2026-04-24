@@ -146,35 +146,44 @@ def check_binance():
 
 
 def check_ic():
-    """[IC] If IC history exists, latest IC > 0.05."""
-    root = os.path.dirname(os.path.dirname(__file__))
-    ic_path = os.path.join(root, "logs", "ic_history.csv")
+    """[IC] If IC history exists, latest IC > 0.05. Reads output/ic_history*.json.
 
-    if not os.path.exists(ic_path):
+    track_ic.py writes JSON lists (short + long). We report the worse of the two
+    most-recent readings so a degraded side cannot hide behind the healthy one.
+    """
+    import json
+    root = os.path.dirname(os.path.dirname(__file__))
+    short_path = os.path.join(root, "output", "ic_history.json")
+    long_path  = os.path.join(root, "output", "ic_history_long.json")
+
+    def _latest(path, label):
+        if not os.path.exists(path):
+            return None, f"{label}=missing"
+        try:
+            with open(path) as fh:
+                data = json.load(fh)
+            if not data:
+                return None, f"{label}=empty"
+            ic = float(data[-1].get("ic"))
+            return ic, f"{label}={ic:.4f}"
+        except Exception as e:
+            return None, f"{label}=err({e})"
+
+    s_ic, s_note = _latest(short_path, "short")
+    l_ic, l_note = _latest(long_path,  "long")
+
+    if s_ic is None and l_ic is None:
         return "OK", "No IC history yet (skipped)"
 
-    try:
-        import pandas as pd
-        df = pd.read_csv(ic_path)
-        if df.empty:
-            return "OK", "IC history empty (skipped)"
-
-        # Expect column named 'ic' or 'mean_ic'
-        ic_col = None
-        for c in ["ic", "mean_ic", "IC"]:
-            if c in df.columns:
-                ic_col = c
-                break
-        if ic_col is None:
-            return "WARN", f"IC history has no 'ic' column; cols={list(df.columns)}"
-
-        latest_ic = df[ic_col].iloc[-1]
-        detail = f"latest IC={latest_ic:.4f}"
-        if latest_ic < 0.05:
-            return "WARN", f"Low: {detail}"
-        return "OK", detail
-    except Exception as e:
-        return "WARN", f"Error reading IC history: {e}"
+    detail = f"{s_note} | {l_note}"
+    worst = min([v for v in (s_ic, l_ic) if v is not None], default=None)
+    if worst is None:
+        return "WARN", detail
+    if worst < 0.03:
+        return "FAIL", f"IC below freeze threshold (<0.03): {detail}"
+    if worst < 0.05:
+        return "WARN", f"IC softening: {detail}"
+    return "OK", detail
 
 
 def main():
