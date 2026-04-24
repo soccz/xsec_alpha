@@ -96,6 +96,98 @@ def format_regime_header(latest_ts, btc_regime_row=None, ic_state: dict | None =
     return "\n".join(lines)
 
 
+def format_compact(short_df, long_df, latest_ts, btc_regime_row=None,
+                    ic_state: dict | None = None, max_per_horizon: int = 5,
+                    min_sigma: float = 1.5) -> str:
+    """Single compact telegram message — A+B hybrid, ~12-14 rows total.
+
+    Header: timestamp + regime (single line, optionally IC flag if any side WARN+)
+    Body: per-horizon top `max_per_horizon` coins by |σ|
+          Row format: `{tier} {coin:6s} {arrow} {pct:+.1f}% {trust_tag}`
+    Footer: legend only if any trust tag present (⭐/⚠)
+
+    Filters:
+      - show |σ| >= min_sigma (default 1.5 = 🔥 tier + top ✅)
+      - skip suppressed rows (preflight batch-blocked)
+    """
+    import math
+    def _nan(v): return v is None or (isinstance(v, float) and v != v)
+
+    lines = []
+
+    # --- Header (1-2 lines) ---
+    ts_str = str(latest_ts)[:16]
+    hdr = f"📊 <b>xsec</b> · <code>{ts_str} UTC</code>"
+
+    if btc_regime_row is not None:
+        try:
+            bull = btc_regime_row.get("regime_bull")
+            if isinstance(bull, float) and math.isnan(bull): bull = None
+            if bull == 1.0:
+                hdr += " · 🟢 bull"
+            elif bull is not None:
+                hdr += " · 🟡 neutral/bear"
+        except Exception: pass
+
+    # IC flag only if something is concerning
+    ic_flag = ""
+    if ic_state:
+        statuses = [s.get("status", "OK") for s in ic_state.values()]
+        if any(s in ("FREEZE", "LIQUIDATE") for s in statuses):
+            ic_flag = " · 🔴 IC"
+        elif any(s == "WARN" for s in statuses):
+            ic_flag = " · 🟡 IC"
+    lines.append(hdr + ic_flag)
+    lines.append("")
+
+    # --- Body: 6h and 12h sections ---
+    has_trust_tag = False
+
+    for pred_df, horizon_h, title in [(short_df, 6, "6h"), (long_df, 12, "12h")]:
+        if pred_df is None or len(pred_df) == 0:
+            continue
+        strong = pred_df[pred_df["sigma"] >= min_sigma].head(max_per_horizon)
+        if strong.empty:
+            continue
+
+        # Horizon header with hit rate summary for 🔥 tier and ✅ tier
+        from utils.magnitude import _load_calibration
+        calib = _load_calibration().get(f"{'short' if horizon_h==6 else 'long'}_{horizon_h}h", [])
+        hit_fire = hit_check = None
+        for b in calib:
+            if b.get("sigma_low") == 2.0:
+                hit_fire = b.get("hit_rate")
+            elif b.get("sigma_low") == 1.0 and b.get("sigma_high") == 1.5:
+                hit_check = b.get("hit_rate")
+        hit_str = []
+        if hit_fire is not None: hit_str.append(f"🔥 {hit_fire*100:.0f}%")
+        if hit_check is not None: hit_str.append(f"✅ {hit_check*100:.0f}%")
+        hit_suffix = f"  <code>({' · '.join(hit_str)})</code>" if hit_str else ""
+
+        lines.append(f"<b>{title}</b>{hit_suffix}")
+
+        for mkt, r in strong.iterrows():
+            coin = str(mkt).replace("KRW-", "")
+            arrow = "↑" if r["direction"] > 0 else ("↓" if r["direction"] < 0 else "·")
+            exp = r.get("expected_pct")
+            exp_s = f"{exp:+.1f}%" if not _nan(exp) else "—"
+            trust_tag = r.get("trust_tag", "") or ""
+            if trust_tag: has_trust_tag = True
+            tier = r.get("tag", "·")
+
+            lines.append(
+                f"  {tier} <b>{coin:<6}</b> {arrow} <code>{exp_s}</code>"
+                + (f"  {trust_tag}" if trust_tag else "")
+            )
+        lines.append("")
+
+    # --- Footer: legend only if trust tags appeared ---
+    if has_trust_tag:
+        lines.append("<code>⭐ 신뢰 (과거 적중≥60%) · ⚠ 역신호 (≤40%)</code>")
+
+    return "\n".join(lines).rstrip()
+
+
 def format_per_coin_predictions(pred_df, horizon_h: int, title: str,
                                    min_sigma: float = 1.0, max_rows: int = 15) -> str:
     """Probabilistic per-coin view.

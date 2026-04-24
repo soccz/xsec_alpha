@@ -591,121 +591,39 @@ def _run(args):
         # Save full-universe per-coin predictions (both horizons) for user to browse
         _save_predictions_full(latest_ts, short_predictions_df, long_predictions_df)
 
-    # Telegram notification with live prices + previous performance
+    # Telegram notification — single compact message (F1.1, 2026-04-25)
+    # Replaces 3 legacy messages (performance + basket + rich per-coin) with
+    # one compact view: header + top 5 per horizon + minimal tags.
     if not args.dry_run and not args.no_telegram:
         try:
-            from utils.telegram import send_message, format_report, format_performance
-            from data.collector import get_current_price
-            import time as _time
+            from utils.telegram import send_message, format_compact
 
-            # --- Previous recommendations performance ---
-            perf_msg = ""
+            # Build regime row
+            regime_row = None
             try:
-                if not prev_df.empty and "entry_price" in prev_df.columns:
-                    prev_active = prev_df[prev_df["side"].isin(["LONG", "WATCH_LONG", "SHORT"])].copy()
-                    if len(prev_active) > 0:
-                        if "entry_time" in prev_active.columns and "horizon_h" in prev_active.columns:
-                            entry_ts = pd.to_datetime(prev_active["entry_time"], utc=True, errors="coerce")
-                            horizon_vals = pd.to_numeric(prev_active["horizon_h"], errors="coerce")
-                            age_hours = (pd.Timestamp(latest_ts) - entry_ts).dt.total_seconds() / 3600.0
-                            prev_active = prev_active[age_hours >= horizon_vals]
-                        if len(prev_active) > 0:
-                            now_prices = {}
-                            for mkt in prev_active["market"]:
-                                p = get_current_price(mkt)
-                                if p:
-                                    now_prices[mkt] = p
-                                _time.sleep(0.1)
-                            perf_msg = format_performance(prev_active, now_prices)
-                            logger.info(f"Previous performance: {len(now_prices)} matured coins checked")
-            except Exception as e:
-                logger.warning(f"Performance calc failed: {e}")
+                btc_regime = compute_btc_regime(closes)
+                if latest_ts in btc_regime.index:
+                    regime_row = btc_regime.loc[latest_ts].to_dict()
+            except Exception:
+                pass
 
-            # --- Current recommendations ---
-            all_coins = list(longs.index) + list(shorts.index)
-            prices = {}
-            for mkt in all_coins:
-                p = get_current_price(mkt)
-                if p:
-                    prices[mkt] = p
-                _time.sleep(0.1)
-            logger.info(f"Fetched {len(prices)}/{len(all_coins)} live prices")
+            ic_state = {
+                "short": {"status": short_gate.status, "last_ic": short_gate.last_ic},
+                "long":  {"status": long_gate.status,  "last_ic": long_gate.last_ic},
+            }
 
-            capital = getattr(config.Portfolio, "TOTAL_CAPITAL_KRW", 10_000_000)
-            stop_loss = getattr(config.Portfolio, "STOP_LOSS_PCT", 3.0)
-            msg = format_report(
-                longs,
-                shorts,
-                latest_ts,
-                prices=prices,
-                horizon_h=short_horizon_h,
-                all_scores=selection_scores,
-                min_sigma=0.0,
-                capital=capital,
-                stop_loss_pct=stop_loss,
-                long_header="LONG" if (long_model_active and long_execution_mode == "long_only") else "WATCH LONG",
-                long_watch_only=not (long_model_active and long_execution_mode == "long_only"),
-                long_horizon_h=long_horizon_h if long_model_active else short_horizon_h,
-                short_horizon_h=short_horizon_h,
-                next_long_rebalance_at=next_long_rebalance_ts,
-                next_short_rebalance_at=next_short_rebalance_ts,
+            msg = format_compact(
+                short_df=short_predictions_df,
+                long_df=long_predictions_df,
+                latest_ts=latest_ts,
+                btc_regime_row=regime_row,
+                ic_state=ic_state,
+                max_per_horizon=5,
+                min_sigma=1.5,
             )
-
-            # Send performance first, then new recommendations
-            if perf_msg:
-                send_message(perf_msg)
             sent = send_message(msg)
-
-            # --- New: regime header + per-coin predictions ---
-            try:
-                from utils.telegram import format_per_coin_predictions, format_regime_header
-                # Build regime row (latest BTC regime snapshot)
-                regime_row = None
-                try:
-                    btc_regime = compute_btc_regime(closes)
-                    if latest_ts in btc_regime.index:
-                        regime_row = btc_regime.loc[latest_ts].to_dict()
-                except Exception:
-                    pass
-                # IC gate state for header
-                ic_state = {
-                    "short": {"status": short_gate.status, "last_ic": short_gate.last_ic},
-                    "long":  {"status": long_gate.status,  "last_ic": long_gate.last_ic},
-                }
-                parts = [
-                    "━━━━━━━━━━━━━━━━━━━━━━",
-                    "  🎯 <b>Per-coin 예측 (전체 유니버스)</b>",
-                    "━━━━━━━━━━━━━━━━━━━━━━",
-                    format_regime_header(latest_ts, regime_row, ic_state, preflight),
-                    "",
-                ]
-                if short_predictions_df is not None:
-                    parts.append(format_per_coin_predictions(
-                        short_predictions_df, horizon_h=short_horizon_h,
-                        title="🔎 6h 예측",
-                        min_sigma=1.0, max_rows=15,
-                    ))
-                    parts.append("")
-                if long_predictions_df is not None:
-                    parts.append(format_per_coin_predictions(
-                        long_predictions_df, horizon_h=long_horizon_h,
-                        title="🔎 12h 예측",
-                        min_sigma=1.0, max_rows=15,
-                    ))
-                    parts.append("")
-                parts.append(
-                    "<code>🔥 (|σ|≥2, 60%, 3%) ✅ (1σ+, 55-57%, 2%) ▫ (0.5σ+, 1%)</code>"
-                )
-                parts.append(
-                    "<code>확률=방향 적중률, 기대=calibrated 예상 수익, [..]=95% CI</code>"
-                )
-                parts.append("━━━━━━━━━━━━━━━━━━━━━━")
-                send_message("\n".join(parts))
-            except Exception as _pe:
-                logger.warning(f"Per-coin telegram section failed: {_pe}")
-
             if sent:
-                logger.info("Telegram report sent")
+                logger.info("Telegram compact report sent")
         except Exception as e:
             logger.warning(f"Telegram notification failed: {e}")
 
