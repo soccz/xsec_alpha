@@ -463,6 +463,207 @@ Binance API ─────────────────→│
 
 ---
 
+## 2부 — 운영 리얼리티 체크 (2026-04-25)
+
+> 여기부터는 **위 연구가 실제로 돌아간 뒤 드러난 문제들과 그 해결**의 기록이다.
+> 위 §1~15는 "연구 → 설계" 단계, 아래는 "운영 → 재설계" 단계.
+
+---
+
+### 16. 원장이 드러낸 진실
+
+2-4주 라이브 프로브가 실제로 돌기 시작한 뒤, **추천-원장(`output/recommendation_ledger.csv`)** 을 감사하면서 세 가지 구조적 문제가 발견됐다.
+
+**16-1. 텔레그램 WATCH_LONG 부호 버그**
+
+`utils/telegram.py::format_performance`가 `side_name == "LONG"` 을 정확 문자열 비교로 처리하고 있어서 `"WATCH_LONG"`은 `else` 분기로 빠져 **SHORT 공식** `(entry−exit)/entry` 으로 계산됐다. 결과: 모든 WATCH LONG 행의 손익 부호가 반대로 표시됨. 원장은 맞게 기록했지만 텔레그램만 거짓말을 하고 있었다.
+
+→ `utils.telegram.realized_return(side, entry, exit)` 단일 헬퍼 도입. `verify_telegram.py` 가 원장↔텔레그램 부호 일관성을 자동 검증 (옛 버그를 regression test로 재현 가능).
+
+**16-2. LONG 82.7% 적중률 = survivorship bias**
+
+처음엔 2σ+ 적중률 82.7%로 보였지만 이는 calibration 윈도우가 학습 데이터와 겹쳐 생긴 인위적 수치였다. 진짜 holdout에서는 **dir_hit 58%, IC 0.13** 수준. bull-regime-only 학습 + 매크로 피처가 "bull-conditional prediction"을 학습해서 bull 구간에서만 과적합한 결과.
+
+**16-3. 90% 방향 불일치 (SHORT vs LONG)**
+
+같은 코인에 대해 SHORT 6h 모델은 91/100 ↓, LONG 12h 모델은 99/100 ↑. 방향 합의 10%. Rank correlation은 +0.55이므로 "**같은 랭킹 순서**를 보고 있지만 **baseline(어디가 0이냐)**이 다름". 원인: SHORT는 전 regime 평균 ≈ 약간 음수, LONG은 bull-only 학습으로 평균 ≈ 양수.
+
+---
+
+### 17. 운영 자동화 인프라
+
+버그가 몇 주간 모른 채 돌았다는 것 자체가 **감시/게이트가 운영에 없었다**는 증거. CLAUDE.md §7의 롤백 규칙은 문서로만 존재했고 자동 집행되지 않았다.
+
+새로 만든 것:
+
+| 파일 | 역할 |
+|---|---|
+| `scripts/health_snapshot.py` | 세션 킥오프 건강 스냅샷 — 데이터 신선도, IC 상태, 원장 실현 성적, 현재 픽 요약 |
+| `utils/preflight.py` | fetch_and_rank 실행 전 게이트 — 데이터 신선도 ≤90min, NaN율 ≤20%, universe churn ≤30% |
+| `utils/ic_gate.py` | CLAUDE.md §7 자동 집행 — OK/WARN/FREEZE/LIQUIDATE 상태 머신, 사이드별 추적 |
+| `utils/drift_detector.py` | 팩터별 IC 24h vs 7d MA 비교, SIGN_FLIP / 50%+ drop 감지 |
+| `utils/enrich.py` | 두 모델 consensus ⚡ + 원장 기반 per-coin 신뢰도 ⭐⚠ |
+| `scripts/verify_telegram.py` | 원장↔텔레그램 부호/크기 일관성 regression test |
+| `scripts/wf_holdout_harness.py` | 일일 walk-forward holdout IC 측정 + wf_history.json 누적 |
+
+세션 킥오프 의례도 명문화 (CLAUDE.md §0): 모든 편집 전 `python scripts/health_snapshot.py` 먼저.
+
+---
+
+### 18. per-coin 확률 출력 설계
+
+이전 텔레그램은 top-5 basket만 보냈고 "잔차 -0.5%" 같은 숫자가 무슨 의미인지 유저가 알 수 없었다. 전면 재설계:
+
+**σ-bucket calibration (`output/calibration_sigma.json`):**
+과거 전체 유니버스 7,600 예측을 스캔해서 `|σ| = |score|/batch_std` 구간별로:
+- 방향 적중률 `hit_rate`
+- 기대 수익률 `mean_signed_return_pct` (sign(score) × realized_return 평균)
+- 평균 절대 수익률 `mean_abs_return_pct`
+- 표준편차
+
+**per-coin 출력 필드 (`utils/magnitude.py::predict_one`):**
+```
+{direction, direction_prob, expected_pct,
+ ci_95_low, ci_95_high, sigma, tag (🔥/✅/▫/·),
+ coin_vol_pct, position_size_pct}
+```
+
+CI는 **코인별 실현 변동성 × 1.96** 으로 계산 → tier가 같아도 코인마다 위험폭이 다름이 시각화됨. Position size는 σ-tier 기반 제안치 (🔥 3% / ✅ 2% / ▫ 1%).
+
+Telegram 한 행:
+```
+🔥 KAITO ↓  65% 기대-1.29%  변±2.6%  [-6.4, +3.9]  💰 3.0%  ⚡⭐
+```
+↑ 방향 확률, 기대 %, 코인 자체 변동폭, 95% CI, 제안 사이즈, 두 모델 합의(⚡), 과거 적중 이력(⭐).
+
+---
+
+### 19. 20명 트레이더 토론 — 3 라운드
+
+운영 문제 해결 과정에서 **20명 스페셜리스트(4 배치 × 5명)** 의 병렬 토론을 3회 수행. 우리 프로젝트만의 방식: 각 토론은 실제 코드 + 원장 데이터 접근 권한을 갖고 진행.
+
+**라운드 1: "현재 시스템의 가장 강력한 형태"**
+- Batch I 전통 퀀트 / II ML / III 크립토 / IV 실전 트레이더
+- 결론: Tier 1 (확률 출력) → Tier 2 (ops) → Tier 3 (피처) → Tier 4 (재학습) 점진 빌드
+
+**라운드 2: "주기·재학습·리셋 정책"**
+- 14/20 F1 Unified Regime 선택 (bull 필터 제거)
+- 주간 soft retrain + 월간 hard reset + drift 트리거
+- Promotion gate: new_IC ≥ old_IC − 0.015 AND ≥ 0.040
+
+**라운드 3: "최종 아키텍처 — 2 모델 유지 vs 통합 vs multi-horizon"**
+- 13/20 F1 (피처 파이프라인 통합) — 구현 30분, 리스크 최소
+- 5/20 F3 (meta-learner) — 나중에
+- 3/20 F2 (multi-horizon single model) — 이 단계에선 과도
+
+---
+
+### 20. F1 통합 아키텍처 (최종 선택)
+
+한 개의 통합 피처 라이브러리로 두 호라이즌을 학습한다.
+
+**`data.features.compute_unified_factors()` — 10개 피처:**
+```
+reversal_1h, reversal_4h, volatility_inv_24h, order_flow_bear,
+range_contraction_12h, binance_lead_1h, kimchi_inv, kimchi_zscore_24h,
+dow_bull, hour_vol
+```
+
+**두 모델, 같은 입력:**
+| 파일 | 호라이즌 | 타겟 | Regime 필터 |
+|---|---|---|---|
+| `models/xsec_6h.pkl` | 6h | absolute coin_return | 전 regime |
+| `models/xsec_12h.pkl` | 12h | absolute coin_return | 전 regime |
+
+**개선 지표:**
+| 측정 | 이전 (분리 피처) | F1 (통합) |
+|---|---|---|
+| 방향 합의 (SHORT↔LONG) | 10-91% | **92%** |
+| Rank correlation | +0.55~0.61 | **+0.908** |
+| 6h 2σ+ 적중 | 63.7% | **64.6%** |
+| 12h 2σ+ 적중 | 64.3% | **70.6%** |
+| 6h 2σ+ E[signed] | +1.23% | **+1.29%** |
+| 12h 2σ+ E[signed] | +0.37% (bull bias) | **+1.85%** |
+
+Bull regime 필터를 없애고도 12h 성능이 오히려 좋아졌다. 이전의 82.7%는 survivorship bias였음이 확인됨.
+
+---
+
+### 21. 재학습·운영 자동화
+
+**`scripts/retrain_pipeline.py` (주 1회, systemd):**
+1. Pre-flight — 데이터 freshness, lock, 디스크
+2. 두 모델 후보 학습 (`xsec_6h_candidate.pkl`, `xsec_12h_candidate.pkl`)
+3. 홀드아웃 IC 측정 (신/구 모델 양쪽)
+4. **Promotion gate:**
+   - `new_ic ≥ old_ic − 0.015` AND `new_ic ≥ 0.040`
+   - 통과: archive 백업 → 배포 → calibration 재생성
+   - 실패: 후보 삭제, 이전 모델 유지, 로그 기록
+5. 결과 `output/retrain_history.json` 누적
+
+**Systemd 타이머:**
+| 유닛 | 주기 | 역할 |
+|---|---|---|
+| `xsec-alpha.timer` | 매 6h (05/11/17/23 UTC) | 예측 실행 + 텔레그램 |
+| `xsec-measure.timer` | 매일 00:00 UTC | 홀드아웃 IC + drift 체크 |
+| `xsec-retrain.timer` | 매주 일 20:00 UTC | F1 retrain_pipeline |
+
+`deploy/install_f1.sh` 한 번 실행으로 전체 systemd 배포.
+
+---
+
+### 최종 시스템 다이어그램
+
+```
+                    ┌─────────────────────────────┐
+                    │  Upbit + Binance 1h OHLCV   │
+                    └─────────────┬───────────────┘
+                                  ↓
+                 ┌────────────────┴────────────────┐
+                 │  compute_unified_factors()       │
+                 │  10 features × 100 coins × T    │
+                 └────────────────┬────────────────┘
+                                  ↓ cross-section z-score
+                 ┌────────────────┴────────────────┐
+                 ↓                                 ↓
+        ┌────────────────┐                ┌────────────────┐
+        │ xsec_6h.pkl    │                │ xsec_12h.pkl   │
+        │ (Ridge+LGBM)   │                │ (Ridge+LGBM)   │
+        │ 6h horizon     │                │ 12h horizon    │
+        └────────┬───────┘                └────────┬───────┘
+                 │          (92% 합의, rc 0.91)     │
+                 └─────────────────┬───────────────┘
+                                   ↓
+                 ┌─────────────────┴──────────────────┐
+                 │  σ-bucket calibration              │
+                 │  (direction_prob, expected_pct,    │
+                 │   ci_95, position_size)            │
+                 └─────────────────┬──────────────────┘
+                                   ↓
+              ┌────────────────────┼────────────────────┐
+              ↓                    ↓                    ↓
+       ┌──────────┐         ┌──────────┐         ┌──────────┐
+       │ enrich   │         │ preflight│         │ ic_gate  │
+       │ ⚡⭐⚠ 태그 │         │ NaN/fresh│         │ §7 게이트 │
+       └────┬─────┘         └────┬─────┘         └────┬─────┘
+            └────────────────────┼────────────────────┘
+                                 ↓
+                    ┌────────────┴────────────┐
+                    │   텔레그램 + CSV 저장    │
+                    │  + recommendation_ledger │
+                    └─────────────────────────┘
+
+    ⏱ Automation:
+    ── 매 6h (예측)        : xsec-alpha.timer
+    ── 매일 00:00 UTC (IC) : xsec-measure.timer
+    ── 주 1회 일 20:00 UTC : xsec-retrain.timer
+                            └→ retrain_pipeline.py (promotion gate)
+                                 └→ pass → archive old + deploy new + rebuild calibration
+                                 └→ fail → keep old + log
+```
+
+---
+
 ## 라이선스
 
 개인 연구용. 투자 조언이 아님.
