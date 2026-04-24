@@ -59,15 +59,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--side",
         type=str,
-        choices=["short", "long"],
+        choices=["short", "long", "unified"],
         default="short",
-        help="Model side: short (default, reversal factors) or long (momentum/breakout factors)",
+        help="short / long (legacy, different factor sets) or unified (F1: same 10-feature set for both horizons)",
     )
     p.add_argument(
         "--ridge-alpha",
         type=float,
         default=None,
         help="Ridge regularization alpha (default: 1.0 for short, 0.1 for long)",
+    )
+    p.add_argument(
+        "--target",
+        type=str,
+        choices=["residual", "absolute"],
+        default="residual",
+        help="Training target: residual (coin−β·BTC, legacy) or absolute (coin_fwd, user-visible %)",
+    )
+    p.add_argument(
+        "--regime-filter",
+        type=str,
+        choices=["default", "all"],
+        default="default",
+        help="Regime filter for long side: default (bull-only, legacy) or all (no filter — unifies baseline with short model)",
+    )
+    p.add_argument(
+        "--no-macro-globals",
+        action="store_true",
+        help="LONG side: exclude global macro features (btc_mom_7d, btc_vol_7d, alt_season_index) — force pure cross-sectional",
     )
     return p.parse_args()
 
@@ -110,7 +129,7 @@ def main() -> None:
     # 1. Build dataset
     # ------------------------------------------------------------------ #
     print(f"[train] Building dataset: days={args.days}, holdout_ratio={args.holdout_ratio}, side={args.side}")
-    ds = build_dataset(days=args.days, holdout_ratio=args.holdout_ratio, horizon=args.horizon, side=args.side)
+    ds = build_dataset(days=args.days, holdout_ratio=args.holdout_ratio, horizon=args.horizon, side=args.side, target=args.target, regime_filter=args.regime_filter, include_macro_globals=not args.no_macro_globals)
 
     X_train: np.ndarray = ds["X_train"]
     y_train: np.ndarray = ds["y_train"]

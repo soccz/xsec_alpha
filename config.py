@@ -36,7 +36,10 @@ class Config:
         REBAL_BUFFER = 10               # 기존 포지션 유지 버퍼 (rank N+buffer까지 유지)
 
     class Model:
-        MODEL_PATH = "models/xsec_xgb.pkl"
+        # F1 unified (2026-04-25): 10-feature unified factor library, all-regime,
+        # absolute-return target. Paired with LongModel below — both models share
+        # identical features; only target horizon differs (6h vs 12h).
+        MODEL_PATH = "models/xsec_6h.pkl"
         HOLDOUT_RATIO = 0.2
 
         # XGBoost hyperparameters
@@ -49,7 +52,8 @@ class Config:
         XGB_RANDOM_STATE = 42
 
     class LongModel:
-        MODEL_PATH = "models/xsec_long.pkl"
+        # F1 unified (2026-04-25): same factor library as Model above.
+        MODEL_PATH = "models/xsec_12h.pkl"
         PREDICT_HORIZON = 12            # long model uses 12h (short uses 6h)
         REBALANCE_ANCHOR_HOUR_UTC = 11  # 11/23 UTC under the current 6h timer cadence
 

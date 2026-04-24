@@ -30,6 +30,8 @@ from data.features import (
     load_binance_pivot,
     compute_factors,
     compute_long_factors,
+    compute_unified_factors,
+    UNIFIED_CALENDAR_COLS,
     crosssection_zscore,
     compute_btc_regime,
     compute_residual_returns,
@@ -109,13 +111,10 @@ def _track_side(side: str, days: int) -> None:
     if not binance_closes.empty:
         binance_closes = binance_closes.iloc[warmup:]
 
-    if side == "long":
-        factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
-        cal_cols = LONG_CALENDAR_COLS
-        logger.info("[%s] Using LONG-specialist factors", side)
-    else:
-        factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
-        cal_cols = CALENDAR_COLS
+    # F1 unified (2026-04-25): both sides use same 10-feature factor library
+    factor_df = compute_unified_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+    cal_cols = UNIFIED_CALENDAR_COLS
+    logger.info("[%s] Using UNIFIED factor library (F1)", side)
 
     zscore_cols = [c for c in factor_df.columns if c not in cal_cols]
     factor_df = crosssection_zscore(factor_df, cols=zscore_cols)

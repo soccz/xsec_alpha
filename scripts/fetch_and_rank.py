@@ -241,11 +241,13 @@ def _run(args):
         load_binance_pivot,
         compute_factors,
         compute_long_factors,
+        compute_unified_factors,
         compute_btc_regime,
         crosssection_zscore,
         build_top_liquidity_universe_index,
         filter_long_frame_by_universe,
         LONG_CALENDAR_COLS,
+        UNIFIED_CALENDAR_COLS,
     )
 
     closes, opens, highs, lows, volumes = load_and_pivot(days=30)
@@ -259,8 +261,10 @@ def _run(args):
     binance_closes = load_binance_pivot(closes.columns.tolist(), days=30)
     if not binance_closes.empty:
         binance_closes = binance_closes.iloc[warmup:]
-    factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
-    factor_df = crosssection_zscore(factor_df)
+    # F1 unified (2026-04-25): single factor pipeline for both 6h and 12h models
+    factor_df = compute_unified_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+    zcols = [c for c in factor_df.columns if c not in UNIFIED_CALENDAR_COLS]
+    factor_df = crosssection_zscore(factor_df, cols=zcols)
     top_n = getattr(config.Data, "LIQUIDITY_TOP_N", 0)
     selected_index, coverage = build_top_liquidity_universe_index(closes, volumes, top_n=top_n)
     factor_df = filter_long_frame_by_universe(factor_df, selected_index)
@@ -282,9 +286,33 @@ def _run(args):
     long_rebalance_due = _is_rebalance_slot(latest_ts, long_horizon_h, long_anchor_hour)
     next_short_rebalance_ts = _next_rebalance_ts(latest_ts, short_horizon_h)
     next_long_rebalance_ts = _next_rebalance_ts(latest_ts, long_horizon_h, long_anchor_hour)
-    latest_factors = factor_df.xs(latest_ts, level="timestamp")
+    latest_factors_raw = factor_df.xs(latest_ts, level="timestamp")
+
+    # Run pre-flight gates BEFORE imputation so NaN rates are honest
+    from utils.preflight import run_preflight
+    _prev_df_early = _load_previous_recommendations(
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "output", "latest.csv")
+    )
+    _prev_universe = (
+        set(_prev_df_early["market"])
+        if not _prev_df_early.empty and "market" in _prev_df_early.columns
+        else None
+    )
+    preflight = run_preflight(
+        latest_ts=latest_ts,
+        latest_factors=latest_factors_raw,
+        current_universe=set(latest_factors_raw.index),
+        previous_universe=_prev_universe,
+    )
+    if preflight["batch_suppression"]:
+        logger.warning(f"Pre-flight FAIL: {preflight['batch_suppression']} — all picks → watch-only")
+    if preflight["bad_features"]:
+        logger.warning(f"Pre-flight bad features (NaN>20%): {preflight['bad_features']}")
+    for w in preflight["warnings"]:
+        logger.info(f"Pre-flight warn: {w}")
+
     # Binance factors may be NaN if binance data lags — fill with 0 (neutral signal)
-    latest_factors = latest_factors.fillna(0)
+    latest_factors = latest_factors_raw.fillna(0)
     # Drop coins with all zeros (truly no data)
     latest_factors = latest_factors[latest_factors.any(axis=1)]
 
@@ -292,9 +320,33 @@ def _run(args):
     score = _compute_score(latest_factors, args)
     score_sorted = score.sort_values(ascending=False)
 
+    # --- Per-coin full-universe prediction (direction + expected% + confidence) ---
+    # Uses sigma-bucket calibration (output/calibration_sigma.json). Saved alongside
+    # the basket CSV so the user can see predictions for all 100 coins, not just picks.
+    try:
+        from utils.magnitude import predict_batch as _predict_batch
+        short_predictions_df = _predict_batch("short_6h", score, closes=closes, horizon_h=short_horizon_h)
+        short_predictions_df["timestamp"] = pd.Timestamp(latest_ts).isoformat()
+        # Apply pre-flight suppression
+        short_predictions_df["suppression"] = preflight["batch_suppression"] or ""
+        short_predictions_df["actionable"] = (
+            (short_predictions_df["sigma"] >= 1.0) & (preflight["batch_suppression"] is None)
+        )
+        logger.info(
+            "Full-universe SHORT predictions: 🔥%s ✅%s ▫%s (n=%s)",
+            int((short_predictions_df["sigma"] >= 2.0).sum()),
+            int(((short_predictions_df["sigma"] >= 1.0) & (short_predictions_df["sigma"] < 2.0)).sum()),
+            int(((short_predictions_df["sigma"] >= 0.5) & (short_predictions_df["sigma"] < 1.0)).sum()),
+            len(short_predictions_df),
+        )
+    except Exception as e:
+        logger.warning(f"Per-coin prediction (short) failed: {e}")
+        short_predictions_df = None
+
     # --- Long model scoring (independent, regime-gated, execution-mode-gated) ---
     long_model_score_sorted = None
     long_model_active = False
+    long_predictions_df = None
     long_execution_mode = getattr(config.LongModel, "EXECUTION_MODE", "disabled")
     try:
         long_model_path = getattr(config.LongModel, "MODEL_PATH", "models/xsec_long.pkl")
@@ -303,42 +355,83 @@ def _run(args):
         if long_execution_mode == "disabled":
             logger.info("Long model DISABLED (LongModel.EXECUTION_MODE='disabled')")
         elif os.path.exists(abs_long_model_path) and not args.no_model:
-            # Check BTC regime gate
+            # F1 unified (2026-04-25): 12h model uses the SAME unified factor pipeline
+            # as the 6h model — only target horizon differs. Just reuse latest_factors
+            # (already z-scored above). Rank correlation between 6h/12h predictions is 0.91.
             btc_regime = compute_btc_regime(closes)
             latest_regime = btc_regime.loc[latest_ts] if latest_ts in btc_regime.index else None
+            latest_long_factors = latest_factors  # same features as short model
 
-            if latest_regime is not None and latest_regime["regime_bull"] == 1.0:
-                # Compute long factors for latest timestamp
-                long_factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
-                long_cal_cols = LONG_CALENDAR_COLS
-                long_zscore_cols = [c for c in long_factor_df.columns if c not in long_cal_cols]
-                long_factor_df = crosssection_zscore(long_factor_df, cols=long_zscore_cols)
-                long_factor_df = filter_long_frame_by_universe(long_factor_df, selected_index)
-                latest_long_factors = long_factor_df.xs(latest_ts, level="timestamp")
-                latest_long_factors = latest_long_factors.fillna(0)
-                latest_long_factors = latest_long_factors[latest_long_factors.any(axis=1)]
-
-                from models.xgb_ranker import XSecRanker
-                long_model = XSecRanker.load(abs_long_model_path)
-                long_scores = long_model.predict(latest_long_factors)
-                long_model_score_sorted = pd.Series(long_scores, index=latest_long_factors.index).sort_values(ascending=False)
-                long_model_active = True
-                logger.info(
-                    f"Long model ACTIVE (regime_bull=1, btc_7d={latest_regime['btc_ret_7d']:+.2%}, "
-                    f"btc_30d={latest_regime['btc_ret_30d']:+.2%}): {len(long_model_score_sorted)} coins scored"
+            from models.xgb_ranker import XSecRanker
+            long_model = XSecRanker.load(abs_long_model_path)
+            long_scores = long_model.predict(latest_long_factors)
+            long_model_score_sorted = pd.Series(long_scores, index=latest_long_factors.index).sort_values(ascending=False)
+            long_model_active = True
+            regime_str = "bull" if latest_regime is not None and latest_regime.get("regime_bull") == 1.0 else "neutral/bear"
+            btc7 = (latest_regime['btc_ret_7d'] if latest_regime is not None else None)
+            btc30 = (latest_regime['btc_ret_30d'] if latest_regime is not None else None)
+            logger.info(
+                f"Long model ACTIVE (regime={regime_str}, btc_7d={btc7}, btc_30d={btc30}): "
+                f"{len(long_model_score_sorted)} coins scored"
+            )
+            # Per-coin full-universe predictions (long model, 12h)
+            try:
+                from utils.magnitude import predict_batch as _predict_batch_long
+                long_predictions_df = _predict_batch_long(
+                    "long_12h",
+                    long_model_score_sorted.sort_index(),
+                    closes=closes,
+                    horizon_h=long_horizon_h,
                 )
-            else:
-                regime_info = ""
-                if latest_regime is not None:
-                    regime_info = f" (btc_7d={latest_regime['btc_ret_7d']:+.2%}, btc_30d={latest_regime['btc_ret_30d']:+.2%})"
-                logger.info(f"Long model INACTIVE: BTC regime not bullish{regime_info}")
+                long_predictions_df["timestamp"] = pd.Timestamp(latest_ts).isoformat()
+                long_predictions_df["suppression"] = preflight["batch_suppression"] or ""
+                long_predictions_df["actionable"] = (
+                    (long_predictions_df["sigma"] >= 1.0) & (preflight["batch_suppression"] is None)
+                )
+            except Exception as _pe:
+                logger.warning(f"Per-coin prediction (long) failed: {_pe}")
+                long_predictions_df = None
     except Exception as e:
         logger.warning(f"Long model scoring failed: {e}")
+
+    # --- Enrich predictions with consensus + per-coin reliability ---
+    try:
+        from utils.enrich import enrich_predictions
+        short_predictions_df, long_predictions_df = enrich_predictions(
+            short_predictions_df, long_predictions_df
+        )
+        if short_predictions_df is not None:
+            cons_n = int(short_predictions_df.get("consensus", pd.Series([False]*len(short_predictions_df))).sum())
+            trust_n = int((short_predictions_df.get("trust_tag", pd.Series([""]*len(short_predictions_df))) == "⭐").sum())
+            warn_n  = int((short_predictions_df.get("trust_tag", pd.Series([""]*len(short_predictions_df))) == "⚠").sum())
+            logger.info(f"Enrichment SHORT: consensus={cons_n}  ⭐trusted={trust_n}  ⚠untrusted={warn_n}")
+    except Exception as _ee:
+        logger.warning(f"Enrichment failed: {_ee}")
 
     execution_mode = getattr(config.Portfolio, "LIVE_EXECUTION_MODE", "short_only")
     watch_long_n = getattr(config.Portfolio, "LIVE_WATCH_LONG_N", config.Portfolio.LONG_N)
     exec_short_n = getattr(config.Portfolio, "LIVE_EXEC_SHORT_N", config.Portfolio.SHORT_N)
     require_bitget = getattr(config.Portfolio, "LIVE_REQUIRE_BITGET_TRADABLE", False)
+
+    # --- IC gate (CLAUDE.md §7 auto-enforcement) ---
+    # Evaluate gate state per-side from ic_history*.json. If a side is in
+    # FREEZE/LIQUIDATE, force watch-only / block. Always persist state for
+    # health_snapshot to read.
+    from utils.ic_gate import evaluate_all as _evaluate_gates
+    gates = _evaluate_gates(persist=True)
+    short_gate = gates["short"]
+    long_gate = gates["long"]
+    logger.info(
+        f"IC gate: short={short_gate.status} (last={short_gate.last_ic}); "
+        f"long={long_gate.status} (last={long_gate.last_ic})"
+    )
+    if short_gate.watch_only and execution_mode == "short_only":
+        logger.warning(f"IC gate SHORT={short_gate.status}: forcing short to watch-only ({short_gate.reason})")
+        execution_mode = "watch_only_all"  # custom marker handled below
+    if long_gate.watch_only:
+        logger.warning(f"IC gate LONG={long_gate.status}: long forced to watch-only ({long_gate.reason})")
+    short_blocked = short_gate.block
+    long_blocked = long_gate.block
     prev_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output", "latest.csv")
     prev_df = _load_previous_recommendations(prev_path)
 
@@ -370,6 +463,20 @@ def _run(args):
         if not is_bullish_day:
             logger.warning(f"Calendar filter: {now_kst.strftime('%A')} KST — suppressing LONG signals (Fri/weekend)")
             long_n = 0
+
+    # --- Apply IC gate overrides (§7 auto-enforcement) ---
+    # Block takes precedence over watch-only. Watch-only demotes 'actionable'
+    # and re-labels the long side to WATCH_LONG.
+    if long_blocked:
+        logger.warning("IC gate LONG=LIQUIDATE: emitting 0 long picks")
+        long_n = 0
+    elif long_gate.watch_only and long_side_label == "LONG":
+        logger.warning("IC gate LONG=FREEZE: demoting LONG → WATCH_LONG")
+        long_side_label = "WATCH_LONG"
+    if short_blocked:
+        logger.warning("IC gate SHORT=LIQUIDATE: emitting 0 short picks")
+        short_n = 0
+    short_watch_only = short_gate.watch_only and not short_blocked
 
     # --- Rebalancing buffer: reduce turnover by keeping existing positions ---
     rebal_buffer = config.Portfolio.REBAL_BUFFER
@@ -478,7 +585,11 @@ def _run(args):
             long_refresh_reason=long_refresh_reason,
             next_long_rebalance_ts=next_long_rebalance_ts,
             next_short_rebalance_ts=next_short_rebalance_ts,
+            short_watch_only=short_watch_only,
         )
+
+        # Save full-universe per-coin predictions (both horizons) for user to browse
+        _save_predictions_full(latest_ts, short_predictions_df, long_predictions_df)
 
     # Telegram notification with live prices + previous performance
     if not args.dry_run and not args.no_telegram:
@@ -544,12 +655,115 @@ def _run(args):
             if perf_msg:
                 send_message(perf_msg)
             sent = send_message(msg)
+
+            # --- New: regime header + per-coin predictions ---
+            try:
+                from utils.telegram import format_per_coin_predictions, format_regime_header
+                # Build regime row (latest BTC regime snapshot)
+                regime_row = None
+                try:
+                    btc_regime = compute_btc_regime(closes)
+                    if latest_ts in btc_regime.index:
+                        regime_row = btc_regime.loc[latest_ts].to_dict()
+                except Exception:
+                    pass
+                # IC gate state for header
+                ic_state = {
+                    "short": {"status": short_gate.status, "last_ic": short_gate.last_ic},
+                    "long":  {"status": long_gate.status,  "last_ic": long_gate.last_ic},
+                }
+                parts = [
+                    "━━━━━━━━━━━━━━━━━━━━━━",
+                    "  🎯 <b>Per-coin 예측 (전체 유니버스)</b>",
+                    "━━━━━━━━━━━━━━━━━━━━━━",
+                    format_regime_header(latest_ts, regime_row, ic_state, preflight),
+                    "",
+                ]
+                if short_predictions_df is not None:
+                    parts.append(format_per_coin_predictions(
+                        short_predictions_df, horizon_h=short_horizon_h,
+                        title="🔎 6h 예측",
+                        min_sigma=1.0, max_rows=15,
+                    ))
+                    parts.append("")
+                if long_predictions_df is not None:
+                    parts.append(format_per_coin_predictions(
+                        long_predictions_df, horizon_h=long_horizon_h,
+                        title="🔎 12h 예측",
+                        min_sigma=1.0, max_rows=15,
+                    ))
+                    parts.append("")
+                parts.append(
+                    "<code>🔥 (|σ|≥2, 60%, 3%) ✅ (1σ+, 55-57%, 2%) ▫ (0.5σ+, 1%)</code>"
+                )
+                parts.append(
+                    "<code>확률=방향 적중률, 기대=calibrated 예상 수익, [..]=95% CI</code>"
+                )
+                parts.append("━━━━━━━━━━━━━━━━━━━━━━")
+                send_message("\n".join(parts))
+            except Exception as _pe:
+                logger.warning(f"Per-coin telegram section failed: {_pe}")
+
             if sent:
                 logger.info("Telegram report sent")
         except Exception as e:
             logger.warning(f"Telegram notification failed: {e}")
 
     logger.info("=== fetch_and_rank END ===")
+
+
+def _save_predictions_full(ts, short_df, long_df):
+    """Save full-universe per-coin predictions (both horizons) to output/predictions_*.csv.
+
+    Columns: timestamp, market, horizon_h, score, sigma, tag, label, direction,
+             expected_pct, hit_rate, typical_move_pct, coin_vol_pct
+    """
+    out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
+    os.makedirs(out_dir, exist_ok=True)
+    ts_str = ts.strftime("%Y%m%dT%H%M") if hasattr(ts, "strftime") else str(ts)[:16].replace(" ", "T")
+
+    frames = []
+    if short_df is not None and len(short_df):
+        d = short_df.reset_index().copy()
+        d["horizon_h"] = 6
+        d["side_hint"] = d["direction"].map({1: "UP", -1: "DOWN", 0: "FLAT"})
+        frames.append(d)
+    if long_df is not None and len(long_df):
+        d = long_df.reset_index().copy()
+        d["horizon_h"] = 12
+        d["side_hint"] = d["direction"].map({1: "UP", -1: "DOWN", 0: "FLAT"})
+        frames.append(d)
+    if not frames:
+        logger.warning("No predictions to save")
+        return
+
+    df = pd.concat(frames, ignore_index=True)
+    cols = ["timestamp", "market", "horizon_h", "side_hint", "direction",
+            "direction_prob", "sigma", "tag", "label",
+            "expected_pct", "ci_95_low", "ci_95_high",
+            "hit_rate", "typical_move_pct", "coin_vol_pct",
+            "position_size_pct",
+            "consensus", "consensus_tag", "consensus_note",
+            "trust_tag", "trust_note", "trust_hit_rate",
+            "suppression", "actionable", "score"]
+    df = df[[c for c in cols if c in df.columns]]
+
+    path = os.path.join(out_dir, f"predictions_{ts_str}.csv")
+    df.to_csv(path, index=False)
+    # latest-predictions symlink
+    latest = os.path.join(out_dir, "latest_predictions.csv")
+    try:
+        if os.path.lexists(latest):
+            os.remove(latest)
+        os.symlink(os.path.basename(path), latest)
+    except Exception:
+        pass
+    logger.info(
+        "Saved full-universe predictions: %s (n=%s, 🔥%s ✅%s)",
+        path, len(df),
+        int((df["sigma"] >= 2.0).sum()),
+        int(((df["sigma"] >= 1.0) & (df["sigma"] < 2.0)).sum()),
+    )
 
 
 def _save_recommendations(
@@ -567,6 +781,7 @@ def _save_recommendations(
     long_refresh_reason="watch_seed",
     next_long_rebalance_ts=None,
     next_short_rebalance_ts=None,
+    short_watch_only=False,
 ):
     out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
     os.makedirs(out_dir, exist_ok=True)
@@ -621,7 +836,7 @@ def _save_recommendations(
             "refresh_reason": "refresh_6h",
             "next_rebalance_at": pd.Timestamp(next_short_rebalance_ts).isoformat() if next_short_rebalance_ts is not None else None,
             "bitget_symbol": market_to_bitget_symbol(market, contract_map or {}),
-            "actionable": True,
+            "actionable": not short_watch_only,
         })
 
     df = pd.DataFrame(rows)

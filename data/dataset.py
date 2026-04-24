@@ -11,12 +11,14 @@ from data.features import (
     load_binance_pivot,
     compute_factors,
     compute_long_factors,
+    compute_unified_factors,
     compute_forward_returns,
     compute_residual_returns,
     compute_btc_regime,
     crosssection_zscore,
     CALENDAR_COLS,
     LONG_CALENDAR_COLS,
+    UNIFIED_CALENDAR_COLS,
     build_top_liquidity_universe_index,
     filter_long_frame_by_universe,
     filter_long_series_by_universe,
@@ -37,19 +39,22 @@ def build_dataset(
     holdout_ratio: float = _HOLDOUT_RATIO_CONFIG,
     horizon: int | None = None,
     side: str = "short",
+    target: str = "residual",
+    regime_filter: str = "default",
+    include_macro_globals: bool = True,
 ) -> dict:
     """
-    Load data, compute factors and residual returns, split temporally.
+    Load data, compute factors and target returns, split temporally.
 
-    Returns dict with keys:
-        X_train:           pd.DataFrame, index=(timestamp, market), columns=factor_names
-        y_train:           pd.Series,    index=(timestamp, market), values=residual_return
-        X_holdout:         pd.DataFrame  (same structure)
-        y_holdout:         pd.Series     (same structure)
-        train_timestamps:  list of timestamps
-        holdout_timestamps: list of timestamps
-        factor_cols:       list of factor column names
-        split_ts:          the timestamp where train ends / holdout begins
+    Parameters
+    ----------
+    target : str
+        "residual" (default)  → beta-adjusted return (coin_fwd − β · BTC_fwd)
+        "absolute"            → raw coin forward return (what the user trades on)
+
+    "absolute" is preferred for production predictions because it directly
+    matches what the user sees as "% move in the next H hours", without the
+    residual→absolute translation gap that compressed pred_std to ~0.003.
     """
     # ------------------------------------------------------------------
     # 1. Load OHLCV and compute features
@@ -65,33 +70,52 @@ def build_dataset(
     beta_window = config.Data.BETA_ROLLING_WINDOW   # 168
 
     binance_closes = load_binance_pivot(closes.columns.tolist(), days=days)
-    if side == "long":
-        factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
-        logger.info("Using LONG-specialist factors (momentum/breakout/trend)")
+    if side == "unified":
+        factor_df = compute_unified_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
+        logger.info("Using UNIFIED factor library (F1: same features for 6h and 12h)")
+    elif side == "long":
+        factor_df = compute_long_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes,
+                                          include_macro_globals=include_macro_globals)
+        logger.info(f"Using LONG-specialist factors (macro_globals={include_macro_globals})")
     else:
         factor_df = compute_factors(closes, opens, highs, lows, volumes, binance_closes=binance_closes)
     residuals  = compute_residual_returns(closes, horizon=horizon, beta_window=beta_window)
     fwd_returns = compute_forward_returns(closes, horizon=horizon)
 
+    # Pick target series based on mode
+    if target == "absolute":
+        target_wide = fwd_returns
+        target_col = "fwd_return"
+        logger.info(f"Target = absolute forward return ({horizon}h coin_fwd)")
+    else:
+        target_wide = residuals
+        target_col = "residual_return"
+        logger.info(f"Target = residual return ({horizon}h coin_fwd − β · BTC_fwd)")
+
     # ------------------------------------------------------------------
     # 2. Normalise factors (cross-sectional z-score per timestamp)
     # ------------------------------------------------------------------
     factor_cols  = factor_df.columns.tolist()
-    cal_cols = LONG_CALENDAR_COLS if side == "long" else CALENDAR_COLS
+    if side == "unified":
+        cal_cols = UNIFIED_CALENDAR_COLS
+    elif side == "long":
+        cal_cols = LONG_CALENDAR_COLS
+    else:
+        cal_cols = CALENDAR_COLS
     zscore_cols  = [c for c in factor_cols if c not in cal_cols]
     factor_df    = crosssection_zscore(factor_df, cols=zscore_cols)
 
     # ------------------------------------------------------------------
     # 3. Stack residuals to long format (timestamp, market)
     # ------------------------------------------------------------------
-    residuals_long = residuals.stack(future_stack=True)
-    residuals_long.index.names = ["timestamp", "market"]
-    residuals_long.name = "residual_return"
+    target_long = target_wide.stack(future_stack=True)
+    target_long.index.names = ["timestamp", "market"]
+    target_long.name = target_col
 
     top_n = getattr(config.Data, "LIQUIDITY_TOP_N", 0)
     selected_index, coverage = build_top_liquidity_universe_index(closes, volumes, top_n=top_n)
     factor_df = filter_long_frame_by_universe(factor_df, selected_index)
-    residuals_long = filter_long_series_by_universe(residuals_long, selected_index)
+    target_long = filter_long_series_by_universe(target_long, selected_index)
     logger.info(
         "Active universe: top %s by %sh traded value (avg selected=%.1f, min=%s, max=%s)",
         top_n,
@@ -106,12 +130,22 @@ def build_dataset(
     # ------------------------------------------------------------------
     import pandas as pd
 
-    combined = factor_df.join(residuals_long, how="inner").dropna()
+    combined = factor_df.join(target_long, how="inner").dropna()
 
     # ------------------------------------------------------------------
     # 4b. Regime filter for long side: keep only bull timestamps
+    #
+    # regime_filter:
+    #   "default" → bull-only for long side (legacy, creates baseline drift)
+    #   "all"     → no regime filter, keep all timestamps (unifies baseline
+    #                with short model → resolves 90% direction disagreement)
     # ------------------------------------------------------------------
-    if side == "long":
+    if side == "unified":
+        # Unified side: all-regime training, no filter
+        pass
+    elif side == "long" and regime_filter == "all":
+        logger.info("Regime filter DISABLED (regime_filter='all') — training on all regimes")
+    elif side == "long":
         btc_regime = compute_btc_regime(closes)
         bull_timestamps = btc_regime.index[btc_regime["regime_bull"] == 1.0]
         pre_regime = len(combined)
@@ -132,10 +166,10 @@ def build_dataset(
     # 5. Drop extreme outliers: |y| > 0.5 (data error)
     # ------------------------------------------------------------------
     pre_len = len(combined)
-    combined = combined[combined["residual_return"].abs() <= OUTLIER_THRESHOLD]
+    combined = combined[combined[target_col].abs() <= OUTLIER_THRESHOLD]
     n_dropped = pre_len - len(combined)
     if n_dropped > 0:
-        logger.warning(f"Dropped {n_dropped} rows with |residual_return| > {OUTLIER_THRESHOLD}")
+        logger.warning(f"Dropped {n_dropped} rows with |{target_col}| > {OUTLIER_THRESHOLD}")
 
     # ------------------------------------------------------------------
     # 6. Temporal split — NEVER shuffle, NEVER mix
@@ -156,9 +190,9 @@ def build_dataset(
     holdout_data = combined[holdout_mask]
 
     X_train   = train_data[factor_cols]
-    y_train   = train_data["residual_return"]
+    y_train   = train_data[target_col]
     X_holdout = holdout_data[factor_cols]
-    y_holdout = holdout_data["residual_return"]
+    y_holdout = holdout_data[target_col]
 
     # ------------------------------------------------------------------
     # 7. Log sizes
@@ -182,4 +216,6 @@ def build_dataset(
         "factor_cols":       factor_cols,
         "split_ts":          split_ts,
         "horizon":           horizon,
+        "target":            target,
+        "target_col":        target_col,
     }

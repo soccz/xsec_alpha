@@ -200,7 +200,80 @@ def compute_residual_returns(
 # 6 cross-sectional factors
 # ---------------------------------------------------------------------------
 
-CALENDAR_COLS = ["dow_bull", "hour_vol"]  # broadcast per-timestamp, skip cross-sectional z-score
+CALENDAR_COLS = [
+    "dow_bull", "hour_vol",
+    # Tier 3 macro features (global per timestamp — skip cross-sectional z-score)
+    "btc_mom_7d", "btc_vol_7d", "alt_season_index",
+]
+
+
+def compute_macro_and_meta_factors(
+    closes: pd.DataFrame,
+    binance_closes: pd.DataFrame | None = None,
+    include_globals: bool = True,
+) -> dict:
+    """Extra features from 20-trader consensus (Tier 3).
+
+    include_globals: if False, skip features that are constant across coins at
+    each timestamp (btc_mom_7d, btc_vol_7d, alt_season_index). These help the
+    LONG 12h (bull-regime) model via time-series × coin-feature interaction
+    but harm a pure cross-sectional ranker (SHORT) by absorbing model capacity
+    without adding cross-section signal.
+
+    Returns dict of wide-format (timestamp × market) DataFrames to merge into
+    the factor library. All values are either global-per-timestamp (broadcast)
+    or per-coin.
+
+    Added features:
+      - btc_mom_7d          : BTC 7d return (global, broadcast)
+      - btc_vol_7d          : BTC 7d realized vol (global)
+      - alt_season_index    : median(non-BTC 24h return) - BTC 24h return (global)
+      - kimchi_zscore_24h   : per-coin z-score of kimchi premium over 24h rolling
+      - listing_age_days    : per-coin age since first non-NaN close (clipped to 60d)
+    """
+    out = {}
+    btc_col = "KRW-BTC"
+
+    if btc_col in closes.columns and include_globals:
+        btc = closes[btc_col]
+        btc_7d_ret = btc.pct_change(7 * 24)
+        btc_vol_7d = btc.pct_change(1).rolling(7 * 24).std() * np.sqrt(7 * 24)
+        btc_24h_ret = btc.pct_change(24)
+
+        # broadcast global series to (timestamp × market) wide frame
+        def _broadcast(s):
+            return pd.DataFrame(
+                np.tile(s.values.reshape(-1, 1), (1, len(closes.columns))),
+                index=closes.index, columns=closes.columns,
+            )
+
+        out["btc_mom_7d"]  = _broadcast(btc_7d_ret)
+        out["btc_vol_7d"]  = _broadcast(btc_vol_7d)
+
+        # Alt season: median of non-BTC 24h returns − BTC 24h return
+        non_btc_24h = closes.drop(columns=[btc_col]).pct_change(24)
+        alt_med = non_btc_24h.median(axis=1)
+        alt_season = alt_med - btc_24h_ret
+        out["alt_season_index"] = _broadcast(alt_season)
+
+    # Kimchi z-score (per-coin rolling z of log Upbit/Binance premium)
+    if binance_closes is not None and not binance_closes.empty:
+        common_coins = [c for c in closes.columns if c in binance_closes.columns]
+        if common_coins:
+            upbit_p = closes[common_coins].reindex(index=closes.index)
+            bn_p    = binance_closes[common_coins].reindex(index=closes.index)
+            raw = np.log(upbit_p / bn_p.replace(0, np.nan))
+            mean24 = raw.rolling(24).mean()
+            std24  = raw.rolling(24).std().replace(0, np.nan)
+            z = ((raw - mean24) / std24)
+            # negate so "negative z = Upbit cheap vs recent baseline" = buy signal
+            out["kimchi_zscore_24h"] = (-z).reindex(columns=closes.columns)
+
+    # (listing_age_days dropped: after warmup drop all coins share the same
+    # first-valid-index, making the cross-sectional std zero. Requires upstream
+    # first-listing-date from DB to be useful — out of scope for this iteration.)
+
+    return out
 
 
 def compute_factors(
@@ -280,6 +353,15 @@ def compute_factors(
 
             logger.info(f"Binance factors added: {len(common_coins)} coins, {len(common_ts)} timestamps")
 
+    # --- Tier 3 meta factors (per-coin only, globals skipped for SHORT) ---
+    # SHORT is a pure cross-sectional ranker — global features (btc_mom_7d etc)
+    # have 0 cross-section signal and absorb model capacity. Skip them here;
+    # LONG 12h (bull regime) uses them via interaction, see compute_long_factors.
+    extras = compute_macro_and_meta_factors(closes, binance_closes=binance_closes, include_globals=False)
+    factor_dict.update(extras)
+    if extras:
+        logger.info(f"Tier 3 factors added (short, per-coin only): {list(extras.keys())}")
+
     stacked = pd.concat(
         {name: df.stack(future_stack=True) for name, df in factor_dict.items()},
         axis=1,
@@ -308,7 +390,101 @@ def compute_factors(
 # Long-specialist factors (trend / breakout / momentum)
 # ---------------------------------------------------------------------------
 
-LONG_CALENDAR_COLS = ["dow_bull", "hour_vol"]  # same calendar cols
+LONG_CALENDAR_COLS = [
+    "dow_bull", "hour_vol",
+    "btc_mom_7d", "btc_vol_7d", "alt_season_index",
+]
+
+
+def compute_unified_factors(
+    closes: pd.DataFrame,
+    opens: pd.DataFrame,
+    highs: pd.DataFrame,
+    lows: pd.DataFrame,
+    volumes: pd.DataFrame,
+    binance_closes: pd.DataFrame = None,
+) -> pd.DataFrame:
+    """Unified cross-sectional factor library — F1 (2026-04-25).
+
+    Merges the union of SHORT + LONG factor sets into a single pipeline.
+    Both 6h and 12h models now train on the same feature set; only the
+    target horizon differs. Resolves the 90%-direction-disagreement issue
+    that came from SHORT and LONG seeing different features.
+
+    Features (10 total):
+      Cross-sectional (z-scored per timestamp):
+        reversal_1h, reversal_4h, volatility_inv_24h, order_flow_bear,
+        range_contraction_12h, binance_lead_1h, kimchi_inv, kimchi_zscore_24h
+      Calendar (NOT z-scored — constant across coins per timestamp):
+        dow_bull, hour_vol
+    """
+    returns_1h = closes.pct_change(1)
+
+    # Cross-sectional factors (union)
+    reversal_1h = -closes.pct_change(1)
+    reversal_4h = -closes.pct_change(4)
+    volatility_inv_24h = -returns_1h.rolling(24).std()
+    intrabar_range = (highs - lows) / closes.replace(0, np.nan)
+    range_contraction_12h = -intrabar_range.rolling(12).mean()
+
+    direction = np.sign(closes - opens)
+    direction[direction == 0] = 1
+    signed_vol = volumes * direction
+    vol_sum_6h = volumes.rolling(6).sum().replace(0, np.nan)
+    order_flow_bear = -(signed_vol.rolling(6).sum() / vol_sum_6h)
+
+    factor_dict = {
+        "reversal_1h":           reversal_1h,
+        "reversal_4h":           reversal_4h,
+        "volatility_inv_24h":    volatility_inv_24h,
+        "order_flow_bear":       order_flow_bear,
+        "range_contraction_12h": range_contraction_12h,
+    }
+
+    # Binance cross-exchange factors
+    if binance_closes is not None and not binance_closes.empty:
+        common_ts = closes.index.intersection(binance_closes.index)
+        common_coins = [c for c in closes.columns if c in binance_closes.columns]
+        if len(common_ts) > 0 and len(common_coins) > 0:
+            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1)
+            bn_r1 = binance_closes[common_coins].loc[common_ts].pct_change(1)
+            factor_dict["binance_lead_1h"] = (bn_r1 - upbit_r1).reindex(index=closes.index, columns=closes.columns)
+
+            upbit_p = closes[common_coins].reindex(index=closes.index)
+            bn_p = binance_closes[common_coins].reindex(index=closes.index)
+            raw_premium = np.log(upbit_p / bn_p.replace(0, np.nan))
+            factor_dict["kimchi_inv"] = (-raw_premium).reindex(columns=closes.columns)
+
+            logger.info(f"Binance factors added (unified): {len(common_coins)} coins, {len(common_ts)} timestamps")
+
+    # Tier 3 per-coin extras (no globals — they hurt cross-section)
+    extras = compute_macro_and_meta_factors(closes, binance_closes=binance_closes, include_globals=False)
+    factor_dict.update(extras)
+    if extras:
+        logger.info(f"Tier 3 factors added (unified, per-coin only): {list(extras.keys())}")
+
+    stacked = pd.concat(
+        {name: df.stack(future_stack=True) for name, df in factor_dict.items()},
+        axis=1,
+    )
+    stacked.index.names = ["timestamp", "market"]
+
+    # Calendar features
+    timestamps = closes.index
+    kst = timestamps + pd.Timedelta(hours=9)
+    dow = kst.dayofweek
+    dow_bull_vals = np.where(dow < 3, 1.0, np.where(dow == 3, 0.0, -1.0))
+    hour = kst.hour
+    hour_vol_vals = (((hour >= 7) & (hour <= 9)) | (hour >= 22) | (hour <= 1)).astype(float)
+    n_coins = len(closes.columns)
+    stacked["dow_bull"] = np.repeat(dow_bull_vals, n_coins)
+    stacked["hour_vol"] = np.repeat(hour_vol_vals, n_coins)
+
+    return stacked
+
+
+# Unified calendar cols (same as SHORT)
+UNIFIED_CALENDAR_COLS = ["dow_bull", "hour_vol"]
 
 
 def compute_long_factors(
@@ -318,6 +494,7 @@ def compute_long_factors(
     lows: pd.DataFrame,
     volumes: pd.DataFrame,
     binance_closes: pd.DataFrame = None,
+    include_macro_globals: bool = True,
 ) -> pd.DataFrame:
     """
     Compute long-specialist cross-sectional factors (v3).
@@ -373,6 +550,12 @@ def compute_long_factors(
             factor_dict["binance_lead_1h"] = bl1h
 
             logger.info(f"Binance factors added (long): {len(common_coins)} coins, {len(common_ts)} timestamps")
+
+    # --- Tier 3 macro/meta factors (shared with short model) ---
+    extras = compute_macro_and_meta_factors(closes, binance_closes=binance_closes, include_globals=include_macro_globals)
+    factor_dict.update(extras)
+    if extras:
+        logger.info(f"Tier 3 factors added (long, include_globals={include_macro_globals}): {list(extras.keys())}")
 
     stacked = pd.concat(
         {name: df.stack(future_stack=True) for name, df in factor_dict.items()},
