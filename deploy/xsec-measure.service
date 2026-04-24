@@ -1,0 +1,16 @@
+[Unit]
+Description=xsec_alpha daily holdout IC measurement (F1)
+After=network.target
+
+[Service]
+Type=oneshot
+User=soccz
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+EnvironmentFile=/mnt/20t/main/gan_t/.env
+# Measure-only (no retrain): appends to output/wf_history.json so health_snapshot
+# sees live IC trend. Also runs drift_detector so factor stability is logged.
+ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/wf_holdout_harness.py --measure-only
+ExecStartPost=/home/soccz/.pyenv/versions/3.12.9/bin/python -m utils.drift_detector
+TimeoutStartSec=600
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/logs/measure.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/logs/measure.log

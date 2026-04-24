@@ -1,0 +1,10 @@
+[Unit]
+Description=xsec_alpha daily IC measurement timer (F1)
+
+[Timer]
+# Daily 00:00 UTC (KST 09:00) — cheap holdout IC + drift check, no retrain
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
