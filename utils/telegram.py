@@ -40,6 +40,136 @@ def _fmt_krw(price):
         return f"{price:.4f}"
 
 
+def format_regime_header(latest_ts, btc_regime_row=None, ic_state: dict | None = None,
+                          preflight: dict | None = None) -> str:
+    """Top-of-message regime + model-health summary."""
+    ts_str = str(latest_ts)[:16]
+    lines = [f"📅 <code>{ts_str} UTC</code>"]
+
+    if btc_regime_row is not None:
+        try:
+            import math
+            def _fmt(v):
+                if v is None: return "—"
+                if isinstance(v, float) and math.isnan(v): return "—"
+                return f"{v:+.1%}"
+            btc7 = btc_regime_row.get("btc_ret_7d")
+            btc30 = btc_regime_row.get("btc_ret_30d")
+            bull = btc_regime_row.get("regime_bull")
+            if isinstance(bull, float) and math.isnan(bull): bull = None
+            tag = "🟢 bull" if bull == 1.0 else ("🟡 neutral/bear" if bull is not None else "❓")
+            lines.append(f"📈 Regime: {tag}  BTC 7d {_fmt(btc7)} / 30d {_fmt(btc30)}")
+        except Exception:
+            pass
+
+    if ic_state:
+        parts = []
+        for side, s in ic_state.items():
+            status = s.get("status", "?")
+            last = s.get("last_ic")
+            last_s = f"{last:+.3f}" if last is not None else "—"
+            emoji = {"OK": "🟢", "WARN": "🟡", "FREEZE": "🔴", "LIQUIDATE": "⛔"}.get(status, "⚪")
+            parts.append(f"{emoji} {side.upper()} {last_s}")
+        lines.append("🩺 Model IC: " + " | ".join(parts))
+
+    if preflight:
+        if preflight.get("batch_suppression"):
+            lines.append(f"⚠ Pre-flight: <b>{preflight['batch_suppression']}</b> → 전체 watch-only")
+        elif preflight.get("warnings"):
+            lines.append("⚠ " + "; ".join(preflight["warnings"])[:150])
+
+    # Factor drift (if state file available)
+    try:
+        import json
+        from pathlib import Path
+        drift_path = Path(__file__).resolve().parent.parent / "output" / "drift_state.json"
+        if drift_path.exists():
+            drift = json.loads(drift_path.read_text())
+            flagged = [(c, v) for c, v in drift.get("factors", {}).items()
+                       if v.get("status") in ("DRIFT", "SIGN_FLIP")]
+            if flagged:
+                parts = [f"{c}({v['status']})" for c, v in flagged[:3]]
+                lines.append("📉 Factor drift: " + ", ".join(parts))
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def format_per_coin_predictions(pred_df, horizon_h: int, title: str,
+                                   min_sigma: float = 1.0, max_rows: int = 15) -> str:
+    """Probabilistic per-coin view.
+
+    Each row: tier | coin | arrow | P(hit) | expected% | [CI_low, CI_high] | size
+    """
+    if pred_df is None or len(pred_df) == 0:
+        return ""
+    strong = pred_df[pred_df["sigma"] >= min_sigma].head(max_rows)
+    if strong.empty:
+        return f"<b>{title}</b> <code>{horizon_h}h</code> — |σ|≥{min_sigma} 신호 없음"
+
+    total = len(pred_df)
+    strong_count = int((pred_df["sigma"] >= min_sigma).sum())
+    suppressed = pred_df.get("actionable")
+    suppressed_n = int((~suppressed.fillna(False)).sum()) if suppressed is not None else 0
+
+    lines = [
+        f"<b>{title}</b> <code>{horizon_h}h</code>",
+        f"<code>총 {total} | |σ|≥{min_sigma}: {strong_count} | 표시 {len(strong)}개"
+        + (f" | 억제 {suppressed_n}" if suppressed_n else "")
+        + "</code>",
+        "",
+    ]
+    def _nan(v):
+        return v is None or (isinstance(v, float) and v != v)
+
+    for mkt, r in strong.iterrows():
+        coin = str(mkt).replace("KRW-", "")
+        arrow = "↑" if r["direction"] > 0 else ("↓" if r["direction"] < 0 else "·")
+        prob = r.get("direction_prob")
+        exp  = r.get("expected_pct")
+        lo   = r.get("ci_95_low")
+        hi   = r.get("ci_95_high")
+        size = r.get("position_size_pct")
+        vol  = r.get("coin_vol_pct")
+
+        prob_s = f"{prob*100:.0f}%" if not _nan(prob) else "—"
+        exp_s  = f"{exp:+.2f}%"     if not _nan(exp)  else "N/A"
+        vol_s  = f"±{vol:.1f}%"     if not _nan(vol)  else ""
+        ci_s   = f"[{lo:+.1f}, {hi:+.1f}]" if not _nan(lo) and not _nan(hi) else ""
+        size_s = f" 💰<code>{size:.1f}%</code>" if not _nan(size) and size > 0 else ""
+        tail   = "  <i>(억제)</i>" if (suppressed is not None and not bool(r.get("actionable", True))) else ""
+
+        # Enrichment tags (consensus + trust)
+        cons_tag  = r.get("consensus_tag", "") or ""
+        trust_tag = r.get("trust_tag", "") or ""
+        enrich = (cons_tag + trust_tag).strip()
+        enrich_s = f" {enrich}" if enrich else ""
+
+        # Format: tag | coin | arrow | prob | expected | vol | CI | size | enrich | suppression
+        lines.append(
+            f"  {r.get('tag', '·')} <b>{coin:<6}</b> {arrow}  "
+            f"<code>{prob_s}</code> 기대<code>{exp_s}</code> "
+            f"변<code>{vol_s}</code> <code>{ci_s}</code>{size_s}{enrich_s}{tail}"
+        )
+    return "\n".join(lines)
+
+
+def realized_return(side: str, entry_price: float, exit_price: float) -> float:
+    """Single source of truth for realized-return sign convention.
+
+    Shared by format_performance and scripts/verify_telegram.py so any regression
+    in one is caught by the other.
+
+    'SHORT' in side → short math, else long math. WATCH_LONG is long-direction.
+    """
+    if not (entry_price and exit_price and entry_price > 0):
+        return float("nan")
+    if "SHORT" in str(side).upper():
+        return (entry_price - exit_price) / entry_price
+    return (exit_price - entry_price) / entry_price
+
+
 def _confidence(score, std):
     """Return (stars, label) based on sigma distance."""
     if std <= 0:
@@ -97,14 +227,15 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
     filtered_longs = [(m, s) for m, s in longs.items() if abs(s) / std >= min_sigma] if std > 0 else list(longs.items())
     filtered_shorts = [(m, s) for m, s in shorts.items() if abs(s) / std >= min_sigma] if std > 0 else list(shorts.items())
 
-    # Confidence-weighted position sizing
+    # Confidence-weighted position sizing (sized per side, not mixed)
     # 🔥 (2σ+) = weight 2, ✅ (1σ+) = weight 1
     weights = {}
     for mkt, score in filtered_longs + filtered_shorts:
         sigma = abs(score) / std if std > 0 else 1.0
         weights[mkt] = 2.0 if sigma >= 2.0 else 1.0
 
-    total_weight = sum(weights.values()) if weights else 0
+    long_total_weight = sum(weights[m] for m, _ in filtered_longs) if filtered_longs else 0
+    short_total_weight = sum(weights[m] for m, _ in filtered_shorts) if filtered_shorts else 0
 
     lines = [
         "━━━━━━━━━━━━━━━━━━━━━━",
@@ -121,7 +252,7 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
         lines.append("")
 
     # Summary line
-    if capital and total_weight > 0:
+    if capital and (long_total_weight > 0 or short_total_weight > 0):
         lines.append(f"💰 총 자본 <b>{int(capital):,}원</b> | 🔥 2배 배분 | 손절 <b>{stop_loss_pct or 3.0}%</b>")
         lines.append("")
 
@@ -139,21 +270,19 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
             exp_pct = score * 100
 
             if now and now > 0:
-                target = now * (1 + score)
                 stop = now * (1 - sl_pct)
-                position_amt = int(capital * weights[mkt] / total_weight) if capital and total_weight > 0 else None
+                position_amt = int(capital * weights[mkt] / long_total_weight) if capital and long_total_weight > 0 else None
                 qty = f"{position_amt / now:,.2f}" if position_amt else ""
                 action_label = "관찰" if long_watch_only else "매수"
                 lines.append(
-                    f"  {icon} <b>{coin}</b>  {exp_pct:+.2f}%"
+                    f"  {icon} <b>{coin}</b>  잔차 {exp_pct:+.2f}%"
                     f"\n     {action_label} <code>{_fmt_krw(now)}</code>"
-                    f"  목표 <code>{_fmt_krw(target)}</code>"
                     f"  손절 <code>{_fmt_krw(stop)}</code>"
                 )
                 if position_amt and not long_watch_only:
                     lines.append(f"     수량 <code>{qty}</code>개  금액 <code>{position_amt:,}</code>원")
             else:
-                lines.append(f"  {icon} <b>{coin}</b>  (<b>{exp_pct:+.2f}%</b>)")
+                lines.append(f"  {icon} <b>{coin}</b>  잔차 <b>{exp_pct:+.2f}%</b>")
         lines.append("")
     else:
         empty_label = long_header if long_watch_only else "LONG"
@@ -172,16 +301,14 @@ def format_report(longs, shorts, timestamp, prices: dict = None,
             exp_pct = score * 100
 
             if now and now > 0:
-                target = now * (1 + score)  # score is negative
                 stop = now * (1 + sl_pct)   # short stop = price goes UP
                 lines.append(
-                    f"  {icon} <b>{coin}</b>  {exp_pct:+.2f}%"
+                    f"  {icon} <b>{coin}</b>  잔차 {exp_pct:+.2f}%"
                     f"\n     매도 <code>{_fmt_krw(now)}</code>"
-                    f"  목표 <code>{_fmt_krw(target)}</code>"
                     f"  손절 <code>{_fmt_krw(stop)}</code>"
                 )
             else:
-                lines.append(f"  {icon} <b>{coin}</b>  (<b>{exp_pct:+.2f}%</b>)")
+                lines.append(f"  {icon} <b>{coin}</b>  잔차 <b>{exp_pct:+.2f}%</b>")
         lines.append("")
     else:
         lines.append(f"🔴 <b>SHORT</b> <code>{short_horizon_h}h</code> — 신뢰할 만한 신호 없음")
@@ -229,11 +356,7 @@ def format_performance(prev_df, now_prices: dict) -> str:
             now = now_prices.get(mkt)
 
             if entry and now and entry > 0:
-                if side_name == "LONG":
-                    ret = (now - entry) / entry  # bought → price went up = profit
-                else:
-                    ret = (entry - now) / entry  # shorted → price went down = profit
-
+                ret = realized_return(side_name, entry, now)
                 pnl_list.append(ret)
                 icon = "✅" if ret > 0 else "❌"
                 lines.append(
@@ -245,23 +368,24 @@ def format_performance(prev_df, now_prices: dict) -> str:
                 lines.append(f"  ▫ {coin:<8} 가격 없음")
         lines.append("")
 
-    # Summary
-    all_pnl = long_pnl + watch_long_pnl + short_pnl
-    if all_pnl:
-        avg = sum(all_pnl) / len(all_pnl) * 100
-        wins = sum(1 for p in all_pnl if p > 0)
-        total = len(all_pnl)
-        long_avg = sum(long_pnl) / len(long_pnl) * 100 if long_pnl else 0
-        watch_long_avg = sum(watch_long_pnl) / len(watch_long_pnl) * 100 if watch_long_pnl else 0
-        short_avg = sum(short_pnl) / len(short_pnl) * 100 if short_pnl else 0
+    # Summary — report per side separately (horizons differ: long=12h, short=6h)
+    def _summary(label, pnl):
+        if not pnl:
+            return None
+        avg = sum(pnl) / len(pnl) * 100
+        wins = sum(1 for p in pnl if p > 0)
+        return f"  {label}: {wins}/{len(pnl)} 적중 · 평균 <b>{avg:+.2f}%</b>"
 
-        lines.append(f"<b>요약</b>")
-        lines.append(f"  적중 {wins}/{total} ({wins/total*100:.0f}%)")
-        lines.append(f"  평균 수익: <b>{avg:+.2f}%</b>")
-        if watch_long_pnl:
-            lines.append(f"  LONG {long_avg:+.2f}% | WATCH {watch_long_avg:+.2f}% | SHORT {short_avg:+.2f}%")
-        else:
-            lines.append(f"  LONG {long_avg:+.2f}% | SHORT {short_avg:+.2f}%")
+    any_data = bool(long_pnl or watch_long_pnl or short_pnl)
+    if any_data:
+        lines.append("<b>요약</b>")
+        for row in [
+            _summary("🟢 LONG (12h)", long_pnl),
+            _summary("🟡 WATCH LONG (12h)", watch_long_pnl),
+            _summary("🔴 SHORT (6h)", short_pnl),
+        ]:
+            if row:
+                lines.append(row)
     else:
         lines.append("  이전 데이터 없음")
 
