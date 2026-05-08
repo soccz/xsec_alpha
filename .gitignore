@@ -15,8 +15,9 @@ build/
 output/
 logs/
 
-# Model binaries
+# Model binaries (live + rotated archives)
 models/*.pkl
+models/archive/
 
 # Database
 *.db
@@ -37,3 +38,6 @@ Thumbs.db
 # Temporary
 /tmp/
 *.tmp
+
+# External tool sentinels (e.g. Codex CLI)
+.codex
