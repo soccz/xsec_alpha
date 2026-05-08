@@ -10,6 +10,10 @@ EnvironmentFile=/mnt/20t/main/gan_t/.env
 # F1 (2026-04-25): retrain both horizons on unified 10-feature pipeline.
 # Includes pre-flight (data freshness, lock), promotion gate (IC delta + floor),
 # auto-archive on promote, and calibration rebuild.
+# Fetch fresh data first — main service does this too. Without it the retrain
+# timer fires Sun 20:00 UTC right when DB latest is 17:00 UTC = ~3.005h old,
+# tripping MAX_DATA_AGE_HOURS=3 deterministically (observed 2026-05-03).
+ExecStartPre=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/update_data.py
 ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/retrain_pipeline.py
 TimeoutStartSec=1200
 StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/logs/retrain.log

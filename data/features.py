@@ -179,7 +179,7 @@ def compute_residual_returns(
     Returns DataFrame same shape as closes, with NaN for the last
     `horizon + execution_lag` rows.
     """
-    returns_1h = closes.pct_change(1)
+    returns_1h = closes.pct_change(1, fill_method=None)
 
     btc_col = "KRW-BTC"
     if btc_col not in closes.columns:
@@ -236,9 +236,9 @@ def compute_macro_and_meta_factors(
 
     if btc_col in closes.columns and include_globals:
         btc = closes[btc_col]
-        btc_7d_ret = btc.pct_change(7 * 24)
-        btc_vol_7d = btc.pct_change(1).rolling(7 * 24).std() * np.sqrt(7 * 24)
-        btc_24h_ret = btc.pct_change(24)
+        btc_7d_ret = btc.pct_change(7 * 24, fill_method=None)
+        btc_vol_7d = btc.pct_change(1, fill_method=None).rolling(7 * 24).std() * np.sqrt(7 * 24)
+        btc_24h_ret = btc.pct_change(24, fill_method=None)
 
         # broadcast global series to (timestamp × market) wide frame
         def _broadcast(s):
@@ -251,7 +251,7 @@ def compute_macro_and_meta_factors(
         out["btc_vol_7d"]  = _broadcast(btc_vol_7d)
 
         # Alt season: median of non-BTC 24h returns − BTC 24h return
-        non_btc_24h = closes.drop(columns=[btc_col]).pct_change(24)
+        non_btc_24h = closes.drop(columns=[btc_col]).pct_change(24, fill_method=None)
         alt_med = non_btc_24h.median(axis=1)
         alt_season = alt_med - btc_24h_ret
         out["alt_season_index"] = _broadcast(alt_season)
@@ -296,16 +296,16 @@ def compute_factors(
         dow_bull     — Mon/Tue/Wed KST=+1, Thu=0, Fri/Sat/Sun=-1
         hour_vol     — 1 if KST hour in [7,8,9,22,23,0] (8am/11pm volatility windows)
     """
-    returns_1h = closes.pct_change(1)
+    returns_1h = closes.pct_change(1, fill_method=None)
     btc_col = "KRW-BTC"
 
     # --- Cross-sectional factors ---
 
     # 1. Reversal 1h: recent losers mean-revert over the next few hours.
-    reversal_1h = -closes.pct_change(1)
+    reversal_1h = -closes.pct_change(1, fill_method=None)
 
     # 2. Reversal 4h: same idea on a slightly wider window.
-    reversal_4h = -closes.pct_change(4)
+    reversal_4h = -closes.pct_change(4, fill_method=None)
 
     # NOTE:
     # btc_lead_{1h,4h} was removed from the active factor set because after
@@ -336,8 +336,8 @@ def compute_factors(
         common_coins = [c for c in closes.columns if c in binance_closes.columns]
 
         if len(common_ts) > 0 and len(common_coins) > 0:
-            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1)
-            bn_r1    = binance_closes[common_coins].loc[common_ts].pct_change(1)
+            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1, fill_method=None)
+            bn_r1    = binance_closes[common_coins].loc[common_ts].pct_change(1, fill_method=None)
 
             # binance_lead_1h: binance 1h return > upbit 1h return → upbit hasn't caught up → BUY
             bl1h = (bn_r1 - upbit_r1).reindex(index=closes.index, columns=closes.columns)
@@ -418,11 +418,11 @@ def compute_unified_factors(
       Calendar (NOT z-scored — constant across coins per timestamp):
         dow_bull, hour_vol
     """
-    returns_1h = closes.pct_change(1)
+    returns_1h = closes.pct_change(1, fill_method=None)
 
     # Cross-sectional factors (union)
-    reversal_1h = -closes.pct_change(1)
-    reversal_4h = -closes.pct_change(4)
+    reversal_1h = -closes.pct_change(1, fill_method=None)
+    reversal_4h = -closes.pct_change(4, fill_method=None)
     volatility_inv_24h = -returns_1h.rolling(24).std()
     intrabar_range = (highs - lows) / closes.replace(0, np.nan)
     range_contraction_12h = -intrabar_range.rolling(12).mean()
@@ -446,8 +446,8 @@ def compute_unified_factors(
         common_ts = closes.index.intersection(binance_closes.index)
         common_coins = [c for c in closes.columns if c in binance_closes.columns]
         if len(common_ts) > 0 and len(common_coins) > 0:
-            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1)
-            bn_r1 = binance_closes[common_coins].loc[common_ts].pct_change(1)
+            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1, fill_method=None)
+            bn_r1 = binance_closes[common_coins].loc[common_ts].pct_change(1, fill_method=None)
             factor_dict["binance_lead_1h"] = (bn_r1 - upbit_r1).reindex(index=closes.index, columns=closes.columns)
 
             upbit_p = closes[common_coins].reindex(index=closes.index)
@@ -515,7 +515,7 @@ def compute_long_factors(
         dow_bull     — Mon/Tue/Wed KST=+1, Thu=0, Fri/Sat/Sun=-1
         hour_vol     — 1 if KST hour in [7,8,9,22,23,0]
     """
-    returns_1h = closes.pct_change(1)
+    returns_1h = closes.pct_change(1, fill_method=None)
 
     # --- Cross-sectional factors ---
 
@@ -525,10 +525,10 @@ def compute_long_factors(
     range_contraction_12h = -intrabar_range.rolling(12).mean()
 
     # 2. Reversal 1h: recent 1h losers bounce (IC=+0.102 at 6h in bull regime)
-    reversal_1h = -closes.pct_change(1)
+    reversal_1h = -closes.pct_change(1, fill_method=None)
 
     # 3. Reversal 4h: recent 4h losers bounce (IC=+0.094 at 6h in bull regime)
-    reversal_4h = -closes.pct_change(4)
+    reversal_4h = -closes.pct_change(4, fill_method=None)
 
     factor_dict = {
         "range_contraction_12h": range_contraction_12h,
@@ -542,8 +542,8 @@ def compute_long_factors(
         common_coins = [c for c in closes.columns if c in binance_closes.columns]
 
         if len(common_ts) > 0 and len(common_coins) > 0:
-            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1)
-            bn_r1 = binance_closes[common_coins].loc[common_ts].pct_change(1)
+            upbit_r1 = closes[common_coins].loc[common_ts].pct_change(1, fill_method=None)
+            bn_r1 = binance_closes[common_coins].loc[common_ts].pct_change(1, fill_method=None)
 
             # binance_lead_1h: same as short model — global leads local
             bl1h = (bn_r1 - upbit_r1).reindex(index=closes.index, columns=closes.columns)
@@ -599,8 +599,8 @@ def compute_btc_regime(closes: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("KRW-BTC not in universe — cannot compute BTC regime")
 
     btc = closes[btc_col]
-    btc_ret_7d = btc.pct_change(7 * 24)   # 7 days in hourly bars
-    btc_ret_30d = btc.pct_change(30 * 24)  # 30 days
+    btc_ret_7d = btc.pct_change(7 * 24, fill_method=None)   # 7 days in hourly bars
+    btc_ret_30d = btc.pct_change(30 * 24, fill_method=None)  # 30 days
     btc_sma20 = btc.rolling(20 * 24).mean()
     btc_above_sma20 = (btc > btc_sma20).astype(float)
 

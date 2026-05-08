@@ -44,7 +44,7 @@ LOCK_FILE = ROOT / "output" / ".retrain.lock"
 # Promotion gate thresholds
 IC_DELTA_THRESHOLD = -0.015   # new IC must be at most 1.5pp worse than old
 IC_ABSOLUTE_FLOOR = 0.040     # new IC must be at least 0.040
-MAX_DATA_AGE_HOURS = 3        # refuse retrain if DB data stale
+MAX_DATA_AGE_HOURS = 4        # refuse retrain if DB data stale (was 3 — boundary at Sun 20:00 UTC vs 17:00 fetch tripped 3.005h)
 
 
 def log(msg: str) -> None:

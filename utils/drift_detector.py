@@ -31,6 +31,10 @@ def _ic_per_slot(factor: pd.Series, realized: pd.Series) -> float:
     df = pd.concat([factor, realized], axis=1).dropna()
     if len(df) < 10:
         return float("nan")
+    # Guard against constant inputs (calendar features can be constant within
+    # a single timestamp slot) — spearmanr emits ConstantInputWarning otherwise.
+    if df.iloc[:, 0].nunique() < 2 or df.iloc[:, 1].nunique() < 2:
+        return float("nan")
     try:
         ic, _ = spearmanr(df.iloc[:, 0], df.iloc[:, 1])
         return float(ic)
