@@ -84,6 +84,16 @@ def preflight() -> tuple[bool, str]:
 
 def measure_holdout_ic(model_path: Path, horizon: int) -> float:
     """Return mean per-slot Spearman IC on 20% holdout."""
+    return measure_holdout_stats(model_path, horizon)["ic"]
+
+
+def measure_holdout_stats(model_path: Path, horizon: int) -> dict:
+    """Return mean IC + t-stat + n_periods on 20% holdout.
+
+    Used by both the promotion gate (which only needs the scalar IC) and
+    the dashboard export (which needs the full stats for the reconciliation
+    card). Format matches output/holdout_report.json schema.
+    """
     from data.dataset import build_dataset
     from models.xgb_ranker import XSecRanker
 
@@ -101,11 +111,71 @@ def measure_holdout_ic(model_path: Path, horizon: int) -> float:
             continue
         ic, _ = spearmanr(g.values, y_slice.values)
         if not np.isnan(ic):
-            per_slot.append(ic)
+            per_slot.append(float(ic))
 
-    if not per_slot:
-        return float("nan")
-    return float(np.mean(per_slot))
+    n = len(per_slot)
+    if n == 0:
+        return {"ic": float("nan"), "tstat": None, "n_periods": 0}
+    mean = sum(per_slot) / n
+    if n > 1:
+        var = sum((v - mean) ** 2 for v in per_slot) / (n - 1)
+        std = var ** 0.5
+        tstat = mean / (std / (n ** 0.5)) if std > 0 else None
+    else:
+        tstat = None
+    return {"ic": float(mean), "tstat": float(tstat) if tstat is not None else None, "n_periods": n}
+
+
+def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
+    """Update output/holdout_report.json with fresh holdout stats + provenance.
+
+    `per_horizon[h]` should be the dict returned by measure_holdout_stats(...).
+    Static fields (hit_2sigma, e_signed_pct, regime_filter) are preserved from
+    the prior file when present so we do not silently zero out values not yet
+    re-measured.
+    """
+    out_path = ROOT / "output" / "holdout_report.json"
+    prior = {}
+    if out_path.exists():
+        try:
+            prior = json.loads(out_path.read_text())
+        except Exception:
+            prior = {}
+
+    def merge(side_key: str, h: int, stats: dict) -> dict:
+        old = prior.get(side_key, {}) if isinstance(prior.get(side_key), dict) else {}
+        return {
+            "ic": round(float(stats["ic"]), 4) if stats["ic"] == stats["ic"] else None,  # NaN check
+            "tstat": round(float(stats["tstat"]), 2) if stats.get("tstat") is not None else old.get("tstat"),
+            "n_periods": int(stats.get("n_periods") or old.get("n_periods") or 0),
+            "hit_2sigma": old.get("hit_2sigma"),
+            "e_signed_pct": old.get("e_signed_pct"),
+            "horizon_h": h,
+            "regime_filter": old.get("regime_filter"),
+        }
+
+    new_doc = {
+        "_provenance": {
+            "asof": stamp,
+            "source": f"retrain_pipeline.py auto-emit at {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+            "documented_in": "projects/xsec-alpha/index.html (Executive Summary)",
+            "regenerate_with": "python scripts/retrain_pipeline.py",
+            "note": "Auto-updated after a successful promotion. Static fields "
+                    "(hit_2sigma, e_signed_pct, regime_filter) are preserved from "
+                    "the prior file until re-measured by an explicit holdout pass.",
+        },
+    }
+    if 6 in per_horizon:
+        new_doc["short_h6"] = merge("short_h6", 6, per_horizon[6])
+    elif "short_h6" in prior:
+        new_doc["short_h6"] = prior["short_h6"]
+    if 12 in per_horizon:
+        new_doc["long_h12"] = merge("long_h12", 12, per_horizon[12])
+    elif "long_h12" in prior:
+        new_doc["long_h12"] = prior["long_h12"]
+
+    out_path.write_text(json.dumps(new_doc, indent=2, ensure_ascii=False))
+    log(f"holdout_report.json updated: {sorted(per_horizon.keys())}")
 
 
 def train_candidate(horizon: int, candidate_path: Path) -> bool:
@@ -203,6 +273,22 @@ print('calibration rebuilt')
     except Exception as e:
         log(f"Calibration rebuild failed: {e}")
         return False
+
+
+def _refresh_dashboard_export() -> None:
+    """Rebuild encrypted dashboard payloads after a successful promotion.
+    Non-fatal — must not abort the retrain run.
+    """
+    target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data")
+    if not target.parent.exists():
+        log("Dashboard target dir absent; skipping export.")
+        return
+    try:
+        from utils.dashboard_export import PIN_DEFAULT, export_to
+        written = export_to(target, PIN_DEFAULT)
+        log(f"Dashboard export refreshed: {len(written)} files")
+    except Exception as e:
+        log(f"Dashboard export failed (non-fatal): {e}")
 
 
 def append_history(entry: dict) -> None:
@@ -306,6 +392,31 @@ def main():
         calib_rebuilt = False
         if any_promoted and not args.dry_run:
             calib_rebuilt = rebuild_calibration()
+
+        # Auto-update holdout_report.json from the newly-promoted prod models.
+        # Re-measure stats fresh (with t-stat + n_periods) so the dashboard
+        # reconciliation card reflects the just-promoted weights, not the
+        # frozen 2026-04-25 baseline.
+        if any_promoted and not args.dry_run:
+            per_h: dict[int, dict] = {}
+            for h in (6, 12):
+                prod = MODELS_DIR / f"xsec_{h}h.pkl"
+                if not prod.exists():
+                    continue
+                try:
+                    per_h[h] = measure_holdout_stats(prod, h)
+                except Exception as e:
+                    log(f"holdout stats refresh failed for h={h}: {e}")
+            if per_h:
+                try:
+                    _write_holdout_report(per_h, stamp)
+                except Exception as e:
+                    log(f"holdout_report.json write failed (non-fatal): {e}")
+
+        # Refresh the public dashboard's encrypted payloads so the new
+        # holdout/calibration numbers go live immediately after promotion.
+        if any_promoted and not args.dry_run:
+            _refresh_dashboard_export()
 
         # Log run
         append_history({

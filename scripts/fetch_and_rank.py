@@ -36,10 +36,37 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="Print recommendations without saving")
     parser.add_argument("--no-model", action="store_true", help="Force equal-weight fallback (ignore XGBoost model)")
     parser.add_argument("--no-telegram", action="store_true", help="Suppress Telegram notification")
+    parser.add_argument("--no-dashboard-export", action="store_true",
+                        help="Skip dashboard payload refresh after run")
     args = parser.parse_args()
 
     with run_lock("fetch_and_rank"):
         _run(args)
+
+    # Post-run: refresh the public dashboard's encrypted payloads.
+    # Non-fatal — a build failure must not block the rebalance pipeline.
+    if not args.dry_run and not args.no_dashboard_export:
+        _refresh_dashboard_export()
+
+
+def _refresh_dashboard_export() -> None:
+    """Rebuild encrypted dashboard payloads (summary/history/accuracy).
+
+    Writes to /home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data/.
+    Skipped silently if the target directory is missing (e.g. running on a host
+    that does not co-locate the public site).
+    """
+    from pathlib import Path
+    target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data")
+    if not target.parent.exists():
+        logger.info("Dashboard target dir absent; skipping export.")
+        return
+    try:
+        from utils.dashboard_export import PIN_DEFAULT, export_to
+        written = export_to(target, PIN_DEFAULT)
+        logger.info(f"Dashboard export refreshed: {len(written)} files at {target}")
+    except Exception as e:
+        logger.warning(f"Dashboard export failed (non-fatal): {e}")
 
 
 def _compute_score(latest_factors: "pd.DataFrame", args) -> "pd.Series":
@@ -612,6 +639,16 @@ def _run(args):
                 "long":  {"status": long_gate.status,  "last_ic": long_gate.last_ic},
             }
 
+            # Price at recommendation timestamp (close of latest_ts bar)
+            prices_at_ts = {}
+            try:
+                if latest_ts in closes.index:
+                    row = closes.loc[latest_ts]
+                    prices_at_ts = {m: float(p) for m, p in row.items()
+                                    if pd.notna(p) and p > 0}
+            except Exception as e:
+                logger.warning(f"Could not build prices_at_ts: {e}")
+
             msg = format_compact(
                 short_df=short_predictions_df,
                 long_df=long_predictions_df,
@@ -620,6 +657,7 @@ def _run(args):
                 ic_state=ic_state,
                 max_per_horizon=5,
                 min_sigma=1.5,
+                prices=prices_at_ts,
             )
             sent = send_message(msg)
             if sent:

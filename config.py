@@ -30,6 +30,14 @@ class Config:
         LIVE_WATCH_LONG_N = int(os.getenv("XSEC_LIVE_WATCH_LONG_N", "5"))
         LIVE_EXEC_SHORT_N = int(os.getenv("XSEC_LIVE_EXEC_SHORT_N", "5"))
         LIVE_REQUIRE_BITGET_TRADABLE = os.getenv("XSEC_LIVE_REQUIRE_BITGET_TRADABLE", "1") != "0"
+        # Paper-observation mode for the LONG side. When True:
+        #   - Telegram alerts SUPPRESS the LONG/WATCH_LONG section (no spam during observation).
+        #   - Ledger continues to record realized PnL for WATCH_LONG picks (paper trading).
+        #   - Dashboard surfaces a "long-paper-observation" status so the gap is auditable.
+        # Set XSEC_LIVE_LONG_TELEGRAM_SILENT=1 to enter observation period; flip back when ready
+        # to wire LONG to live execution (then also flip LIVE_EXECUTION_MODE).
+        LIVE_LONG_TELEGRAM_SILENT = os.getenv("XSEC_LIVE_LONG_TELEGRAM_SILENT", "0") == "1"
+        LIVE_LONG_OBSERVATION_START = os.getenv("XSEC_LIVE_LONG_OBSERVATION_START", "")
         TOTAL_CAPITAL_KRW = 10_000_000  # 총 운용 자본 (KRW). 환경변수로 오버라이드 가능
         MAX_POSITION_PCT = 10.0         # 단일 포지션 최대 비중 (%)
         STOP_LOSS_PCT = 3.0             # 손절 기준 (%)

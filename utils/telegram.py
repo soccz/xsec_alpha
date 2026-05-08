@@ -98,20 +98,36 @@ def format_regime_header(latest_ts, btc_regime_row=None, ic_state: dict | None =
 
 def format_compact(short_df, long_df, latest_ts, btc_regime_row=None,
                     ic_state: dict | None = None, max_per_horizon: int = 5,
-                    min_sigma: float = 1.5) -> str:
+                    min_sigma: float = 1.5, prices: dict | None = None) -> str:
     """Single compact telegram message — A+B hybrid, ~12-14 rows total.
 
     Header: timestamp + regime (single line, optionally IC flag if any side WARN+)
     Body: per-horizon top `max_per_horizon` coins by |σ|
-          Row format: `{tier} {coin:6s} {arrow} {pct:+.1f}% {trust_tag}`
+          Row format: `{tier} {coin:6s} {arrow} {pct:+.1f}% @{price} {trust_tag}`
     Footer: legend only if any trust tag present (⭐/⚠)
 
     Filters:
       - show |σ| >= min_sigma (default 1.5 = 🔥 tier + top ✅)
       - skip suppressed rows (preflight batch-blocked)
+      - LONG (12h) section is skipped entirely when LIVE_LONG_TELEGRAM_SILENT is set.
+        Ledger continues to record paper PnL; we just stop alerting until 1-2 weeks
+        of observation data is collected. The dashboard's "long_paper_observation"
+        badge lets the user/reviewer see the silence is intentional.
+
+    prices: optional {market: KRW close price at latest_ts} for display. Missing
+            entries fall back to no price suffix.
     """
+    prices = prices or {}
     import math
     def _nan(v): return v is None or (isinstance(v, float) and v != v)
+
+    # Paper-observation gate for LONG side (config-driven, env-overridable).
+    long_silent = False
+    try:
+        from config import config as _cfg
+        long_silent = bool(getattr(_cfg.Portfolio, "LIVE_LONG_TELEGRAM_SILENT", False))
+    except Exception:
+        long_silent = False
 
     lines = []
 
@@ -146,6 +162,9 @@ def format_compact(short_df, long_df, latest_ts, btc_regime_row=None,
     for pred_df, horizon_h, title in [(short_df, 6, "6h"), (long_df, 12, "12h")]:
         if pred_df is None or len(pred_df) == 0:
             continue
+        # Paper-observation: skip the 12h LONG section entirely when silent.
+        if horizon_h == 12 and long_silent:
+            continue
         strong = pred_df[pred_df["sigma"] >= min_sigma].head(max_per_horizon)
         if strong.empty:
             continue
@@ -171,12 +190,15 @@ def format_compact(short_df, long_df, latest_ts, btc_regime_row=None,
             arrow = "↑" if r["direction"] > 0 else ("↓" if r["direction"] < 0 else "·")
             exp = r.get("expected_pct")
             exp_s = f"{exp:+.1f}%" if not _nan(exp) else "—"
+            price = prices.get(mkt)
+            price_s = _fmt_krw(price) if price and not _nan(price) else None
             trust_tag = r.get("trust_tag", "") or ""
             if trust_tag: has_trust_tag = True
             tier = r.get("tag", "·")
 
             lines.append(
                 f"  {tier} <b>{coin:<6}</b> {arrow} <code>{exp_s}</code>"
+                + (f" @<code>{price_s}</code>" if price_s else "")
                 + (f"  {trust_tag}" if trust_tag else "")
             )
         lines.append("")
