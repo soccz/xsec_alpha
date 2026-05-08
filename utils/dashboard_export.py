@@ -559,6 +559,106 @@ def build_history_payload(history_days: int = 60, ic_days: int = 60) -> dict:
     }
 
 
+def _daily_pnl_series(history: list[dict], side: str) -> list[dict]:
+    """Daily aggregated stats per side: date, n_trades, hit_rate, mean_pct, cum_pct, drawdown_pct.
+
+    Used by dashboard's cumulative PnL chart + daily heatmap. Only matured trades.
+    """
+    from collections import defaultdict
+    daily = defaultdict(list)
+    for r in history:
+        if r.get("side") != side:
+            continue
+        rp = r.get("realized_pct")
+        if rp is None:
+            continue
+        ts = r.get("entry_time", "")[:10]  # YYYY-MM-DD
+        if not ts:
+            continue
+        daily[ts].append(float(rp))
+
+    rows = []
+    cum = 0.0
+    peak = 0.0
+    for date in sorted(daily.keys()):
+        vals = daily[date]
+        n = len(vals)
+        mean_pct = sum(vals) / n
+        hit_rate = sum(1 for v in vals if v > 0) / n
+        cum += mean_pct  # equal-weight per-day (treats day as a portfolio)
+        peak = max(peak, cum)
+        dd = cum - peak  # ≤ 0
+        rows.append({
+            "date": date,
+            "n_trades": n,
+            "hit_rate": round(hit_rate, 4),
+            "mean_pct": round(mean_pct, 4),
+            "cum_pct": round(cum, 4),
+            "drawdown_pct": round(dd, 4),
+        })
+    return rows
+
+
+def _return_distribution(history: list[dict], side: str, n_bins: int = 12) -> dict:
+    """Histogram + summary statistics for realized return distribution."""
+    vals = [float(r["realized_pct"]) for r in history
+            if r.get("side") == side and r.get("realized_pct") is not None]
+    if not vals:
+        return {"bins": [], "stats": {"n": 0}}
+
+    vals_sorted = sorted(vals)
+    n = len(vals)
+    mean = sum(vals) / n
+    var = sum((v - mean) ** 2 for v in vals) / max(n - 1, 1)
+    std = var ** 0.5
+
+    def pct(p):
+        if n == 0:
+            return None
+        idx = max(0, min(n - 1, int(round((p / 100) * (n - 1)))))
+        return vals_sorted[idx]
+
+    # Clip histogram range to p2/p98 so a couple of outliers don't squash all bins.
+    # Outlier counts are merged into the boundary bins.
+    lo_clip = pct(2) if n >= 50 else min(vals)
+    hi_clip = pct(98) if n >= 50 else max(vals)
+    if hi_clip <= lo_clip:
+        lo_clip, hi_clip = min(vals), max(vals)
+    width = (hi_clip - lo_clip) / max(n_bins, 1) if hi_clip > lo_clip else 1.0
+
+    bins = []
+    for i in range(n_bins):
+        a = lo_clip + i * width
+        b = lo_clip + (i + 1) * width if i < n_bins - 1 else hi_clip + 0.001
+        if i == 0:
+            count = sum(1 for v in vals if v < b)
+        elif i == n_bins - 1:
+            count = sum(1 for v in vals if v >= a)
+        else:
+            count = sum(1 for v in vals if a <= v < b)
+        bins.append({
+            "bin_low": round(a, 3),
+            "bin_high": round(b, 3),
+            "count": count,
+        })
+    return {
+        "bins": bins,
+        "stats": {
+            "n": n,
+            "mean": round(mean, 4),
+            "median": round(vals_sorted[n // 2], 4),
+            "std": round(std, 4),
+            "min": round(min(vals), 4),
+            "max": round(max(vals), 4),
+            "p5": round(pct(5), 4) if pct(5) is not None else None,
+            "p25": round(pct(25), 4) if pct(25) is not None else None,
+            "p75": round(pct(75), 4) if pct(75) is not None else None,
+            "p95": round(pct(95), 4) if pct(95) is not None else None,
+            "hit_rate": round(sum(1 for v in vals if v > 0) / n, 4),
+        },
+    }
+
+
 def build_accuracy_payload(history_days: int = 60) -> dict:
     ledger = _read_csv(OUTPUT_DIR / "recommendation_ledger.csv")
     history = _pick_history(ledger, history_days)
@@ -572,6 +672,16 @@ def build_accuracy_payload(history_days: int = 60) -> dict:
             "WATCH_LONG": _realized_stats(history, "WATCH_LONG", [7, 14, 30]),
         },
         "calibration_buckets": calib,
+        # New (2026-05-08): per-side daily pnl/dd series + return distribution
+        # for cumulative PnL chart, daily heatmap, and return histogram.
+        "daily_series": {
+            "SHORT": _daily_pnl_series(history, "SHORT"),
+            "WATCH_LONG": _daily_pnl_series(history, "WATCH_LONG"),
+        },
+        "return_distribution": {
+            "SHORT": _return_distribution(history, "SHORT"),
+            "WATCH_LONG": _return_distribution(history, "WATCH_LONG"),
+        },
         "n_total": len(history),
     }
 
