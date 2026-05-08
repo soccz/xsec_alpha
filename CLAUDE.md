@@ -186,8 +186,11 @@ t_stat  = mean_ic / (ic_series.std() / sqrt(N_periods))
 
 **모델/피처 수정 후 반드시:**
 1. IC 측정 실행 (`python scripts/measure_ic.py`, 5분이면 됨 — 변명 없음)
-2. 피처 NaN율 확인 (컬럼별 30% 초과 금지)
-3. 예측값 범위 확인 (`mean ∈ [-0.05, +0.05]`, `std ∈ [0.01, 0.50]`)
+2. 피처 NaN율 확인 (컬럼별 30% 초과 금지) — **예외: `kimchi_zscore_24h`는 25% Binance-미상장 코인 + 24h warmup으로 ~32% NaN이 구조적 정상치**
+3. 예측값 범위 확인:
+   - `mean ∈ [-0.05, +0.05]` (편향 없음)
+   - **`std ∈ [0.001, 0.50]`** (랭킹 기반 모델은 절대값 std가 작아도 IC가 살아있음. F1 EnsembleRanker(Ridge+LGBM)는 cross-section std ≈ 0.003에서 IC 0.20)
+   - **즉시 중단**: `std < 0.0005` (제로 신호) 또는 `|mean| > 0.10` (방향 편향)
 4. holdout 재측정 (`python scripts/evaluate_holdout.py`) — Phase 2 게이트 재확인
 
 **자동 집행되는 게이트 (§7 규칙):**
@@ -199,7 +202,7 @@ t_stat  = mean_ic / (ic_series.std() / sqrt(N_periods))
 
 **즉시 중단 조건:**
 - RSI=0, volatility=0 발견 시 → 데이터 파이프라인 버그. 배포 전 수정.
-- 예측 std < 0.005 → 제로 신호. 원인 찾기.
+- 예측 std < 0.0005 → 제로 신호. 원인 찾기. (랭킹 모델 정상 범위 0.001~0.01)
 - Long/Short 각 10개 미만 → watch-only 모드로 출력.
 
 **일일 운영 확인:**

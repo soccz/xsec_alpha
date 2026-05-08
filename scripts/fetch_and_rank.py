@@ -38,15 +38,19 @@ def main():
     parser.add_argument("--no-telegram", action="store_true", help="Suppress Telegram notification")
     parser.add_argument("--no-dashboard-export", action="store_true",
                         help="Skip dashboard payload refresh after run")
+    parser.add_argument("--no-dashboard-push", action="store_true",
+                        help="Skip auto-pushing dashboard payloads to soccz.github.io")
     args = parser.parse_args()
 
     with run_lock("fetch_and_rank"):
         _run(args)
 
-    # Post-run: refresh the public dashboard's encrypted payloads.
-    # Non-fatal — a build failure must not block the rebalance pipeline.
+    # Post-run: refresh the public dashboard's encrypted payloads, then push.
+    # Non-fatal — a build/push failure must not block the rebalance pipeline.
     if not args.dry_run and not args.no_dashboard_export:
         _refresh_dashboard_export()
+        if not args.no_dashboard_push:
+            _push_dashboard_to_github()
 
 
 def _refresh_dashboard_export() -> None:
@@ -67,6 +71,106 @@ def _refresh_dashboard_export() -> None:
         logger.info(f"Dashboard export refreshed: {len(written)} files at {target}")
     except Exception as e:
         logger.warning(f"Dashboard export failed (non-fatal): {e}")
+
+
+_KIMCHI_NAN_EXPECTED_PCT = 33.0  # ~25% Binance-unmatched coins + 24h warmup
+_NAN_FLOOR_GENERIC_PCT = 30.0     # CLAUDE.md §8 rule for non-kimchi factors
+
+
+def _write_feature_health(factor_df) -> None:
+    """Write per-factor NaN% + flag for health_snapshot.py.
+
+    Output: output/feature_health.json
+    Fields:
+      - generated_at: ISO timestamp
+      - rows: total rows in factor_df
+      - factors: {col: {nan_pct, status, note}}
+        status = OK / EXPECTED (kimchi structural) / WARN (>30% non-kimchi)
+    """
+    import json
+    from datetime import datetime, timezone
+    from pathlib import Path
+
+    rows = len(factor_df)
+    if rows == 0:
+        return
+    payload = {
+        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "rows": rows,
+        "factors": {},
+    }
+    for col in factor_df.columns:
+        pct = float(factor_df[col].isna().sum() / rows * 100)
+        if "kimchi" in col and pct <= _KIMCHI_NAN_EXPECTED_PCT + 5:
+            status = "EXPECTED"
+            note = f"structural: ~25% coins lack Binance + 24h warmup"
+        elif pct > _NAN_FLOOR_GENERIC_PCT:
+            status = "WARN"
+            note = f"NaN% > {_NAN_FLOOR_GENERIC_PCT}% (CLAUDE.md §8)"
+        else:
+            status = "OK"
+            note = ""
+        payload["factors"][col] = {
+            "nan_pct": round(pct, 2),
+            "status": status,
+            "note": note,
+        }
+    out = Path(__file__).resolve().parent.parent / "output" / "feature_health.json"
+    out.write_text(json.dumps(payload, indent=2))
+
+
+def _push_dashboard_to_github() -> None:
+    """Commit+push refreshed dashboard payloads to soccz.github.io.
+
+    Scope is intentionally narrow: only `projects/xsec-alpha/dashboard/data/`
+    is staged. We pull --rebase first to absorb concurrent commits (the
+    github.io repo gets manual commits + commits from sibling projects).
+    Skipped when:
+      - github.io clone is missing
+      - data dir is missing or unchanged since last commit
+      - any git step fails (logged but non-fatal)
+    """
+    import subprocess
+    from pathlib import Path
+
+    repo = Path("/home/soccz/22tb/soccz.github.io")
+    data_subpath = "projects/xsec-alpha/dashboard/data"
+    if not (repo / data_subpath).exists():
+        logger.info("Dashboard repo absent or data dir missing; skipping push.")
+        return
+
+    def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
+        return subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
+                              check=check, timeout=60)
+
+    try:
+        # 1. Stage only the dashboard data — never sweep up unrelated edits.
+        run(["git", "add", data_subpath])
+
+        # 2. Skip if no real change (bytes-identical export).
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"],
+                              cwd=repo, timeout=10)
+        if diff.returncode == 0:
+            logger.info("Dashboard unchanged; nothing to push.")
+            return
+
+        # 3. Commit, then rebase onto remote, then push. Rebase BEFORE push
+        # to absorb concurrent unrelated commits.
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        run(["git", "commit", "-m", f"xsec-alpha: dashboard auto-refresh {ts}"])
+        try:
+            run(["git", "pull", "--rebase", "origin", "main"])
+        except subprocess.CalledProcessError as e:
+            logger.warning(f"Dashboard pull --rebase failed: {e.stderr.strip()}; aborting push.")
+            run(["git", "rebase", "--abort"], check=False)
+            return
+        run(["git", "push", "origin", "main"])
+        logger.info(f"Dashboard pushed: xsec-alpha/dashboard/data/ @ {ts}")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Dashboard push failed (non-fatal): {e.stderr.strip() if e.stderr else e}")
+    except Exception as e:
+        logger.warning(f"Dashboard push failed (non-fatal): {e}")
 
 
 def _compute_score(latest_factors: "pd.DataFrame", args) -> "pd.Series":
@@ -303,6 +407,14 @@ def _run(args):
         coverage["min_selected"],
         coverage["max_selected"],
     )
+
+    # 3. Persist feature-health snapshot (NaN% per column at latest timestamp).
+    # Used by health_snapshot.py section F. Cheap (≤10ms) and gives operators
+    # a record of structural NaN drift (e.g. Binance match rate dropping).
+    try:
+        _write_feature_health(factor_df)
+    except Exception as e:
+        logger.warning(f"Feature-health snapshot failed (non-fatal): {e}")
 
     # 3. Use latest timestamp
     latest_ts = factor_df.index.get_level_values("timestamp").max()

@@ -225,10 +225,45 @@ def section_current_picks():
     return "OK", summary
 
 
+# ------------------ F. feature health ------------------ #
+
+def section_feature_health():
+    """Read output/feature_health.json (written by fetch_and_rank).
+
+    Returns (status, info) where info includes per-factor NaN% & flags.
+    """
+    fh_path = OUTPUT_DIR / "feature_health.json"
+    if not fh_path.exists():
+        return "WARN", {"available": False, "factors": {}}
+    try:
+        data = json.loads(fh_path.read_text())
+    except Exception as e:
+        return "WARN", {"available": False, "error": str(e), "factors": {}}
+
+    factors = data.get("factors", {}) or {}
+    worst = "OK"
+    for col, info in factors.items():
+        st = info.get("status", "OK")
+        if st == "WARN":
+            worst = "WARN"
+    return worst, {
+        "available": True,
+        "generated_at": data.get("generated_at"),
+        "rows": data.get("rows"),
+        "factors": factors,
+    }
+
+
 # ------------------ E. structural warnings ------------------ #
 
-def section_warnings(operational_rows, ic_info, realized_info):
+def section_warnings(operational_rows, ic_info, realized_info, feature_health=None):
     warns = []
+    if feature_health and feature_health.get("available"):
+        for col, info in feature_health.get("factors", {}).items():
+            if info.get("status") == "WARN":
+                warns.append(
+                    f"Feature health: {col} NaN={info.get('nan_pct')}% — {info.get('note')}"
+                )
     # Known bug: healthcheck.py points at wrong IC path
     hc_path = ROOT / "scripts" / "healthcheck.py"
     if hc_path.exists():
@@ -319,6 +354,16 @@ def render_text(snap):
                 f"{extra}"
             )
 
+    # F (feature health)
+    fh = snap.get("feature_health") or {}
+    if fh.get("available"):
+        lines.append("")
+        lines.append("F. FEATURE HEALTH (NaN%)")
+        for col, info in fh.get("factors", {}).items():
+            tag = _status_tag(info["status"])
+            note = f"  {info['note']}" if info.get("note") else ""
+            lines.append(f"   [{tag}] {col:<22} {info['nan_pct']:>5.2f}%{note}")
+
     # E
     lines.append("")
     lines.append("E. WARNINGS")
@@ -379,6 +424,13 @@ def render_markdown(snap):
                 f"score∈[{_fmt_pct(info['score_min'])}, {_fmt_pct(info['score_max'])}]"
             )
 
+    fh = snap.get("feature_health") or {}
+    if fh.get("available"):
+        lines += ["", "## F. Feature health (NaN%)", "", "| factor | status | NaN% | note |", "|---|---|---|---|"]
+        for col, info in fh.get("factors", {}).items():
+            note = info.get("note", "") or ""
+            lines.append(f"| `{col}` | `{info['status']}` | {info['nan_pct']}% | {note} |")
+
     lines += ["", "## E. Warnings", ""]
     if snap["warnings"]:
         for w in snap["warnings"]:
@@ -398,13 +450,14 @@ def main():
     ic_worst, ic_info = section_ic()
     rl_worst, rl_info = section_realized()
     cp_worst, cp_info = section_current_picks()
+    fh_worst, fh_info = section_feature_health()
 
     # Resolve overall
     precedence = ["LIQ", "FREEZE", "FAIL", "WARN", "OK"]
-    all_status = [op_worst, ic_worst, rl_worst, cp_worst]
+    all_status = [op_worst, ic_worst, rl_worst, cp_worst, fh_worst]
     overall = min(all_status, key=lambda s: precedence.index(s) if s in precedence else 99)
 
-    warnings = section_warnings(op_rows, ic_info, rl_info)
+    warnings = section_warnings(op_rows, ic_info, rl_info, fh_info)
 
     snap = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
@@ -413,6 +466,7 @@ def main():
         "ic":            ic_info,
         "realized":      rl_info,
         "current_picks": cp_info,
+        "feature_health": fh_info,
         "warnings":      warnings,
     }
 
