@@ -659,6 +659,117 @@ def _return_distribution(history: list[dict], side: str, n_bins: int = 12) -> di
     }
 
 
+def _best_worst(history: list[dict], side: str, k: int = 5) -> dict:
+    """Top-k wins / losses for narrative storytelling."""
+    rows = [r for r in history
+            if r.get("side") == side and r.get("realized_pct") is not None]
+    if not rows:
+        return {"best": [], "worst": []}
+    rows_sorted = sorted(rows, key=lambda r: float(r["realized_pct"]))
+    pick = lambda r: {
+        "market": r.get("market"),
+        "entry_time": r.get("entry_time"),
+        "exit_time": r.get("exit_time"),
+        "entry_price": r.get("entry_price"),
+        "exit_price": r.get("exit_price"),
+        "horizon_h": r.get("horizon_h"),
+        "realized_pct": float(r["realized_pct"]),
+        "actionable": bool(r.get("actionable")),
+    }
+    return {
+        "best": [pick(r) for r in rows_sorted[-k:][::-1]],
+        "worst": [pick(r) for r in rows_sorted[:k]],
+    }
+
+
+def _monthly_returns(history: list[dict], side: str) -> list[dict]:
+    """year/month → summed mean daily return (institutional factsheet style)."""
+    daily = _daily_pnl_series(history, side)
+    if not daily:
+        return []
+    from collections import defaultdict
+    bucket = defaultdict(lambda: {"sum": 0.0, "n_days": 0, "n_trades": 0})
+    for row in daily:
+        date = row["date"]  # YYYY-MM-DD
+        try:
+            y, m, _ = date.split("-")
+            key = f"{y}-{m}"
+        except ValueError:
+            continue
+        bucket[key]["sum"] += row["mean_pct"]
+        bucket[key]["n_days"] += 1
+        bucket[key]["n_trades"] += row["n_trades"]
+    out = []
+    for key in sorted(bucket.keys()):
+        y, m = key.split("-")
+        b = bucket[key]
+        out.append({
+            "year": int(y),
+            "month": int(m),
+            "return_pct": round(b["sum"], 4),
+            "n_days": b["n_days"],
+            "n_trades": b["n_trades"],
+        })
+    return out
+
+
+def _rolling_stats(history: list[dict], side: str, window: int = 7) -> list[dict]:
+    """Rolling mean / hit-rate over `window` days, anchored on each end-date."""
+    daily = _daily_pnl_series(history, side)
+    if len(daily) < 2:
+        return []
+    out = []
+    for i in range(len(daily)):
+        lo = max(0, i - window + 1)
+        chunk = daily[lo:i + 1]
+        if not chunk:
+            continue
+        n_trades = sum(c["n_trades"] for c in chunk)
+        if n_trades == 0:
+            continue
+        # weighted by per-day n_trades
+        weighted_mean = sum(c["mean_pct"] * c["n_trades"] for c in chunk) / n_trades
+        weighted_hit = sum(c["hit_rate"] * c["n_trades"] for c in chunk) / n_trades
+        out.append({
+            "date": daily[i]["date"],
+            "window_n_trades": n_trades,
+            "rolling_mean_pct": round(weighted_mean, 4),
+            "rolling_hit_rate": round(weighted_hit, 4),
+        })
+    return out
+
+
+def _calibration_reliability(calib: dict) -> dict:
+    """Convert σ-bucket calibration into reliability-diagram points.
+
+    For each bucket, x = predicted hit probability proxy (use σ midpoint mapped to
+    a soft probability via 0.5 + clip(σ_mid * scale, -0.5, 0.5)), y = empirical hit_rate.
+    Simpler: just emit (sigma_mid, hit_rate) pairs and let the chart label sigma directly.
+    """
+    out = {"short_6h": [], "long_12h": []}
+    for key in ("short_6h", "long_12h"):
+        buckets = calib.get(key) or []
+        for b in buckets:
+            sl = b.get("sigma_low")
+            sh = b.get("sigma_high")
+            if sl is None:
+                continue
+            mid = sl if sh is None else (sl + sh) / 2
+            n = b.get("n", 0)
+            hit = b.get("hit_rate")
+            if hit is None:
+                continue
+            out[key].append({
+                "sigma_mid": round(mid, 3),
+                "sigma_low": round(sl, 3),
+                "sigma_high": round(sh, 3) if sh is not None else None,
+                "n": n,
+                "hit_rate": round(hit, 4),
+                "mean_signed_pct": b.get("mean_signed_return_pct"),
+            })
+    return out
+
+
 def build_accuracy_payload(history_days: int = 60) -> dict:
     ledger = _read_csv(OUTPUT_DIR / "recommendation_ledger.csv")
     history = _pick_history(ledger, history_days)
@@ -682,6 +793,19 @@ def build_accuracy_payload(history_days: int = 60) -> dict:
             "SHORT": _return_distribution(history, "SHORT"),
             "WATCH_LONG": _return_distribution(history, "WATCH_LONG"),
         },
+        "best_worst": {
+            "SHORT": _best_worst(history, "SHORT", k=5),
+            "WATCH_LONG": _best_worst(history, "WATCH_LONG", k=5),
+        },
+        "monthly_returns": {
+            "SHORT": _monthly_returns(history, "SHORT"),
+            "WATCH_LONG": _monthly_returns(history, "WATCH_LONG"),
+        },
+        "rolling_stats": {
+            "SHORT": _rolling_stats(history, "SHORT", window=7),
+            "WATCH_LONG": _rolling_stats(history, "WATCH_LONG", window=7),
+        },
+        "calibration_reliability": _calibration_reliability(calib),
         "n_total": len(history),
     }
 
