@@ -754,7 +754,10 @@ def _calibration_reliability(calib: dict) -> dict:
             sh = b.get("sigma_high")
             if sl is None:
                 continue
-            mid = sl if sh is None else (sl + sh) / 2
+            # For open-ended last bucket (sigma_high=None), use sl + 0.5σ as a
+            # representative midpoint (typical bucket width). Pure sl
+            # under-represents the bucket on a reliability x-axis.
+            mid = (sl + 0.5) if sh is None else (sl + sh) / 2
             n = b.get("n", 0)
             hit = b.get("hit_rate")
             if hit is None:
