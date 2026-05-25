@@ -616,6 +616,94 @@ def _daily_pnl_series(history: list[dict], side: str) -> list[dict]:
     return rows
 
 
+def _shadow_strategy_comparison(history: list[dict]) -> dict:
+    """Compare two live strategies head-to-head on the same calendar.
+
+      - current_short_only: 5 SHORT picks per rebalance, net daily mean
+      - shadow_long_short5: 5 SHORT + 5 WATCH_LONG combined as a 10-name
+        equal-weight basket per day (since both sides are already tracked
+        in the ledger paper-mode, this needs no new data — just a different
+        aggregation rule)
+
+    portfolio_experiment.py showed shadow_long_short5 had t=+1.62 on a
+    60d holdout. Live-shadowing here surfaces whether that finding holds
+    forward without forcing a strategy switch on weak statistics.
+
+    Returns: { current_short_only: [{date,n,mean_net,cum_net}], shadow_long_short5: [...] }
+    Both series are NET (after costs); gross is implicit (cum_gross = cum_net + Σ cost).
+    """
+    from collections import defaultdict
+    by_date_side = defaultdict(lambda: defaultdict(list))  # date → side → [net_pct]
+    for r in history:
+        npct = r.get("net_pct")
+        if npct is None:
+            continue
+        ts = r.get("entry_time", "")[:10]
+        if not ts:
+            continue
+        side = r.get("side")
+        if side not in ("SHORT", "WATCH_LONG"):
+            continue
+        by_date_side[ts][side].append(float(npct))
+
+    cur_rows, sha_rows = [], []
+    cur_cum, sha_cum = 0.0, 0.0
+    cur_peak, sha_peak = 0.0, 0.0
+    for date in sorted(by_date_side.keys()):
+        shorts = by_date_side[date].get("SHORT", [])
+        longs = by_date_side[date].get("WATCH_LONG", [])
+
+        if shorts:
+            cur_mean = sum(shorts) / len(shorts)
+            cur_cum += cur_mean
+            cur_peak = max(cur_peak, cur_cum)
+            cur_rows.append({
+                "date": date, "n": len(shorts),
+                "mean_net": round(cur_mean, 4),
+                "cum_net": round(cur_cum, 4),
+                "drawdown_net": round(cur_cum - cur_peak, 4),
+            })
+
+        combined = shorts + longs
+        if combined:
+            sha_mean = sum(combined) / len(combined)
+            sha_cum += sha_mean
+            sha_peak = max(sha_peak, sha_cum)
+            sha_rows.append({
+                "date": date,
+                "n_short": len(shorts),
+                "n_long": len(longs),
+                "mean_net": round(sha_mean, 4),
+                "cum_net": round(sha_cum, 4),
+                "drawdown_net": round(sha_cum - sha_peak, 4),
+            })
+
+    def _summary(rows: list[dict]) -> dict:
+        if not rows:
+            return {"n_days": 0}
+        means = [r["mean_net"] for r in rows]
+        m = sum(means) / len(means)
+        var = sum((v - m) ** 2 for v in means) / max(len(means) - 1, 1)
+        std = var ** 0.5
+        return {
+            "n_days": len(rows),
+            "final_cum_net": rows[-1]["cum_net"],
+            "max_drawdown_net": min(r["drawdown_net"] for r in rows),
+            "daily_mean_net": round(m, 4),
+            "daily_sharpe_net": round(m / std, 3) if std > 0 else None,
+        }
+
+    return {
+        "current_short_only": cur_rows,
+        "shadow_long_short5": sha_rows,
+        "summary": {
+            "current_short_only": _summary(cur_rows),
+            "shadow_long_short5": _summary(sha_rows),
+        },
+        "_note": "Live head-to-head shadow. SHORT-only is what fetch_and_rank actually emits as actionable; long_short5 is the candidate strategy from portfolio_experiment.py. Both daily series use ledger net_pct (after fees).",
+    }
+
+
 def _return_distribution(history: list[dict], side: str, n_bins: int = 12) -> dict:
     """Histogram + summary statistics for realized return distribution."""
     vals = [float(r["realized_pct"]) for r in history
@@ -826,14 +914,92 @@ def build_accuracy_payload(history_days: int = 60) -> dict:
             "WATCH_LONG": _rolling_stats(history, "WATCH_LONG", window=7),
         },
         "calibration_reliability": _calibration_reliability(calib),
+        # New (2026-05-25): live shadow comparison between current operational
+        # strategy (SHORT-only) and the candidate long_short5 from
+        # portfolio_experiment.py. Computed from the SAME ledger — no new
+        # paper trades, just a different aggregation rule.
+        "shadow_strategy_compare": _shadow_strategy_comparison(history),
         "n_total": len(history),
     }
 
 
 # ---- top-level export ----------------------------------------------------
 
+def build_public_summary_payload() -> dict:
+    """A trimmed, PUBLIC-safe snapshot for the project narrative page.
+
+    Strategy: include only aggregate metrics that don't expose individual
+    picks, entry prices, or anything that could be reverse-engineered into a
+    live trading edge. Safe to ship in plaintext alongside the encrypted
+    dashboard payloads.
+
+    Contains:
+      - asof timestamp
+      - IC: live 30d means + holdout snapshots (already public via the
+        narrative HTML anyway)
+      - realized: gross/net/win per side over 30d (aggregates, no picks)
+      - model age + ops gate states
+      - n_total picks tracked
+
+    Excluded (kept inside the encrypted dashboard data):
+      - latest_picks (individual coin choices)
+      - drift per-factor IC (could reveal which factor is alive)
+      - calibration buckets (would let outsiders reproduce the signal map)
+      - daily series / heatmap / best-worst / pick history
+    """
+    summary = build_summary_payload()
+    realized = summary.get("realized_summary") or {}
+
+    def _side(name: str) -> dict | None:
+        s = realized.get(name) or {}
+        d30 = s.get("d30") or {}
+        if not d30:
+            return None
+        return {
+            "n": d30.get("n"),
+            "win_pct": d30.get("win_pct"),
+            "gross_pct": d30.get("avg"),
+            "net_pct": d30.get("avg_net"),
+            "cost_pct": d30.get("cost_pct"),
+            "tstat_clustered": d30.get("tstat_clustered"),
+            "sharpe": d30.get("sharpe"),
+        }
+
+    ic_sum = summary.get("ic_summary") or {}
+    holdout = summary.get("holdout_ic") or {}
+    gates = summary.get("gates") or {}
+
+    return {
+        "asof": summary.get("asof"),
+        "ic": {
+            "short_6h": {
+                "live_30d_mean": (ic_sum.get("short_h6") or {}).get("last30", {}).get("mean"),
+                "holdout": (holdout.get("short_h6") or {}).get("ic") if holdout else None,
+                "holdout_tstat": (holdout.get("short_h6") or {}).get("tstat") if holdout else None,
+                "holdout_n": (holdout.get("short_h6") or {}).get("n_periods") if holdout else None,
+                "gate": (gates.get("short") or {}).get("status"),
+            },
+            "long_12h": {
+                "live_30d_mean": (ic_sum.get("long_h12") or {}).get("last30", {}).get("mean"),
+                "holdout": (holdout.get("long_h12") or {}).get("ic") if holdout else None,
+                "holdout_tstat": (holdout.get("long_h12") or {}).get("tstat") if holdout else None,
+                "holdout_n": (holdout.get("long_h12") or {}).get("n_periods") if holdout else None,
+                "gate": (gates.get("long") or {}).get("status"),
+            },
+        },
+        "realized_30d": {
+            "SHORT": _side("SHORT"),
+            "WATCH_LONG": _side("WATCH_LONG"),
+        },
+        "model_age_days": summary.get("model_age_days") or {},
+        "cost_assumptions": summary.get("cost_assumptions") or {},
+        "_note": "public sibling of encrypted dashboard data. Aggregates only — no individual picks.",
+    }
+
+
 def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
-              history_days: int = 60, ic_days: int = 60) -> dict[str, Path]:
+              history_days: int = 60, ic_days: int = 60,
+              public_target: Path | None = None) -> dict[str, Path]:
     target_dir.mkdir(parents=True, exist_ok=True)
     payloads = {
         "summary.json": build_summary_payload(),
@@ -847,4 +1013,12 @@ def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
         path = target_dir / name
         path.write_text(json.dumps(envelope, ensure_ascii=False, indent=2))
         written[name] = path
+
+    # Public sibling (unencrypted aggregates) — for narrative HTML auto-refresh.
+    if public_target is not None:
+        public_target.parent.mkdir(parents=True, exist_ok=True)
+        public_payload = build_public_summary_payload()
+        public_target.write_text(json.dumps(public_payload, ensure_ascii=False, indent=2))
+        written["public_summary.json"] = public_target
+
     return written

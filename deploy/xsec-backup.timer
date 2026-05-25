@@ -1,0 +1,12 @@
+[Unit]
+Description=xsec_alpha DB backup — daily at 18:00 UTC (KST 03:00)
+
+[Timer]
+# Off-peak vs fetch cadence (xsec-alpha.timer fires at 17/23/05/11 UTC).
+# 18:00 UTC sits in the quiet hour after the 17:00 fetch.
+OnCalendar=*-*-* 18:00:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

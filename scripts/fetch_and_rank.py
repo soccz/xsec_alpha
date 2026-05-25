@@ -54,21 +54,26 @@ def main():
 
 
 def _refresh_dashboard_export() -> None:
-    """Rebuild encrypted dashboard payloads (summary/history/accuracy).
+    """Rebuild dashboard payloads.
 
-    Writes to /home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data/.
-    Skipped silently if the target directory is missing (e.g. running on a host
-    that does not co-locate the public site).
+      - encrypted: summary/history/accuracy.json under dashboard/data/
+        (PIN-gated; picks, ledger detail, drift IC stay private)
+      - public:    public_summary.json under projects/xsec-alpha/
+        (aggregates only; safe to ship plaintext for narrative HTML auto-fetch)
+
+    Skipped silently if the target directory is missing (host doesn't host
+    the public site).
     """
     from pathlib import Path
-    target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data")
-    if not target.parent.exists():
+    encrypted_target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data")
+    public_target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/public_summary.json")
+    if not encrypted_target.parent.exists():
         logger.info("Dashboard target dir absent; skipping export.")
         return
     try:
         from utils.dashboard_export import PIN_DEFAULT, export_to
-        written = export_to(target, PIN_DEFAULT)
-        logger.info(f"Dashboard export refreshed: {len(written)} files at {target}")
+        written = export_to(encrypted_target, PIN_DEFAULT, public_target=public_target)
+        logger.info(f"Dashboard export refreshed: {len(written)} files (incl. public_summary)")
     except Exception as e:
         logger.warning(f"Dashboard export failed (non-fatal): {e}")
 
@@ -135,6 +140,7 @@ def _push_dashboard_to_github() -> None:
 
     repo = Path("/home/soccz/22tb/soccz.github.io")
     data_subpath = "projects/xsec-alpha/dashboard/data"
+    public_subpath = "projects/xsec-alpha/public_summary.json"
     if not (repo / data_subpath).exists():
         logger.info("Dashboard repo absent or data dir missing; skipping push.")
         return
@@ -144,8 +150,11 @@ def _push_dashboard_to_github() -> None:
                               check=check, timeout=60)
 
     try:
-        # 1. Stage only the dashboard data — never sweep up unrelated edits.
+        # 1. Stage encrypted dashboard data + the public summary sibling.
+        # Scope is narrow — never sweep up unrelated edits in the repo.
         run(["git", "add", data_subpath])
+        if (repo / public_subpath).exists():
+            run(["git", "add", public_subpath])
 
         # 2. Skip if no real change (bytes-identical export).
         diff = subprocess.run(["git", "diff", "--cached", "--quiet"],

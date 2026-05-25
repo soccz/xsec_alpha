@@ -1,0 +1,12 @@
+[Unit]
+Description=xsec_alpha SQLite DB backup (hot, integrity-checked)
+After=network.target
+
+[Service]
+Type=oneshot
+User=soccz
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+ExecStart=/bin/bash /mnt/20t/main/gan_t/xsec_alpha/scripts/backup_db.sh
+TimeoutStartSec=300
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/logs/backup.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/logs/backup.log
