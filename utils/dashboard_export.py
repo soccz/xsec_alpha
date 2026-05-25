@@ -262,6 +262,8 @@ def _pick_history(ledger: list[dict], days: int) -> list[dict]:
         if t < cutoff:
             continue
         rr = _to_float(r.get("realized_return"))
+        nr = _to_float(r.get("net_return"))
+        cost = _to_float(r.get("estimated_cost_return"))
         out.append({
             "market": r.get("market"),
             "side": r.get("side"),
@@ -272,17 +274,27 @@ def _pick_history(ledger: list[dict], days: int) -> list[dict]:
             "entry_price": _to_float(r.get("entry_price")),
             "exit_price": _to_float(r.get("exit_price")),
             "realized_pct": round(100 * rr, 4) if rr is not None else None,
+            "net_pct": round(100 * nr, 4) if nr is not None else None,
+            "estimated_cost_pct": round(100 * cost, 4) if cost is not None else None,
         })
     out.sort(key=lambda x: x["entry_time"], reverse=True)
     return out
 
 
-# Cost assumptions (round-trip, per pick) — disclosed as a constant so reviewers
-# can audit the haircut. Bitget USDT-perp taker is 0.06% per side × 2 sides
-# = 0.12%, plus ~0.0075% funding per 6h hold. Upbit spot taker 0.05% per side.
+# Cost assumptions (round-trip, per pick) — disclosed so reviewers can audit
+# the haircut. Ledger rows carry exact estimated_cost_pct; these defaults are
+# fallback values for older rows or external exports.
+try:
+    from config import config as _cfg
+    _one_way_bps = float(getattr(_cfg.Costs, "ONE_WAY_FEE_BPS", 6.0)) + float(getattr(_cfg.Costs, "SLIPPAGE_BPS", 4.0))
+    _short_extra_bps = float(getattr(_cfg.Costs, "SHORT_EXTRA_COST_BPS", 10.0))
+except Exception:
+    _one_way_bps = 10.0
+    _short_extra_bps = 10.0
 COST_PCT_BY_SIDE = {
-    "SHORT": 0.13,        # bitget perp 6h: 0.12 fee + ~0.01 funding
-    "WATCH_LONG": 0.10,   # upbit spot 12h: 0.10 fee + 0 funding
+    "SHORT": (2.0 * _one_way_bps + _short_extra_bps) / 100.0,
+    "LONG": (2.0 * _one_way_bps) / 100.0,
+    "WATCH_LONG": (2.0 * _one_way_bps) / 100.0,
 }
 
 
@@ -338,6 +350,7 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
     for d in days_window:
         cutoff = datetime.now(timezone.utc) - timedelta(days=d)
         vals: list[float] = []
+        net_vals: list[float] = []
         picks: list[tuple[str, float]] = []  # (entry_time, realized_pct) for clustering
         wins = 0
         for r in history:
@@ -358,6 +371,9 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
             if rp is None:
                 continue
             vals.append(rp)
+            npct = r.get("net_pct")
+            if npct is not None:
+                net_vals.append(npct)
             picks.append((ts, rp))
             if rp > 0:
                 wins += 1
@@ -371,6 +387,7 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
             }
             continue
         mean = sum(vals) / n
+        mean_net = (sum(net_vals) / len(net_vals)) if net_vals else (mean - cost)
         if n > 1:
             var = sum((v - mean) ** 2 for v in vals) / (n - 1)
             std = var ** 0.5
@@ -384,7 +401,7 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
             "n": n,
             "n_windows": n_windows,
             "avg": round(mean, 4),
-            "avg_net": round(mean - cost, 4),
+            "avg_net": round(mean_net, 4),
             "win_pct": round(100 * wins / n, 1),
             "win_ci_lo": round(100 * ci_lo, 1) if ci_lo is not None else None,
             "win_ci_hi": round(100 * ci_hi, 1) if ci_hi is not None else None,

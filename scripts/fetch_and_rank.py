@@ -234,6 +234,102 @@ def _next_rebalance_ts(ts, horizon_h: int, anchor_hour_utc: int | None = None):
     return base + pd.Timedelta(hours=horizon_h)
 
 
+def _as_bool(value) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    if isinstance(value, (int, float)) and not pd.isna(value):
+        return bool(value)
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _cost_assumptions_for_side(side: str) -> dict:
+    fee_bps = float(getattr(config.Costs, "ONE_WAY_FEE_BPS", 6.0))
+    slippage_bps = float(getattr(config.Costs, "SLIPPAGE_BPS", 4.0))
+    short_extra_bps = (
+        float(getattr(config.Costs, "SHORT_EXTRA_COST_BPS", 10.0))
+        if "short" in str(side).lower()
+        else 0.0
+    )
+    estimated_cost_return = (2.0 * (fee_bps + slippage_bps) + short_extra_bps) / 10000.0
+    return {
+        "fee_bps": fee_bps,
+        "slippage_bps": slippage_bps,
+        "short_extra_cost_bps": short_extra_bps,
+        "estimated_cost_return": estimated_cost_return,
+    }
+
+
+def _prediction_meta_for(market: str, side: str, short_df=None, long_df=None) -> dict:
+    pred_df = short_df if "short" in str(side).lower() else long_df
+    fields = {
+        "sigma": None,
+        "tag": "",
+        "expected_pct": None,
+        "hit_rate": None,
+        "typical_move_pct": None,
+        "coin_vol_pct": None,
+        "consensus": None,
+        "consensus_tag": "",
+        "trust_tag": "",
+        "trust_note": "",
+        "suppression": "",
+    }
+    if pred_df is None or market not in pred_df.index:
+        return fields
+    row = pred_df.loc[market]
+    for key in fields:
+        if key in row:
+            val = row.get(key)
+            if not isinstance(val, (list, tuple, dict)) and pd.isna(val):
+                val = None
+            fields[key] = val
+    return fields
+
+
+def _backfill_cost_columns(ledger_df: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    if ledger_df is None or ledger_df.empty or "realized_return" not in ledger_df.columns:
+        return ledger_df, False
+
+    df = ledger_df.copy()
+    changed = False
+    for col in (
+        "gross_return",
+        "fee_bps",
+        "slippage_bps",
+        "short_extra_cost_bps",
+        "estimated_cost_return",
+        "net_return",
+    ):
+        if col not in df.columns:
+            df[col] = np.nan
+            changed = True
+
+    for idx, row in df.iterrows():
+        gross = pd.to_numeric(row.get("gross_return"), errors="coerce")
+        if pd.isna(gross):
+            gross = pd.to_numeric(row.get("realized_return"), errors="coerce")
+            if pd.isna(gross):
+                continue
+            df.at[idx, "gross_return"] = float(gross)
+            changed = True
+
+        cost = _cost_assumptions_for_side(row.get("side", ""))
+        for col in ("fee_bps", "slippage_bps", "short_extra_cost_bps", "estimated_cost_return"):
+            if pd.isna(pd.to_numeric(row.get(col), errors="coerce")):
+                df.at[idx, col] = cost[col]
+                changed = True
+
+        expected_net = float(gross) - float(df.at[idx, "estimated_cost_return"])
+        net = pd.to_numeric(row.get("net_return"), errors="coerce")
+        if pd.isna(net):
+            df.at[idx, "net_return"] = expected_net
+            changed = True
+
+    return df, changed
+
+
 def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
     out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
     ledger_path = os.path.join(out_dir, "recommendation_ledger.csv")
@@ -248,6 +344,12 @@ def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
         "horizon_h",
         "entry_price",
         "exit_price",
+        "gross_return",
+        "fee_bps",
+        "slippage_bps",
+        "short_extra_cost_bps",
+        "estimated_cost_return",
+        "net_return",
         "realized_return",
         "refresh_reason",
         "source_file",
@@ -262,6 +364,8 @@ def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
             ledger_df = pd.DataFrame()
     else:
         ledger_df = pd.DataFrame()
+
+    ledger_df, ledger_backfilled = _backfill_cost_columns(ledger_df)
 
     existing_keys = set()
     if not ledger_df.empty and set(key_cols).issubset(ledger_df.columns):
@@ -313,21 +417,29 @@ def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
 
             side_lower = side.lower()
             if "short" in side_lower:
-                realized_return = (entry_price - exit_price) / entry_price
+                gross_return = (entry_price - exit_price) / entry_price
             else:
-                realized_return = (exit_price - entry_price) / entry_price
+                gross_return = (exit_price - entry_price) / entry_price
+            cost = _cost_assumptions_for_side(side)
+            net_return = gross_return - cost["estimated_cost_return"]
 
             matured_rows.append({
                 "market": market,
                 "side": side,
-                "actionable": bool(row.get("actionable", False)),
+                "actionable": _as_bool(row.get("actionable", False)),
                 "entry_time": entry_time.isoformat(),
                 "exit_time_target": target_exit_ts.isoformat(),
                 "exit_time_actual": pd.Timestamp(exit_ts).isoformat(),
                 "horizon_h": horizon_h,
                 "entry_price": float(entry_price),
                 "exit_price": float(exit_price),
-                "realized_return": float(realized_return),
+                "gross_return": float(gross_return),
+                "fee_bps": cost["fee_bps"],
+                "slippage_bps": cost["slippage_bps"],
+                "short_extra_cost_bps": cost["short_extra_cost_bps"],
+                "estimated_cost_return": cost["estimated_cost_return"],
+                "net_return": float(net_return),
+                "realized_return": float(gross_return),
                 "refresh_reason": row.get("refresh_reason", ""),
                 "source_file": fname,
             })
@@ -337,6 +449,10 @@ def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
         if not os.path.exists(ledger_path):
             pd.DataFrame(columns=ledger_cols).to_csv(ledger_path, index=False)
             logger.info("Ledger initialized with no matured positions yet -> %s", ledger_path)
+            return
+        if ledger_backfilled:
+            ledger_df.to_csv(ledger_path, index=False)
+            logger.info("Ledger cost columns backfilled -> %s", ledger_path)
             return
         logger.info("Ledger unchanged: no newly matured positions")
         return
@@ -616,6 +732,8 @@ def _run(args):
         logger.warning("IC gate SHORT=LIQUIDATE: emitting 0 short picks")
         short_n = 0
     short_watch_only = short_gate.watch_only and not short_blocked
+    if preflight["batch_suppression"]:
+        short_watch_only = True
 
     # --- Rebalancing buffer: reduce turnover by keeping existing positions ---
     rebal_buffer = config.Portfolio.REBAL_BUFFER
@@ -708,11 +826,14 @@ def _run(args):
     logger.info(f"{long_side_label} ({len(longs)}): {longs.index.tolist()}")
     logger.info(f"SHORT {'EXEC' if execution_mode == 'short_only' else ''} ({len(shorts)}): {shorts.index.tolist()}")
 
+    saved_recommendations_df = pd.DataFrame()
     if not args.dry_run:
-        _save_recommendations(
+        saved_recommendations_df = _save_recommendations(
             latest_ts,
             longs,
             shorts,
+            short_predictions_df=short_predictions_df,
+            long_predictions_df=long_predictions_df,
             long_side_label=long_side_label,
             short_side_label="SHORT",
             contract_map=contract_map,
@@ -730,26 +851,11 @@ def _run(args):
         # Save full-universe per-coin predictions (both horizons) for user to browse
         _save_predictions_full(latest_ts, short_predictions_df, long_predictions_df)
 
-    # Telegram notification — single compact message (F1.1, 2026-04-25)
-    # Replaces 3 legacy messages (performance + basket + rich per-coin) with
-    # one compact view: header + top 5 per horizon + minimal tags.
+    # Telegram notification is intentionally decision-only. Full diagnostics
+    # are already saved to latest.csv, latest_predictions.csv and the ledger.
     if not args.dry_run and not args.no_telegram:
         try:
-            from utils.telegram import send_message, format_compact
-
-            # Build regime row
-            regime_row = None
-            try:
-                btc_regime = compute_btc_regime(closes)
-                if latest_ts in btc_regime.index:
-                    regime_row = btc_regime.loc[latest_ts].to_dict()
-            except Exception:
-                pass
-
-            ic_state = {
-                "short": {"status": short_gate.status, "last_ic": short_gate.last_ic},
-                "long":  {"status": long_gate.status,  "last_ic": long_gate.last_ic},
-            }
+            from utils.telegram import send_message, format_actionable_signals
 
             # Price at recommendation timestamp (close of latest_ts bar)
             prices_at_ts = {}
@@ -761,19 +867,17 @@ def _run(args):
             except Exception as e:
                 logger.warning(f"Could not build prices_at_ts: {e}")
 
-            msg = format_compact(
-                short_df=short_predictions_df,
-                long_df=long_predictions_df,
+            msg = format_actionable_signals(
+                recommendations_df=saved_recommendations_df,
                 latest_ts=latest_ts,
-                btc_regime_row=regime_row,
-                ic_state=ic_state,
-                max_per_horizon=5,
-                min_sigma=1.5,
                 prices=prices_at_ts,
+                min_sigma=getattr(config.Notification, "TELEGRAM_MIN_SIGMA", 1.5),
+                min_expected_abs_pct=getattr(config.Notification, "TELEGRAM_MIN_EXPECTED_ABS_PCT", 0.20),
+                hide_untrusted=getattr(config.Notification, "TELEGRAM_HIDE_UNTRUSTED", True),
             )
             sent = send_message(msg)
             if sent:
-                logger.info("Telegram compact report sent")
+                logger.info("Telegram run heartbeat/recommendation report sent")
         except Exception as e:
             logger.warning(f"Telegram notification failed: {e}")
 
@@ -838,6 +942,8 @@ def _save_recommendations(
     ts,
     longs,
     shorts,
+    short_predictions_df=None,
+    long_predictions_df=None,
     long_side_label="LONG",
     short_side_label="SHORT",
     contract_map=None,
@@ -868,6 +974,8 @@ def _save_recommendations(
 
     for market, score in longs.items():
         side = long_side_label
+        cost = _cost_assumptions_for_side(side)
+        pred_meta = _prediction_meta_for(market, side, short_predictions_df, long_predictions_df)
         prev_meta = prev_long_meta.get(market, {})
         if carry_longs and prev_meta:
             entry_price = prev_meta.get("entry_price")
@@ -889,9 +997,13 @@ def _save_recommendations(
             "next_rebalance_at": pd.Timestamp(next_long_rebalance_ts).isoformat() if next_long_rebalance_ts is not None else None,
             "bitget_symbol": bitget_symbol,
             "actionable": (side == "SHORT") or (side == "LONG" and long_model_active),
+            **cost,
+            **pred_meta,
         })
 
     for market, score in shorts.items():
+        cost = _cost_assumptions_for_side(short_side_label)
+        pred_meta = _prediction_meta_for(market, short_side_label, short_predictions_df, long_predictions_df)
         entry_price = get_current_price(market)
         _time.sleep(0.1)
         rows.append({
@@ -905,6 +1017,8 @@ def _save_recommendations(
             "next_rebalance_at": pd.Timestamp(next_short_rebalance_ts).isoformat() if next_short_rebalance_ts is not None else None,
             "bitget_symbol": market_to_bitget_symbol(market, contract_map or {}),
             "actionable": not short_watch_only,
+            **cost,
+            **pred_meta,
         })
 
     df = pd.DataFrame(rows)
@@ -919,6 +1033,8 @@ def _save_recommendations(
         os.symlink(os.path.basename(csv_path), latest_path)
     except Exception as e:
         logger.warning(f"Could not update latest symlink: {e}")
+
+    return df
 
 
 if __name__ == "__main__":

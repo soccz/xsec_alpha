@@ -17,6 +17,7 @@ Outputs:
 
 Usage:
     python scripts/retrain_pipeline.py [--dry-run] [--force]
+    python scripts/retrain_pipeline.py --horizons 6 --min-delta 0
 """
 from __future__ import annotations
 
@@ -309,9 +310,32 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="Train + measure, do not promote")
     ap.add_argument("--force", action="store_true", help="Skip promotion gate (dangerous)")
+    ap.add_argument(
+        "--horizons",
+        default="6,12",
+        help="Comma-separated horizons to retrain/promote (default: 6,12)",
+    )
+    ap.add_argument(
+        "--min-delta",
+        type=float,
+        default=IC_DELTA_THRESHOLD,
+        help=(
+            "Minimum allowed new-old holdout IC delta for promotion. "
+            "Default keeps the existing weekly refresh tolerance; use 0 for strict improvement."
+        ),
+    )
     args = ap.parse_args()
 
     log(f"=== retrain_pipeline START (dry_run={args.dry_run}, force={args.force}) ===")
+    try:
+        horizons = tuple(int(h.strip()) for h in str(args.horizons).split(",") if h.strip())
+    except ValueError:
+        log(f"Invalid --horizons value: {args.horizons!r}")
+        sys.exit(2)
+    invalid = [h for h in horizons if h not in (6, 12)]
+    if invalid or not horizons:
+        log(f"Invalid horizons {invalid}; supported horizons are 6 and 12")
+        sys.exit(2)
 
     # Pre-flight
     ok, reason = preflight()
@@ -330,10 +354,10 @@ def main():
 
     try:
         ARCHIVE_DIR.mkdir(exist_ok=True)
-        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%S")
         results = {}
 
-        for horizon in (6, 12):
+        for horizon in horizons:
             name = f"xsec_{horizon}h"
             prod_path = MODELS_DIR / f"{name}.pkl"
             candidate_path = MODELS_DIR / f"{name}_candidate.pkl"
@@ -356,7 +380,7 @@ def main():
 
             # Promotion gate
             delta = new_ic - old_ic if old_ic != float("-inf") else 0.0
-            pass_delta = delta >= IC_DELTA_THRESHOLD
+            pass_delta = delta >= args.min_delta
             pass_floor = new_ic >= IC_ABSOLUTE_FLOOR
             promoted = (pass_delta and pass_floor) or args.force
 

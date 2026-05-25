@@ -53,9 +53,17 @@ def build_btc_context(
     btc_vol_7d = btc.pct_change().rolling(vol_lookback_hours).std()
 
     vol_median = btc_vol_7d.dropna().median()
-    direction = np.where(btc_ret_7d >= 0, "bull", "bear")
-    vol_bucket = np.where(btc_vol_7d >= vol_median, "highvol", "lowvol")
-    regime = pd.Series(direction + "_" + vol_bucket, index=btc.index, name="regime")
+    direction = pd.Series(
+        np.where(btc_ret_7d >= 0, "bull", "bear"),
+        index=btc.index,
+        dtype="object",
+    )
+    vol_bucket = pd.Series(
+        np.where(btc_vol_7d >= vol_median, "highvol", "lowvol"),
+        index=btc.index,
+        dtype="object",
+    )
+    regime = direction.str.cat(vol_bucket, sep="_").rename("regime")
     regime[btc_ret_7d.isna() | btc_vol_7d.isna()] = "unknown"
 
     return pd.DataFrame(

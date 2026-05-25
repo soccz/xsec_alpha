@@ -4,7 +4,7 @@ Holdout evaluation script — Phase 2 gate check.
 
 Usage:
     cd /mnt/20t/main/gan_t/xsec_alpha
-    python scripts/evaluate_holdout.py [--days 90] [--model-path models/xsec_xgb.pkl]
+    python scripts/evaluate_holdout.py [--days 90] [--model-path models/xsec_6h.pkl]
 
 Phase 2 Gate: holdout IC > 0.10 AND t-stat > 2.0
 """
@@ -40,7 +40,7 @@ def main():
         description="Phase 2 gate: evaluate XGBoost ranker on holdout split."
     )
     parser.add_argument("--days",          type=int,   default=90,                    help="Days of history to load (default: 90)")
-    parser.add_argument("--model-path",    type=str,   default="models/xsec_xgb.pkl", help="Path to trained model pickle")
+    parser.add_argument("--model-path",    type=str,   default=config.Model.MODEL_PATH, help="Path to trained model pickle")
     parser.add_argument("--holdout-ratio", type=float, default=0.2,                   help="Fraction of timestamps to hold out (default: 0.2)")
     parser.add_argument("--horizon",       type=int,   default=None,                  help="Override prediction horizon in hours")
     parser.add_argument("--rebalance-hours", type=int, default=None,                  help="Evaluation rebalance interval in hours (default: same as horizon)")
@@ -51,7 +51,8 @@ def main():
     parser.add_argument("--fee-bps",       type=float, default=5.0,                   help="One-way fee in bps")
     parser.add_argument("--slippage-bps",  type=float, default=0.0,                   help="One-way slippage assumption in bps")
     parser.add_argument("--short-extra-cost-bps", type=float, default=10.0,          help="Additional per-period cost charged to the short leg (research baseline: 10bps)")
-    parser.add_argument("--side",              type=str,   default="short", choices=["short", "long"], help="Model side: short or long")
+    parser.add_argument("--side",              type=str,   default="unified", choices=["unified", "short", "long"], help="Factor library/model side")
+    parser.add_argument("--target",            type=str,   default="absolute", choices=["absolute", "residual"], help="Holdout target to rank against")
     args = parser.parse_args()
 
     logger.info(
@@ -65,8 +66,14 @@ def main():
     # ------------------------------------------------------------------
     # 1. Build dataset (same split as training)
     # ------------------------------------------------------------------
-    logger.info("Building dataset (side=%s)...", args.side)
-    ds = build_dataset(days=args.days, holdout_ratio=args.holdout_ratio, horizon=args.horizon, side=args.side)
+    logger.info("Building dataset (side=%s, target=%s)...", args.side, args.target)
+    ds = build_dataset(
+        days=args.days,
+        holdout_ratio=args.holdout_ratio,
+        horizon=args.horizon,
+        side=args.side,
+        target=args.target,
+    )
 
     X_holdout          = ds["X_holdout"]
     closes             = ds["closes"]
@@ -89,6 +96,7 @@ def main():
         beta_window=config.Data.BETA_ROLLING_WINDOW,
         execution_lag=execution_lag_bars,
     )
+    eval_target_wide = eval_fwd_returns if args.target == "absolute" else eval_residuals_wide
     btc_context = build_btc_context(closes)
 
     logger.info(
@@ -114,7 +122,7 @@ def main():
         a in sys.argv for a in ("--model-path",)
     ) or any(a.startswith("--model-path=") for a in sys.argv)
     if not user_set_model_path and args.side == "long":
-        model_path = "models/xsec_long.pkl"
+        model_path = config.LongModel.MODEL_PATH
     if not os.path.isabs(model_path):
         model_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), model_path)
 
@@ -164,17 +172,17 @@ def main():
         except KeyError:
             continue
 
-        if ts not in eval_residuals_wide.index:
+        if ts not in eval_target_wide.index:
             continue
-        actual_res_ts = eval_residuals_wide.loc[ts].dropna()
+        actual_target_ts = eval_target_wide.loc[ts].dropna()
 
-        combined = pd.concat([sc_ts, actual_res_ts], axis=1).dropna()
-        combined.columns = ["score", "residual"]
+        combined = pd.concat([sc_ts, actual_target_ts], axis=1).dropna()
+        combined.columns = ["score", "target"]
 
         if len(combined) < max(5, args.long_n + args.short_n):
             continue
 
-        ic, _ = spearmanr(combined["score"], combined["residual"])
+        ic, _ = spearmanr(combined["score"], combined["target"])
         ic_values[ts] = ic
 
         # Long/Short hit rate
@@ -191,8 +199,8 @@ def main():
         long_idx = list(longs.index)
         short_idx = list(shorts.index)
 
-        long_ret = combined.loc[long_idx, "residual"].mean() if long_idx else 0.0
-        short_ret = combined.loc[short_idx, "residual"].mean() if short_idx else 0.0
+        long_ret = combined.loc[long_idx, "target"].mean() if long_idx else 0.0
+        short_ret = combined.loc[short_idx, "target"].mean() if short_idx else 0.0
 
         if long_idx and short_idx:
             longshort_hits.append(1 if long_ret > short_ret else 0)
@@ -281,13 +289,15 @@ def main():
     # ------------------------------------------------------------------
     gate_ic  = mean_ic > IC_GATE
     gate_t   = t_stat  > TST_GATE
-    gate_pass = gate_ic and gate_t
+    gate_std = pred_std >= 0.0005
+    gate_mean = abs(pred_mean) <= 0.10
+    gate_pass = gate_ic and gate_t and gate_std and gate_mean
 
     print()
     print("=" * 65)
     print(
         f"Phase 2 Holdout Evaluation  (split: {split_ts}, horizon: {horizon}h, "
-        f"rebalance: {rebalance_hours}h, exec lag: {execution_lag_bars})"
+        f"rebalance: {rebalance_hours}h, exec lag: {execution_lag_bars}, target: {args.target})"
     )
     print("=" * 65)
     print(f"  {'Metric':<30} {'Value':>10}  {'Gate':>6}")
@@ -324,6 +334,10 @@ def main():
             reasons.append(f"IC {mean_ic:+.4f} <= {IC_GATE}")
         if not gate_t:
             reasons.append(f"t-stat {t_stat:+.2f} <= {TST_GATE}")
+        if not gate_std:
+            reasons.append(f"pred std {pred_std:.4f} < 0.0005")
+        if not gate_mean:
+            reasons.append(f"|pred mean| {abs(pred_mean):.4f} > 0.10")
         print(f"  PHASE 2 GATE FAILED: {', '.join(reasons)}")
         print(f"  -> Revisit feature engineering or increase training data")
     print("=" * 65)
@@ -351,9 +365,14 @@ def main():
             )
         print("-" * 65)
 
-    # Prediction std sanity warning
-    if pred_std < 0.005:
-        logger.warning(f"Prediction std={pred_std:.4f} < 0.005 — model may be outputting near-constant scores")
+    # Prediction std sanity follows the current ranking-model contract:
+    # cross-section std around 0.001~0.01 can be valid when IC is alive.
+    if pred_std < 0.0005:
+        logger.error(f"Prediction std={pred_std:.4f} < 0.0005 — zero-signal risk; stop and investigate")
+    elif pred_std < 0.001:
+        logger.warning(f"Prediction std={pred_std:.4f} < 0.001 — below normal ranking-model range")
+    elif pred_std > 0.50:
+        logger.warning(f"Prediction std={pred_std:.4f} > 0.50 — above normal ranking-model range")
 
     sys.exit(0 if gate_pass else 1)
 

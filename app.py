@@ -120,6 +120,14 @@ def _safe_float(v):
     return v
 
 
+def _safe_bool(v):
+    if isinstance(v, bool):
+        return v
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+
 def _latest_ic_point(history):
     if not history:
         return None
@@ -182,6 +190,10 @@ def _ledger_summary(df):
         "mean_return_actionable": None,
         "mean_return_watch_long": None,
         "mean_return_short": None,
+        "mean_net_all": None,
+        "mean_net_actionable": None,
+        "mean_net_watch_long": None,
+        "mean_net_short": None,
         "last_exit_time": None,
     }
     if df is None or df.empty:
@@ -189,7 +201,7 @@ def _ledger_summary(df):
 
     summary["total_closed"] = int(len(df))
     if "actionable" in df.columns:
-        actionable_mask = df["actionable"].fillna(False).astype(bool)
+        actionable_mask = df["actionable"].apply(_safe_bool)
         summary["actionable_closed"] = int(actionable_mask.sum())
     else:
         actionable_mask = None
@@ -216,6 +228,19 @@ def _ledger_summary(df):
         if short_mask is not None and short_mask.any():
             sr = rr[short_mask].dropna()
             summary["mean_return_short"] = sr.mean() if not sr.empty else None
+
+    if "net_return" in df.columns:
+        nr = df["net_return"].apply(_safe_float)
+        summary["mean_net_all"] = nr.dropna().mean() if nr.notna().any() else None
+        if actionable_mask is not None and actionable_mask.any():
+            an = nr[actionable_mask].dropna()
+            summary["mean_net_actionable"] = an.mean() if not an.empty else None
+        if watch_long_mask is not None and watch_long_mask.any():
+            wn = nr[watch_long_mask].dropna()
+            summary["mean_net_watch_long"] = wn.mean() if not wn.empty else None
+        if short_mask is not None and short_mask.any():
+            sn = nr[short_mask].dropna()
+            summary["mean_net_short"] = sn.mean() if not sn.empty else None
 
     if "exit_time_actual" in df.columns:
         exits = pd.to_datetime(df["exit_time_actual"], utc=True, errors="coerce").dropna()
@@ -511,6 +536,9 @@ def _render_ledger_block(summary):
         f'<div class="stat"><span class="label">Mean Return Actionable</span><span class="value">{_pct(summary["mean_return_actionable"])}</span></div>',
         f'<div class="stat"><span class="label">Mean Return Watch Long</span><span class="value">{_pct(summary["mean_return_watch_long"])}</span></div>',
         f'<div class="stat"><span class="label">Mean Return Short</span><span class="value">{_pct(summary["mean_return_short"])}</span></div>',
+        f'<div class="stat"><span class="label">Mean Net All</span><span class="value">{_pct(summary["mean_net_all"])}</span></div>',
+        f'<div class="stat"><span class="label">Mean Net Actionable</span><span class="value">{_pct(summary["mean_net_actionable"])}</span></div>',
+        f'<div class="stat"><span class="label">Mean Net Short</span><span class="value">{_pct(summary["mean_net_short"])}</span></div>',
         f'<div class="stat"><span class="label">Last Exit</span><span class="value">{summary["last_exit_time"] or "N/A"}</span></div>',
     ]
     return "".join(html)

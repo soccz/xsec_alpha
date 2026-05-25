@@ -43,6 +43,20 @@ class Config:
         STOP_LOSS_PCT = 3.0             # 손절 기준 (%)
         REBAL_BUFFER = 10               # 기존 포지션 유지 버퍼 (rank N+buffer까지 유지)
 
+    class Costs:
+        # Background accounting only. Telegram stays recommendation-focused;
+        # dashboard/ledger disclose the cost assumptions and net return.
+        ONE_WAY_FEE_BPS = float(os.getenv("XSEC_ONE_WAY_FEE_BPS", "6"))
+        SLIPPAGE_BPS = float(os.getenv("XSEC_SLIPPAGE_BPS", "4"))
+        SHORT_EXTRA_COST_BPS = float(os.getenv("XSEC_SHORT_EXTRA_COST_BPS", "10"))
+
+    class Notification:
+        # Only these quality-screened rows reach Telegram. Full details are still
+        # written to latest.csv / latest_predictions.csv / recommendation_ledger.csv.
+        TELEGRAM_MIN_SIGMA = float(os.getenv("XSEC_TELEGRAM_MIN_SIGMA", "1.5"))
+        TELEGRAM_MIN_EXPECTED_ABS_PCT = float(os.getenv("XSEC_TELEGRAM_MIN_EXPECTED_ABS_PCT", "0.20"))
+        TELEGRAM_HIDE_UNTRUSTED = os.getenv("XSEC_TELEGRAM_HIDE_UNTRUSTED", "1") != "0"
+
     class Model:
         # F1 unified (2026-04-25): 10-feature unified factor library, all-regime,
         # absolute-return target. Paired with LongModel below — both models share

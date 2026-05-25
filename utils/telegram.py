@@ -210,6 +210,126 @@ def format_compact(short_df, long_df, latest_ts, btc_regime_row=None,
     return "\n".join(lines).rstrip()
 
 
+def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None = None,
+                              min_sigma: float = 1.5,
+                              min_expected_abs_pct: float = 0.20,
+                              hide_untrusted: bool = True) -> str:
+    """Telegram surface for final user-facing recommendations.
+
+    Full diagnostics stay in CSV/dashboard artifacts. This formatter always
+    returns a heartbeat message: either quality-screened executable rows, or a
+    compact "no execution recommendation" notice for the run.
+    """
+    prices = prices or {}
+    ts_str = str(latest_ts)[:16]
+
+    def _nan(v):
+        return v is None or (isinstance(v, float) and v != v)
+
+    def _truthy(v):
+        if isinstance(v, bool):
+            return v
+        if v is None:
+            return False
+        return str(v).strip().lower() in {"1", "true", "yes", "y"}
+
+    def _empty_message(reason: str, raw_df=None) -> str:
+        lines = [
+            f"📌 <b>xsec 추천</b> · <code>{ts_str} UTC</code>",
+            "",
+            "⏸ <b>실행 추천 없음</b>",
+            f"<code>{reason}</code>",
+        ]
+        if raw_df is not None and len(raw_df):
+            total = len(raw_df)
+            actionable_n = (
+                int(raw_df["actionable"].apply(_truthy).sum())
+                if "actionable" in raw_df.columns
+                else 0
+            )
+            lines.append(f"<code>후보 {total}개 · actionable {actionable_n}개</code>")
+            if "suppression" in raw_df.columns:
+                reasons = [
+                    str(x) for x in raw_df["suppression"].dropna().unique().tolist()
+                    if str(x).strip()
+                ]
+                if reasons:
+                    lines.append(f"<code>억제: {', '.join(reasons[:2])}</code>")
+        lines.append("<code>세부 근거·비용·성과는 대시보드/ledger에 기록</code>")
+        return "\n".join(lines).rstrip()
+
+    if recommendations_df is None or len(recommendations_df) == 0:
+        return _empty_message("추천 데이터 없음")
+
+    raw_df = recommendations_df.copy()
+    df = raw_df.copy()
+    if "actionable" in df.columns:
+        df = df[df["actionable"].apply(_truthy)]
+    if df.empty:
+        return _empty_message("pre-flight/gate로 전체 watch-only", raw_df)
+
+    if "sigma" in df.columns:
+        df["sigma"] = df["sigma"].apply(lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan"))
+        df = df[df["sigma"] >= min_sigma]
+    if "expected_pct" in df.columns:
+        df["expected_pct"] = df["expected_pct"].apply(lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan"))
+        df = df[df["expected_pct"].abs() >= min_expected_abs_pct]
+        if "side" in df.columns:
+            side_u = df["side"].astype(str).str.upper()
+            side_ok = (
+                (side_u.str.contains("SHORT", na=False) & (df["expected_pct"] < 0))
+                | (side_u.eq("LONG") & (df["expected_pct"] > 0))
+            )
+            df = df[side_ok]
+    if hide_untrusted and "trust_tag" in df.columns:
+        df = df[df["trust_tag"].fillna("").astype(str) != "⚠"]
+    if df.empty:
+        return _empty_message(
+            f"quality gate 통과 없음 (min {min_sigma:.1f}σ, 기대 {min_expected_abs_pct:.2f}%+)",
+            raw_df,
+        )
+
+    if "sigma" in df.columns:
+        df = df.sort_values(["side", "sigma"], ascending=[True, False])
+
+    lines = [
+        f"📌 <b>xsec 추천</b> · <code>{ts_str} UTC</code>",
+        "",
+    ]
+
+    for side_key, title, icon in [
+        ("SHORT", "SHORT", "🔴"),
+        ("LONG", "LONG", "🟢"),
+    ]:
+        part = df[df["side"].astype(str).str.upper().eq(side_key)] if "side" in df.columns else df
+        if part.empty:
+            continue
+        horizon = int(part["horizon_h"].iloc[0]) if "horizon_h" in part.columns else ""
+        lines.append(f"{icon} <b>{title}</b> <code>{horizon}h</code>")
+        for _, row in part.iterrows():
+            market = str(row.get("market", ""))
+            coin = market.replace("KRW-", "")
+            exp = row.get("expected_pct")
+            exp_s = f"{float(exp):+.1f}%" if not _nan(exp) else "—"
+            sigma = row.get("sigma")
+            sigma_s = f"{float(sigma):.1f}σ" if not _nan(sigma) else "—"
+            tag = row.get("tag", "") or ""
+            trust = row.get("trust_tag", "") or ""
+            price = prices.get(market) or row.get("entry_price")
+            price_s = _fmt_krw(float(price)) if price and not _nan(price) else None
+            arrow = "↓" if side_key == "SHORT" else "↑"
+            lines.append(
+                f"  {tag} <b>{coin}</b> {arrow} <code>{exp_s}</code> "
+                f"<code>{sigma_s}</code>"
+                + (f" @<code>{price_s}</code>" if price_s else "")
+                + (f" {trust}" if trust else "")
+            )
+        lines.append("")
+
+    lines.append("<code>세부 근거·비용·성과는 대시보드/ledger에 기록</code>")
+    return "\n".join(lines).rstrip()
+
+
 def format_per_coin_predictions(pred_df, horizon_h: int, title: str,
                                    min_sigma: float = 1.0, max_rows: int = 15) -> str:
     """Probabilistic per-coin view.
