@@ -45,7 +45,7 @@ LOCK_FILE = ROOT / "output" / ".retrain.lock"
 # Promotion gate thresholds
 IC_DELTA_THRESHOLD = -0.015   # new IC must be at most 1.5pp worse than old
 IC_ABSOLUTE_FLOOR = 0.040     # new IC must be at least 0.040
-MAX_DATA_AGE_HOURS = 4        # refuse retrain if DB data stale (was 3 — boundary at Sun 20:00 UTC vs 17:00 fetch tripped 3.005h)
+MAX_DATA_AGE_HOURS = 6        # refuse retrain if DB data stale. xsec-alpha.timer fires every 6h, so any retrain run between fetches sees data at most 6h old. Hard staleness (>6h) means a fetch silently failed and we should not retrain on partial data.
 
 
 def log(msg: str) -> None:
