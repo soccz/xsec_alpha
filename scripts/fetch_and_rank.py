@@ -876,6 +876,15 @@ def _run(args):
             except Exception as e:
                 logger.warning(f"Could not build prices_at_ts: {e}")
 
+            # Realized 30d summary so the message can show recent paper performance
+            # alongside the new signals — manual trader needs that context.
+            realized_summary = None
+            try:
+                from utils.dashboard_export import build_summary_payload
+                realized_summary = (build_summary_payload() or {}).get("realized_summary")
+            except Exception as e:
+                logger.debug(f"Could not load realized summary for telegram tail: {e}")
+
             msg = format_actionable_signals(
                 recommendations_df=saved_recommendations_df,
                 latest_ts=latest_ts,
@@ -883,6 +892,7 @@ def _run(args):
                 min_sigma=getattr(config.Notification, "TELEGRAM_MIN_SIGMA", 1.5),
                 min_expected_abs_pct=getattr(config.Notification, "TELEGRAM_MIN_EXPECTED_ABS_PCT", 0.20),
                 hide_untrusted=getattr(config.Notification, "TELEGRAM_HIDE_UNTRUSTED", True),
+                realized_summary=realized_summary,
             )
             sent = send_message(msg)
             if sent:

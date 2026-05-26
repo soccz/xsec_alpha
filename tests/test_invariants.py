@@ -264,20 +264,21 @@ def test_dashboard_public_summary_has_aggregates():
 
 def test_telegram_format_actionable_branches():
     from utils.telegram import format_actionable_signals
-    # Branch A: recommendation present
+    # Branch A: recommendation present (σ >= soft floor 1.0)
     df_yes = pd.DataFrame([
         {"market": "KRW-X", "side": "SHORT", "direction": -1, "sigma": 2.0,
          "expected_pct": -1.2, "p_correct": 0.62, "trust_tag": "", "actionable": True,
          "tag": "🔥", "label": "강한 신호", "consensus": 2.0, "horizon_h": 6}
     ]).set_index("market", drop=False)
     msg_a = format_actionable_signals(df_yes, latest_ts=pd.Timestamp("2026-01-01T00:00:00Z"))
-    assert msg_a and "xsec" in msg_a, "branch A (recommendation) produced empty message"
+    assert msg_a and "xsec" in msg_a and "SHORT" in msg_a, "branch A (recommendation) missing structure"
 
-    # Branch B: heartbeat
+    # Branch B: heartbeat — all picks below σ 1.0 soft floor
     df_no = pd.DataFrame([
         {"market": "KRW-Y", "side": "SHORT", "direction": -1, "sigma": 0.5,
          "expected_pct": -0.1, "p_correct": 0.51, "trust_tag": "", "actionable": False,
          "tag": "▫", "label": "약함", "consensus": 1.0, "horizon_h": 6}
     ]).set_index("market", drop=False)
     msg_b = format_actionable_signals(df_no, latest_ts=pd.Timestamp("2026-01-01T00:00:00Z"))
-    assert msg_b and "추천" in msg_b, "branch B (heartbeat) produced empty message"
+    assert msg_b and ("강한 신호 없음" in msg_b or "⏸" in msg_b), \
+        "branch B (heartbeat) missing pause/no-signal marker"

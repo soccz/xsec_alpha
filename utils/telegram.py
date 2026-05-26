@@ -213,12 +213,23 @@ def format_compact(short_df, long_df, latest_ts, btc_regime_row=None,
 def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None = None,
                               min_sigma: float = 1.5,
                               min_expected_abs_pct: float = 0.20,
-                              hide_untrusted: bool = True) -> str:
-    """Telegram surface for final user-facing recommendations.
+                              hide_untrusted: bool = True,
+                              realized_summary: dict | None = None) -> str:
+    """Telegram surface — designed for an operator who trades manually.
 
-    Full diagnostics stay in CSV/dashboard artifacts. This formatter always
-    returns a heartbeat message: either quality-screened executable rows, or a
-    compact "no execution recommendation" notice for the run.
+    The user executes both sides by hand on Bitget / Upbit, so the message
+    needs enough information to support a manual judgment. Every pick that
+    might be tradable shows up, with quality tier + trust tag attached:
+
+      - SHORT rows (actionable): the 5 picks fetch_and_rank emits as exec
+      - LONG  rows (watch-only): top WATCH_LONG candidates by σ (since the
+        user trades these manually too, they need to see them)
+      - Each row carries σ, expected%, trust_tag, entry_price, and a tier
+        icon (🔥 ≥2σ, ✅ ≥1.5σ, ▫ weaker). Untrusted (⚠) signals are kept
+        but visibly tagged so the user can skip them.
+
+    If absolutely nothing meets even the soft threshold (σ ≥ 1.0), we still
+    emit a heartbeat with reason — confirms the loop ran.
     """
     prices = prices or {}
     ts_str = str(latest_ts)[:16]
@@ -233,100 +244,140 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
             return False
         return str(v).strip().lower() in {"1", "true", "yes", "y"}
 
-    def _empty_message(reason: str, raw_df=None) -> str:
+    def _realized_tail() -> str:
+        if not realized_summary:
+            return ""
+        bits = []
+        for side, label in (("SHORT", "SHORT"), ("WATCH_LONG", "LONG")):
+            d = (realized_summary.get(side) or {}).get("d30") or {}
+            net = d.get("avg_net")
+            n = d.get("n")
+            if net is not None and n:
+                sign = "+" if net > 0 else ""
+                bits.append(f"{label} {sign}{net:.2f}% (n={n})")
+        return "  ·  ".join(bits) if bits else ""
+
+    def _clean_str(v) -> str:
+        # NaN slips through `or ""` because float('nan') is truthy. Guard explicitly.
+        if _nan(v):
+            return ""
+        s = str(v).strip()
+        return "" if s.lower() in ("nan", "none", "<na>") else s
+
+    def _row(row, side_key: str) -> str:
+        market = str(row.get("market", ""))
+        coin = market.replace("KRW-", "")
+        exp = row.get("expected_pct")
+        exp_s = f"{float(exp):+.1f}%" if not _nan(exp) else "—"
+        sigma = row.get("sigma")
+        sigma_s = f"{float(sigma):.1f}σ" if not _nan(sigma) else "—"
+        tag = _clean_str(row.get("tag")) or "·"
+        trust = _clean_str(row.get("trust_tag"))
+        price = prices.get(market) or row.get("entry_price")
+        price_s = _fmt_krw(float(price)) if price and not _nan(price) else None
+        arrow = "↓" if side_key == "SHORT" else "↑"
+        return (
+            f"  {tag} <b>{coin}</b> {arrow} <code>{exp_s}</code> "
+            f"<code>{sigma_s}</code>"
+            + (f" @<code>{price_s}</code>" if price_s else "")
+            + (f" {trust}" if trust else "")
+        )
+
+    def _heartbeat(reason: str, raw_df=None) -> str:
         lines = [
-            f"📌 <b>xsec 추천</b> · <code>{ts_str} UTC</code>",
+            f"📌 <b>xsec</b> · <code>{ts_str} UTC</code>",
             "",
-            "⏸ <b>실행 추천 없음</b>",
+            "⏸ <b>강한 신호 없음</b>",
             f"<code>{reason}</code>",
         ]
         if raw_df is not None and len(raw_df):
             total = len(raw_df)
-            actionable_n = (
-                int(raw_df["actionable"].apply(_truthy).sum())
-                if "actionable" in raw_df.columns
-                else 0
-            )
-            lines.append(f"<code>후보 {total}개 · actionable {actionable_n}개</code>")
-            if "suppression" in raw_df.columns:
-                reasons = [
-                    str(x) for x in raw_df["suppression"].dropna().unique().tolist()
-                    if str(x).strip()
-                ]
-                if reasons:
-                    lines.append(f"<code>억제: {', '.join(reasons[:2])}</code>")
-        lines.append("<code>세부 근거·비용·성과는 대시보드/ledger에 기록</code>")
+            lines.append(f"<code>후보 {total}개 · 모두 σ &lt; 1.0</code>")
+        tail = _realized_tail()
+        if tail:
+            lines.append("")
+            lines.append(f"<code>📊 30d net  {tail}</code>")
+        lines.append("<code>세부는 대시보드/ledger</code>")
         return "\n".join(lines).rstrip()
 
     if recommendations_df is None or len(recommendations_df) == 0:
-        return _empty_message("추천 데이터 없음")
+        return _heartbeat("추천 데이터 없음")
 
     raw_df = recommendations_df.copy()
-    df = raw_df.copy()
-    if "actionable" in df.columns:
-        df = df[df["actionable"].apply(_truthy)]
-    if df.empty:
-        return _empty_message("pre-flight/gate로 전체 watch-only", raw_df)
+    if "sigma" in raw_df.columns:
+        raw_df["sigma"] = raw_df["sigma"].apply(
+            lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan")
+        )
+    if "expected_pct" in raw_df.columns:
+        raw_df["expected_pct"] = raw_df["expected_pct"].apply(
+            lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan")
+        )
 
-    if "sigma" in df.columns:
-        df["sigma"] = df["sigma"].apply(lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan"))
-        df = df[df["sigma"] >= min_sigma]
-    if "expected_pct" in df.columns:
-        df["expected_pct"] = df["expected_pct"].apply(lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan"))
-        df = df[df["expected_pct"].abs() >= min_expected_abs_pct]
-        if "side" in df.columns:
-            side_u = df["side"].astype(str).str.upper()
-            side_ok = (
-                (side_u.str.contains("SHORT", na=False) & (df["expected_pct"] < 0))
-                | (side_u.eq("LONG") & (df["expected_pct"] > 0))
-            )
-            df = df[side_ok]
-    if hide_untrusted and "trust_tag" in df.columns:
-        df = df[df["trust_tag"].fillna("").astype(str) != "⚠"]
-    if df.empty:
-        return _empty_message(
-            f"quality gate 통과 없음 (min {min_sigma:.1f}σ, 기대 {min_expected_abs_pct:.2f}%+)",
+    # Split sides BEFORE filtering so we can show both regardless of actionable.
+    side_u = raw_df["side"].astype(str).str.upper() if "side" in raw_df.columns else pd.Series([""] * len(raw_df))
+    short_df = raw_df[side_u.str.contains("SHORT", na=False)].copy()
+    long_df = raw_df[side_u.str.contains("LONG", na=False)].copy()
+
+    # Direction sanity per side
+    if "expected_pct" in short_df.columns:
+        short_df = short_df[short_df["expected_pct"] <= 0]
+    if "expected_pct" in long_df.columns:
+        long_df = long_df[long_df["expected_pct"] >= 0]
+
+    # Soft floor: σ >= 1.0 lets weaker signals through with their tier visible.
+    # The min_sigma / min_expected_abs_pct args now drive the "🔥 strong" tier
+    # split, not a hard cut.
+    SOFT_SIGMA = 1.0
+    short_df = short_df[short_df["sigma"].fillna(0) >= SOFT_SIGMA]
+    long_df = long_df[long_df["sigma"].fillna(0) >= SOFT_SIGMA]
+
+    # Sort by sigma desc per side, cap to 5 each
+    if not short_df.empty:
+        short_df = short_df.sort_values("sigma", ascending=False).head(5)
+    if not long_df.empty:
+        long_df = long_df.sort_values("sigma", ascending=False).head(5)
+
+    if short_df.empty and long_df.empty:
+        return _heartbeat(
+            f"전 사이드 σ &lt; {SOFT_SIGMA:.1f} (강신호 0)",
             raw_df,
         )
 
-    if "sigma" in df.columns:
-        df = df.sort_values(["side", "sigma"], ascending=[True, False])
+    lines = [f"📌 <b>xsec</b> · <code>{ts_str} UTC</code>", ""]
 
-    lines = [
-        f"📌 <b>xsec 추천</b> · <code>{ts_str} UTC</code>",
-        "",
-    ]
-
-    for side_key, title, icon in [
-        ("SHORT", "SHORT", "🔴"),
-        ("LONG", "LONG", "🟢"),
-    ]:
-        part = df[df["side"].astype(str).str.upper().eq(side_key)] if "side" in df.columns else df
+    def _summary_chip(part) -> str:
         if part.empty:
-            continue
-        horizon = int(part["horizon_h"].iloc[0]) if "horizon_h" in part.columns else ""
-        lines.append(f"{icon} <b>{title}</b> <code>{horizon}h</code>")
-        for _, row in part.iterrows():
-            market = str(row.get("market", ""))
-            coin = market.replace("KRW-", "")
-            exp = row.get("expected_pct")
-            exp_s = f"{float(exp):+.1f}%" if not _nan(exp) else "—"
-            sigma = row.get("sigma")
-            sigma_s = f"{float(sigma):.1f}σ" if not _nan(sigma) else "—"
-            tag = row.get("tag", "") or ""
-            trust = row.get("trust_tag", "") or ""
-            price = prices.get(market) or row.get("entry_price")
-            price_s = _fmt_krw(float(price)) if price and not _nan(price) else None
-            arrow = "↓" if side_key == "SHORT" else "↑"
-            lines.append(
-                f"  {tag} <b>{coin}</b> {arrow} <code>{exp_s}</code> "
-                f"<code>{sigma_s}</code>"
-                + (f" @<code>{price_s}</code>" if price_s else "")
-                + (f" {trust}" if trust else "")
-            )
+            return ""
+        strong = int((part["sigma"] >= min_sigma).sum()) if "sigma" in part.columns else 0
+        trusted = int((part.get("trust_tag", "").astype(str) == "⭐").sum()) if "trust_tag" in part.columns else 0
+        untrusted = int((part.get("trust_tag", "").astype(str) == "⚠").sum()) if "trust_tag" in part.columns else 0
+        bits = []
+        if strong: bits.append(f"🔥{strong}")
+        if trusted: bits.append(f"⭐{trusted}")
+        if untrusted: bits.append(f"⚠{untrusted}")
+        return f" <code>({' · '.join(bits)})</code>" if bits else ""
+
+    if not short_df.empty:
+        horizon = int(short_df["horizon_h"].iloc[0]) if "horizon_h" in short_df.columns else 6
+        lines.append(f"🔴 <b>SHORT</b> <code>{horizon}h</code>{_summary_chip(short_df)}")
+        for _, row in short_df.iterrows():
+            lines.append(_row(row, "SHORT"))
         lines.append("")
 
-    lines.append("<code>세부 근거·비용·성과는 대시보드/ledger에 기록</code>")
+    if not long_df.empty:
+        horizon = int(long_df["horizon_h"].iloc[0]) if "horizon_h" in long_df.columns else 12
+        lines.append(f"🟢 <b>LONG</b> <code>{horizon}h</code>{_summary_chip(long_df)}")
+        for _, row in long_df.iterrows():
+            lines.append(_row(row, "LONG"))
+        lines.append("")
+
+    # Realized 30d net summary line for context (manual trader needs to know
+    # how the signal has actually paid off recently).
+    tail = _realized_tail()
+    if tail:
+        lines.append(f"<code>📊 30d net  {tail}</code>")
+
+    lines.append("<code>⭐ 신뢰 (적중≥60%) · ⚠ 역신호 (≤40%) · 세부는 대시보드</code>")
     return "\n".join(lines).rstrip()
 
 
