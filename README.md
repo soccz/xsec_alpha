@@ -432,6 +432,30 @@ Bitget USDT perp 공개 API로 실제 숏 가능 여부 확인:
 
 ---
 
+### 16. 외부 연구 전이 검증 — prelude 멀티데이 과확장 (2026-06-25, 기각)
+
+prelude(업비트 KRW 일봉 펌프 레이더)에서 강하게 검증된 신호들을 short-capable 인 xsec_alpha 로
+전이할 수 있는지 점검. prelude 는 현물 long-only 라 cross-sectional excess 엣지를 환금 못 했고,
+xsec_alpha 는 Bitget 숏이 되므로 후보였다.
+
+- **LVG-XS(저변동 grind-up)**: 이미 `volatility_inv_24h`(proven IC +0.081)로 프로덕션에 존재 → 신규성 0.
+- **멀티데이 과확장(rev_1d/3d/7d = -pct_change(24/72/168))**: prelude 가 일봉에서 "이미 며칠 오른
+  코인 = 음의 forward = 숏 알파"로 검증한 신호. xsec_alpha 의 reversal 은 1h/4h 단기뿐이라 후보.
+  - **단변량 IC(h6, 비침습 측정)**: rev_1d +0.091 / rev_3d +0.067 / rev_7d +0.058 (전부 t>20).
+    기존 [rev1h,rev4h,volinv24h] 직교화 후에도 증분 IC rev_1d +0.033(t11.5)·최근30d +0.018(t3.7)
+    — **OOS 까지 살아있는 진짜 단변량 신호.**
+  - **★병렬 walk-forward holdout 게이트(BASE vs BASE+rev1d,rev3d, XSecRanker, 4 fold)**: 모델
+    holdout IC BASE +0.198 → AUG +0.198 (ΔIC mean **−0.0014**, 1/4 fold만 +), 숏 net BASE +0.0038 →
+    AUG +0.0038 (Δnet **~0**, 2/4 fold). → **REJECT.**
+- **판정:** 멀티데이 과확장은 단변량으론 진짜지만, **XGBoost 랭커가 이미 reversal_4h(corr 0.35)+
+  volatility_inv_24h(corr 0.33)의 비선형 상호작용으로 포섭** → 명시 팩터 추가는 모델·net 무개선
+  (오히려 용량 희석). **"증분 단변량 IC ≠ 모델 개선"** 의 교과서 사례. data/features.py 변경 없음.
+- **메타:** prelude 와 xsec_alpha 가 독립적으로 같은 cross-sectional 팩터 패밀리에 수렴 — 전이할
+  free lunch 없음. xsec_alpha 숏이 이미 그 엣지를 수확 중이라는 *확인*. (재현: scratchpad
+  xsec_overext_ic_test.py / xsec_overext_wf_gate.py, 프로덕션 무변경 비침습 측정)
+
+---
+
 ## 시스템 구조
 
 ```
