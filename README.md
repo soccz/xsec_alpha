@@ -420,15 +420,37 @@ Bitget USDT perp 공개 API로 실제 숏 가능 여부 확인:
 
 ---
 
+### 14-bis. 🔒 사전등록 시한부 재계약 (2026-07-11 비준 — 판정 전 수정 금지)
+
+**배경:** §14 프로브 계약(2026-04-14, "2~4주 후 계속/조정/중단 결정")이 판정 없이 12주 초과.
+2026-07-11 사용자 비준으로 아래와 같이 시한부 재계약한다. (22tb/DECISIONS.md 보드 등재)
+
+- **WATCH_LONG: KILL 확정 (2026-07-11).** 근거: 30d 실현 net −0.22%/trade·승률 45.3%로
+  §14 승격 전제(long IC>0 → 실행 승격)와 실측이 모순. 집행 = `config.Portfolio.LIVE_WATCH_LONG_N`
+  기본값 0 (픽 생성·ledger·텔레그램 중지). §14의 "Long 승격 조건"은 폐기 — 부활은 새 사전등록으로만.
+- **SHORT: 판정일 2026-09-01 (prelude와 동일 일자). UNDECIDED 불허.**
+  - **GO(유지) 기준 — 전부 충족:**
+    1. 재계약 구간(2026-07-11~09-01) closed per-trade mean net > 0
+    2. 프로브 누적(04-14~) per-trade mean net > 0 AND clustered 95% CI 0 제외
+    3. 구간 내 ic_gate SHORT의 FREEZE/LIQUIDATE 무발동 (발동 시 사유 해소 증빙 필수)
+  - **미달 시 KILL:** 타이머 3종(alpha/measure/retrain) 정지 + 아카이브. 측정 인프라 존치 여부는 판정 세션에서.
+  - **조기 KILL:** 프로브 누적 mean net < 0 전환 시 즉시.
+  - **승격(자본 확대·자동 실행)은 GO와 별개 안건:** 실체결 기록(사용자 fills) ≥ 20건으로
+    신호가격↔체결가격 갭(슬리피지·펀딩비)을 실측하기 전에는 상정 금지 — 현 net +0.22%는 비용 가정치.
+- **데드맨스위치:** 09-01에 사람이 판정 안 해도 위 기준으로 자동 판정 (계산은 recommendation_ledger.csv
+  기계 채점으로 가능). 판정 결과와 무관하게 이 블록 자체는 판정 전 수정 금지.
+
+---
+
 ### 15. 다음 단계
 
 - [ ] 2~4주 라이브 프로브 실행 및 데이터 수집
 - [x] Long 전용 모델 연구 → v3 완성 (compression+reversal, 12h, Ensemble)
-- [ ] Long 승격 판정: 60+ holdout timestamps 축적 후 재평가
+- [x] ~~Long 승격 판정: 60+ holdout timestamps 축적 후 재평가~~ → **2026-07-11 WATCH_LONG KILL (§14-bis)**
 - [ ] app.py 대시보드에 ledger/next_rebalance/refresh_reason 노출
 - [ ] Short 모델 재저장 (Ridge feature names 경고 제거)
 - [ ] 360일+ 데이터로 추세장 포함 재검증
-- [ ] 프로브 종료 후: 계속/조정/중단 결정
+- [x] ~~프로브 종료 후: 계속/조정/중단 결정~~ → **2026-07-11 시한부 재계약, 판정일 09-01 (§14-bis)**
 
 ---
 

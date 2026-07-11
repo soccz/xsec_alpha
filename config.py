@@ -27,7 +27,10 @@ class Config:
         LONG_N = 20    # top 10% of ~200 coins
         SHORT_N = 20   # bottom 10%
         LIVE_EXECUTION_MODE = os.getenv("XSEC_LIVE_EXECUTION_MODE", "short_only")
-        LIVE_WATCH_LONG_N = int(os.getenv("XSEC_LIVE_WATCH_LONG_N", "5"))
+        # 2026-07-11 WATCH_LONG KILL (README §14-bis 사전등록 재계약): 30d 실현 net −0.22%/trade,
+        # 승률 45.3%로 §14 승격 전제와 모순 → N=0 (픽 생성·ledger·텔레그램 모두 중지).
+        # 부활은 새 사전등록으로만. env 오버라이드는 그 사전등록 통과 후에만 사용할 것.
+        LIVE_WATCH_LONG_N = int(os.getenv("XSEC_LIVE_WATCH_LONG_N", "0"))
         LIVE_EXEC_SHORT_N = int(os.getenv("XSEC_LIVE_EXEC_SHORT_N", "5"))
         LIVE_REQUIRE_BITGET_TRADABLE = os.getenv("XSEC_LIVE_REQUIRE_BITGET_TRADABLE", "1") != "0"
         # Paper-observation mode for the LONG side. When True:
