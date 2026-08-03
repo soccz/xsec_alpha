@@ -137,7 +137,7 @@ def run_all(days: int = 120):
     for i, market in enumerate(markets):
         logger.info(f"[{i+1}/{len(markets)}] {market}")
         collect_market_data(market, days)
-        time.sleep(1.1)
+        time.sleep(float(config.Data.COLLECTOR_MARKET_SLEEP_SEC))
     logger.info("Collection complete")
 
 

@@ -339,10 +339,10 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
     annualizing would require block resampling over rebalance buckets to avoid
     the IID assumption.
 
-    Reports both the naive per-trade t (assumes IID across all picks) and the
-    clustered t (group picks by entry_time first, treat each rebalance window as
-    one observation). The clustered t is the honest one because 5 SHORT picks
-    in the same 6h window share market regime.
+    Primary hit/t/sharpe fields use net return (legacy rows fall back to gross
+    minus configured cost). Explicit ``gross_*`` fields preserve the diagnostic
+    comparison. The clustered t groups by entry_time because picks from one
+    rebalance window share market regime.
     """
     side_u = side.upper()
     cost = COST_PCT_BY_SIDE.get(side_u, 0.0)
@@ -351,8 +351,10 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
         cutoff = datetime.now(timezone.utc) - timedelta(days=d)
         vals: list[float] = []
         net_vals: list[float] = []
-        picks: list[tuple[str, float]] = []  # (entry_time, realized_pct) for clustering
-        wins = 0
+        gross_picks: list[tuple[str, float]] = []
+        net_picks: list[tuple[str, float]] = []
+        gross_wins = 0
+        net_wins = 0
         for r in history:
             if (r.get("side") or "").upper() != side_u:
                 continue
@@ -372,43 +374,78 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
                 continue
             vals.append(rp)
             npct = r.get("net_pct")
-            if npct is not None:
-                net_vals.append(npct)
-            picks.append((ts, rp))
+            effective_net = npct if npct is not None else (rp - cost)
+            net_vals.append(effective_net)
+            gross_picks.append((ts, rp))
+            net_picks.append((ts, effective_net))
             if rp > 0:
-                wins += 1
+                gross_wins += 1
+            if effective_net > 0:
+                net_wins += 1
         n = len(vals)
         if n == 0:
             out[f"d{d}"] = {
                 "n": 0, "n_windows": 0, "avg": None, "avg_net": None, "win_pct": None,
+                "gross_win_pct": None, "net_win_pct": None,
                 "win_ci_lo": None, "win_ci_hi": None,
+                "gross_win_ci_lo": None, "gross_win_ci_hi": None,
+                "net_win_ci_lo": None, "net_win_ci_hi": None,
                 "std": None, "tstat": None, "tstat_clustered": None,
-                "sharpe": None, "cost_pct": cost,
+                "sharpe": None, "gross_std": None, "gross_tstat": None,
+                "gross_tstat_clustered": None, "gross_sharpe": None,
+                "metric_basis": "net_return", "cost_pct": cost,
             }
             continue
         mean = sum(vals) / n
         mean_net = (sum(net_vals) / len(net_vals)) if net_vals else (mean - cost)
         if n > 1:
-            var = sum((v - mean) ** 2 for v in vals) / (n - 1)
-            std = var ** 0.5
+            gross_var = sum((v - mean) ** 2 for v in vals) / (n - 1)
+            gross_std = gross_var ** 0.5
+            net_var = sum((v - mean_net) ** 2 for v in net_vals) / (n - 1)
+            net_std = net_var ** 0.5
         else:
-            std = None
-        tstat = (mean / (std / (n ** 0.5))) if (std and std > 0 and n > 1) else None
-        sharpe = (mean / std) if (std and std > 0) else None
-        n_windows, tstat_clustered = _clustered_t(picks)
-        ci_lo, ci_hi = _wilson_ci(wins, n)
+            gross_std = None
+            net_std = None
+        gross_tstat = (
+            mean / (gross_std / (n ** 0.5))
+            if (gross_std and gross_std > 0 and n > 1) else None
+        )
+        net_tstat = (
+            mean_net / (net_std / (n ** 0.5))
+            if (net_std and net_std > 0 and n > 1) else None
+        )
+        gross_sharpe = (mean / gross_std) if (gross_std and gross_std > 0) else None
+        net_sharpe = (mean_net / net_std) if (net_std and net_std > 0) else None
+        gross_n_windows, gross_tstat_clustered = _clustered_t(gross_picks)
+        n_windows, net_tstat_clustered = _clustered_t(net_picks)
+        gross_ci_lo, gross_ci_hi = _wilson_ci(gross_wins, n)
+        net_ci_lo, net_ci_hi = _wilson_ci(net_wins, n)
         out[f"d{d}"] = {
             "n": n,
             "n_windows": n_windows,
             "avg": round(mean, 4),
             "avg_net": round(mean_net, 4),
-            "win_pct": round(100 * wins / n, 1),
-            "win_ci_lo": round(100 * ci_lo, 1) if ci_lo is not None else None,
-            "win_ci_hi": round(100 * ci_hi, 1) if ci_hi is not None else None,
-            "std": round(std, 4) if std is not None else None,
-            "tstat": round(tstat, 3) if tstat is not None else None,
-            "tstat_clustered": round(tstat_clustered, 3) if tstat_clustered is not None else None,
-            "sharpe": round(sharpe, 3) if sharpe is not None else None,
+            # Primary inference/hit fields are net of configured costs. Gross
+            # counterparts stay explicit for backward-compatible analysis.
+            "win_pct": round(100 * net_wins / n, 1),
+            "gross_win_pct": round(100 * gross_wins / n, 1),
+            "net_win_pct": round(100 * net_wins / n, 1),
+            "win_ci_lo": round(100 * net_ci_lo, 1) if net_ci_lo is not None else None,
+            "win_ci_hi": round(100 * net_ci_hi, 1) if net_ci_hi is not None else None,
+            "gross_win_ci_lo": round(100 * gross_ci_lo, 1) if gross_ci_lo is not None else None,
+            "gross_win_ci_hi": round(100 * gross_ci_hi, 1) if gross_ci_hi is not None else None,
+            "net_win_ci_lo": round(100 * net_ci_lo, 1) if net_ci_lo is not None else None,
+            "net_win_ci_hi": round(100 * net_ci_hi, 1) if net_ci_hi is not None else None,
+            "std": round(net_std, 4) if net_std is not None else None,
+            "tstat": round(net_tstat, 3) if net_tstat is not None else None,
+            "tstat_clustered": round(net_tstat_clustered, 3) if net_tstat_clustered is not None else None,
+            "sharpe": round(net_sharpe, 3) if net_sharpe is not None else None,
+            "gross_n_windows": gross_n_windows,
+            "gross_std": round(gross_std, 4) if gross_std is not None else None,
+            "gross_tstat": round(gross_tstat, 3) if gross_tstat is not None else None,
+            "gross_tstat_clustered": round(gross_tstat_clustered, 3) if gross_tstat_clustered is not None else None,
+            "gross_sharpe": round(gross_sharpe, 3) if gross_sharpe is not None else None,
+            "metric_basis": "net_return",
             "cost_pct": cost,
         }
     return out
@@ -474,11 +511,86 @@ def _long_paper_observation_state() -> dict | None:
     return {
         "active": True,
         "telegram_silent": True,
-        "ledger_recording": True,  # WATCH_LONG already accumulates paper PnL
+        "ledger_recording": True,  # exact-entry long_shadow_ledger.csv
         "observation_start": start,
         "observation_days": days,
-        "decision_after": "1-2 weeks of clean ledger data",
-        "next_step": "Set LIVE_EXECUTION_MODE=balanced to wire LONG to live execution.",
+        "decision_after": "60 independent 12h shadow baskets and preregistered economic gates",
+        "next_step": "Evaluate README §14-ter; execution requires a separate reviewed code change.",
+    }
+
+
+def _long_policy_state(gates: dict | None = None) -> dict:
+    """Public-safe LONG execution/WATCH policy; never includes coin details."""
+    from config import config as _cfg
+
+    long_gate = (gates or {}).get("long") or {}
+    execution_max = int(getattr(_cfg.Portfolio, "LIVE_WATCH_LONG_N", 0))
+    model_max = int(getattr(_cfg.LongModel, "LONG_N", 5))
+    alert_max = min(
+        int(getattr(_cfg.Notification, "LONG_WATCH_ALERT_MAX_N", 1)),
+        model_max,
+    )
+    horizon_h = int(getattr(_cfg.LongModel, "PREDICT_HORIZON", 12))
+    anchor = int(getattr(_cfg.LongModel, "REBALANCE_ANCHOR_HOUR_UTC", 11))
+    anchor_hours = sorted({hour for hour in range(24) if (hour - anchor) % horizon_h == 0})
+    policy_reason = long_gate.get("policy_reason") or (
+        "WATCH_LONG KILL policy: LIVE_WATCH_LONG_N=0 (README §14-bis)"
+        if execution_max <= 0 else None
+    )
+    return {
+        "contract": "strong_shadow_watch_v1",
+        "status": "EXECUTION_BLOCKED_CONDITIONAL_WATCH" if execution_max <= 0 else "ACTIVE",
+        "reason": policy_reason,
+        "execution_max": execution_max,
+        "execution_actionable": False if execution_max <= 0 else None,
+        "conditional_watch_alert_max": alert_max if execution_max <= 0 else 0,
+        "watch_alert_gates": {
+            "anchor_hours_utc": anchor_hours,
+            "bitget_tradable_required": bool(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_REQUIRE_BITGET_TRADABLE", True)
+            ),
+            "preflight_clear_required": True,
+            "btc_7d_return_gt": float(getattr(_cfg.LongModel, "BTC_7D_RETURN_GATE", 0.0)),
+            "btc_30d_return_gt": float(
+                getattr(_cfg.LongModel, "BTC_30D_RETURN_FLOOR", -0.10)
+            ),
+            "ic_status_required": "OK",
+            "ic_min_reads": int(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_MIN_IC_READS", 3)
+            ),
+            "ic_each_gte": float(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_IC_FLOOR", 0.05)
+            ),
+            "latest_ic_gte": float(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_MIN_IC", 0.10)
+            ),
+            "sigma_gte": float(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_MIN_SIGMA", 2.0)
+            ),
+            "expected_pct_gte": float(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_MIN_EXPECTED_PCT", 0.20)
+            ),
+            "direction_probability_gte": float(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_MIN_DIRECTION_PROB", 0.65)
+            ),
+            "positive_direction_required": True,
+            "cross_horizon_consensus_required": bool(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_REQUIRE_CONSENSUS", True)
+            ),
+            "untrusted_hidden": bool(
+                getattr(_cfg.Notification, "LONG_WATCH_ALERT_HIDE_UNTRUSTED", True)
+            ),
+            "shadow_top_n": model_max,
+        },
+        "economic_reactivation": {
+            "automatic": False,
+            "requires_separate_code_change": True,
+            "min_independent_12h_baskets": 60,
+            "mean_net_gt": 0.0,
+            "block_bootstrap_95pct_lower_gt": 0.0,
+            "three_temporal_folds_net_gt": 0.0,
+            "all_allowed_regimes_net_gt": 0.0,
+        },
     }
 
 
@@ -538,6 +650,7 @@ def build_summary_payload() -> dict:
         "ops": _ops_from_health(health),
         "cost_assumptions": COST_PCT_BY_SIDE,
         "long_paper_observation": _long_paper_observation_state(),
+        "long_policy": _long_policy_state(gate.get("gates", {})),
     }
 
 
@@ -957,7 +1070,10 @@ def build_public_summary_payload() -> dict:
             return None
         return {
             "n": d30.get("n"),
-            "win_pct": d30.get("win_pct"),
+            "win_pct": d30.get("net_win_pct", d30.get("win_pct")),
+            "gross_win_pct": d30.get("gross_win_pct", d30.get("win_pct")),
+            "net_win_pct": d30.get("net_win_pct", d30.get("win_pct")),
+            "win_pct_basis": "net_return",
             "gross_pct": d30.get("avg"),
             "net_pct": d30.get("avg_net"),
             "cost_pct": d30.get("cost_pct"),
@@ -993,6 +1109,7 @@ def build_public_summary_payload() -> dict:
         },
         "model_age_days": summary.get("model_age_days") or {},
         "cost_assumptions": summary.get("cost_assumptions") or {},
+        "long_policy": summary.get("long_policy") or {},
         "_note": "public sibling of encrypted dashboard data. Aggregates only — no individual picks.",
     }
 

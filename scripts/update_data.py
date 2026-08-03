@@ -19,13 +19,21 @@ import argparse
 import time
 import sqlite3
 import requests
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from config import config
 from utils.logger import logger
-from utils.run_lock import run_lock
+from utils.run_lock import data_access_lock, run_lock
 from data.database import get_db_connection, init_db
 from data.collector import run_all as upbit_run_all, get_all_krw_markets
+
+
+# Leave enough room inside the installed xsec-alpha TimeoutStartSec=600 for
+# track_ic + fetch_and_rank after a peer updater finishes.
+_UPDATE_LOCK_WAIT_SEC = 480.0
+_PEER_MAX_DATA_AGE_HOURS = 6.0
+_PEER_MAX_SOURCE_LAG_HOURS = 2.0
+_PEER_MIN_BINANCE_FRESH_RATIO = 0.90
 
 
 # ── Binance helpers ──────────────────────────────────────────────────────────
@@ -199,6 +207,75 @@ def update_binance(days: int = 120):
         conn.close()
 
 
+def _parse_utc_timestamp(value) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _peer_update_is_complete() -> tuple[bool, str]:
+    """Validate a peer updater's DB before letting systemd continue.
+
+    The global timestamps catch a skipped Binance phase.  The per-market ratio
+    catches a peer that stopped after updating only the first few Binance
+    symbols, even though the table-wide MAX(timestamp) already looks fresh.
+    """
+    conn = get_db_connection()
+    try:
+        upbit_row = conn.execute("SELECT MAX(timestamp) FROM crypto_data").fetchone()
+        binance_row = conn.execute("SELECT MAX(timestamp) FROM binance_data").fetchone()
+        upbit_latest = _parse_utc_timestamp(upbit_row[0] if upbit_row else None)
+        binance_latest = _parse_utc_timestamp(binance_row[0] if binance_row else None)
+        if upbit_latest is None or binance_latest is None:
+            return False, "missing Upbit or Binance latest timestamp"
+
+        age_h = (datetime.now(timezone.utc) - upbit_latest).total_seconds() / 3600
+        source_lag_h = abs((upbit_latest - binance_latest).total_seconds()) / 3600
+        if age_h > _PEER_MAX_DATA_AGE_HOURS:
+            return False, f"Upbit data is stale ({age_h:.1f}h)"
+        if source_lag_h > _PEER_MAX_SOURCE_LAG_HOURS:
+            return False, f"Upbit/Binance latest timestamps differ by {source_lag_h:.1f}h"
+
+        known_row = conn.execute(
+            "SELECT COUNT(DISTINCT market) FROM binance_data"
+        ).fetchone()
+        known_markets = int(known_row[0] if known_row else 0)
+        fresh_row = conn.execute(
+            """
+            SELECT COUNT(*)
+            FROM (
+                SELECT market
+                FROM binance_data
+                GROUP BY market
+                HAVING julianday(MAX(timestamp)) >= julianday(?) - (? / 24.0)
+            )
+            """,
+            (upbit_latest.isoformat(timespec="seconds"), _PEER_MAX_SOURCE_LAG_HOURS),
+        ).fetchone()
+        fresh_markets = int(fresh_row[0] if fresh_row else 0)
+        fresh_ratio = fresh_markets / known_markets if known_markets else 0.0
+        if fresh_ratio < _PEER_MIN_BINANCE_FRESH_RATIO:
+            return False, (
+                f"only {fresh_markets}/{known_markets} Binance markets are fresh "
+                f"({fresh_ratio:.1%})"
+            )
+
+        return True, (
+            f"Upbit/Binance lag={source_lag_h:.1f}h, "
+            f"fresh Binance markets={fresh_markets}/{known_markets} ({fresh_ratio:.1%})"
+        )
+    except (sqlite3.Error, OSError) as exc:
+        return False, f"peer DB validation failed: {exc}"
+    finally:
+        conn.close()
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -211,20 +288,44 @@ def main():
     do_upbit = not args.binance_only
     do_binance = not args.upbit_only
 
-    with run_lock("update_data"):
-        init_db()
-        started = time.time()
+    # This command is used as systemd ExecStartPre for both alpha and retrain.
+    # Wait for a peer updater instead of letting the caller consume its partial
+    # market-by-market commits.  Once the peer releases the lock, validate its
+    # completed DB while holding the lock ourselves; skip a duplicate 5+ minute
+    # collection only when that validation passes.
+    with run_lock(
+        "update_data",
+        timeout_sec=_UPDATE_LOCK_WAIT_SEC,
+        exit_code=os.EX_TEMPFAIL,
+    ) as waited_for_peer:
+        if waited_for_peer:
+            ready, reason = _peer_update_is_complete()
+            if not ready:
+                logger.error(f"[Lock] Peer updater finished but DB is incomplete: {reason}")
+                raise SystemExit(os.EX_TEMPFAIL)
+            logger.info(f"[Lock] Peer updater completed; reusing fresh DB ({reason})")
+            return
 
-        if do_upbit:
-            logger.info("=== Upbit update ===")
-            upbit_run_all(days=args.days)
+        # Keep market-by-market commits away from multi-query IC readers.  This
+        # lock is intentionally distinct from update_data's peer-dedup lock: a
+        # reader must never be mistaken for an updater whose work can be reused.
+        with data_access_lock(timeout_sec=_UPDATE_LOCK_WAIT_SEC):
+            init_db()
+            started = time.time()
 
-        if do_binance:
-            logger.info("=== Binance update ===")
-            update_binance(days=args.days)
+            if do_binance:
+                logger.info("=== Binance update ===")
+                update_binance(days=args.days)
 
-        elapsed = time.time() - started
-        logger.info(f"Data update finished in {elapsed / 60:.1f} min")
+            # Keep the price source used for ranking as close as possible to
+            # the recommendation run. In a full update Binance is collected
+            # first and Upbit last; single-source modes retain their behavior.
+            if do_upbit:
+                logger.info("=== Upbit update ===")
+                upbit_run_all(days=args.days)
+
+            elapsed = time.time() - started
+            logger.info(f"Data update finished in {elapsed / 60:.1f} min")
 
 
 if __name__ == "__main__":

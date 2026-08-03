@@ -37,7 +37,11 @@ python scripts/health_snapshot.py
 ## 1. 뭘 만드는가
 
 200+ KRW 마켓을 읽되, **freshness filter 통과 후 최근 24h 거래대금 상위 100개**를 기본 활성 유니버스로 사용한다.
-연구는 이 활성 유니버스에서 랭킹을 계산하고, 현재 라이브 프로브는 **Upbit 신호 → Bitget tradable 필터 → SHORT 5 실행 + WATCH LONG 5 참고** 계약을 사용한다.
+연구는 이 활성 유니버스에서 랭킹을 계산한다. 현재 라이브 계약은
+**Upbit 신호 → Bitget tradable 필터 → 수동 판단용 SHORT actionable 신호 최대 5개**다.
+LONG은 실행·추천 원장 0건을 하드 고정하며, 11/23 UTC에 레짐·current-contract
+IC·2σ·OOS 방향확률·6h/12h 합의 게이트를 모두 통과한 경우에만
+`actionable=false` WATCH 알림을 최대 1개 보낸다. 이 저장소에는 주문 API가 없다.
 
 gan_t와 다른 세 가지:
 - 절대 수익률 예측 → **상대 랭킹** (베타 노이즈 상쇄됨)
@@ -67,9 +71,9 @@ gan_t와 다른 세 가지:
 - 피처: `reversal_1h/4h, volatility_inv_24h, order_flow_bear, range_contraction_12h, binance_lead_1h, kimchi_inv, kimchi_zscore_24h, dow_bull, hour_vol`
 - 단일 소스: `data.features.compute_unified_factors()` (`UNIFIED_CALENDAR_COLS = ['dow_bull','hour_vol']`)
 - 타겟: **absolute coin_return** (residual 아님)
-- Regime 필터: 없음 (전 regime 학습)
+- 학습 Regime 필터: 없음 (전 regime 학습). LONG 선택/WATCH 알림에는 strict BTC 7d/30d 실행 게이트 적용
 
-**성능 (holdout):**
+**성능 (2026-04 F1 선택 당시 historical snapshot, 현재 승격 근거로 재사용 금지):**
 - 6h 2σ+ 적중 64.6%, 기대 +1.29%
 - 12h 2σ+ 적중 70.6%, 기대 +1.85%
 - 방향 합의: 92%, rank correlation: 0.91
@@ -81,17 +85,20 @@ gan_t와 다른 세 가지:
 
 ---
 
-## 3. 즉시 확정된 설계 결정
+## 3. 초기 설계 결정 (historical)
+
+아래 표는 프로젝트 시작 시 결정 기록이다. 타겟·피처·LONG 레짐 계약은
+현행 §2-bis와 README §14-ter가 우선하며, 특히 production 타겟은 absolute return이다.
 
 | 항목 | 결정 | 이유 |
 |------|------|------|
-| 예측 타겟 | **residual return** (coin_return - beta × BTC_return) | 베타 오염 제거. 절대 수익률 예측 시 BTC 방향에 종속됨. |
+| 예측 타겟 | **residual return** (초기안; 현행은 absolute return) | 베타 오염 제거를 시도했으나 F1에서 계약 변경. |
 | 첫 모델 | **XGBoost** | feature importance로 팩터 기여 즉시 확인 가능. Ridge는 IC 확인 후 비교. |
 | 리밸런싱 | **12h마다** (예측 호라이즌과 동일) | 예측창과 실행창 일치. |
 | 활성 유니버스 | **freshness filter 후 최근 24h 거래대금 상위 100개** | 극저유동성 코인 환상을 줄이고 train/eval/live 계약을 일치시킴. |
 | 팩터 정규화 | **크로스섹션 z-score** per timestamp, `\|z\| > 3` 클리핑 | 코인별 절대값 차이 제거. rank → z-score 순서. |
 | 연구용 Long/Short | **각 20개 고정** | 기본 활성 유니버스 top 100 기준. |
-| 라이브 프로브 | **SHORT 5 실행 + WATCH LONG 5** | Bitget USDT perp tradable 코인만 알림/CSV에 남김. |
+| 라이브 프로브 | **SHORT actionable ≤5 + LONG 실행 0 / 조건부 WATCH ≤1** | SHORT는 수동 판단용. LONG WATCH는 비실행·비원장 알림이며 모든 엄격 게이트를 통과해야 함. |
 | 베타 계산 | **168h rolling** (gan_t와 동일) | 크립토 레짐 빠름. 30일 window는 stale. |
 
 ---
@@ -203,7 +210,7 @@ t_stat  = mean_ic / (ic_series.std() / sqrt(N_periods))
 **즉시 중단 조건:**
 - RSI=0, volatility=0 발견 시 → 데이터 파이프라인 버그. 배포 전 수정.
 - 예측 std < 0.0005 → 제로 신호. 원인 찾기. (랭킹 모델 정상 범위 0.001~0.01)
-- Long/Short 각 10개 미만 → watch-only 모드로 출력.
+- 라이브 SHORT 후보가 5개 미만이면 watch-only. LONG은 조건부 WATCH 계약의 어느 게이트라도 빠지면 0건.
 
 **일일 운영 확인:**
 - IC (rolling 7-day) 대시보드에서 확인

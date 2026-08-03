@@ -10,6 +10,10 @@ States (most → least severe):
   WARN       any recent IC<0.05      → proceed but surface it
   OK         last-3 all >= 0.05
 
+Raw IC status is never rewritten. A separately recorded execution policy may
+still set ``block=True`` (for example the preregistered WATCH_LONG KILL), so
+degradation stays visible while exposure remains zero.
+
 Conservative failure mode: missing history returns WARN, not OK.
 """
 from __future__ import annotations
@@ -42,7 +46,9 @@ class SideGate:
     last_ic: float | None
     ic_tail: list[float]
     watch_only: bool         # True → force side to watch-only
-    block: bool              # True → emit no picks at all
+    block: bool              # True → emit no picks at all (IC or policy)
+    policy_blocked: bool
+    policy_reason: str | None
 
     def as_dict(self) -> dict:
         d = asdict(self)
@@ -54,6 +60,19 @@ def _load_ics(path: Path) -> list[float]:
         return []
     try:
         data = json.loads(path.read_text())
+        latest_contract = next(
+            (
+                row.get("contract_version")
+                for row in reversed(data)
+                if row.get("contract_version")
+            ),
+            None,
+        )
+        if latest_contract:
+            data = [
+                row for row in data
+                if row.get("contract_version") == latest_contract
+            ]
         return [float(r["ic"]) for r in data if "ic" in r and r["ic"] is not None]
     except Exception:
         return []
@@ -80,10 +99,23 @@ def _decide(ics: list[float]) -> tuple[GateStatus, str]:
     return "OK", f"last-{len(last)} all >= {WARN_THRESHOLD}"
 
 
+def _policy_block_reason(side: str, watch_long_n: int | None = None) -> str | None:
+    """Return an execution-policy block without altering raw IC status."""
+    if side != "long":
+        return None
+    if watch_long_n is None:
+        from config import config
+        watch_long_n = int(getattr(config.Portfolio, "LIVE_WATCH_LONG_N", 0))
+    if watch_long_n <= 0:
+        return "WATCH_LONG KILL policy: LIVE_WATCH_LONG_N=0 (README §14-bis)"
+    return None
+
+
 def evaluate_side(side: str) -> SideGate:
     path = HISTORY_FILES[side]
     ics = _load_ics(path)
     status, reason = _decide(ics)
+    policy_reason = _policy_block_reason(side)
     return SideGate(
         side=side,
         status=status,
@@ -91,7 +123,9 @@ def evaluate_side(side: str) -> SideGate:
         last_ic=ics[-1] if ics else None,
         ic_tail=ics[-LOOKBACK:] if ics else [],
         watch_only=(status in ("FREEZE", "LIQUIDATE")),
-        block=(status == "LIQUIDATE"),
+        block=(status == "LIQUIDATE" or policy_reason is not None),
+        policy_blocked=(policy_reason is not None),
+        policy_reason=policy_reason,
     )
 
 
@@ -118,7 +152,8 @@ def render(gates: dict[str, SideGate]) -> str:
         if g.block: flags.append("BLOCK")
         if g.watch_only and not g.block: flags.append("WATCH")
         flag_str = f" [{' '.join(flags)}]" if flags else ""
-        lines.append(f"  {side:6s} {g.status:9s}{flag_str}  tail=[{tail}]  {g.reason}")
+        policy = f"; policy={g.policy_reason}" if g.policy_reason else ""
+        lines.append(f"  {side:6s} {g.status:9s}{flag_str}  tail=[{tail}]  {g.reason}{policy}")
     return "\n".join(lines)
 
 

@@ -222,8 +222,8 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
     might be tradable shows up, with quality tier + trust tag attached:
 
       - SHORT rows (actionable): the 5 picks fetch_and_rank emits as exec
-      - LONG  rows (watch-only): top WATCH_LONG candidates by σ (since the
-        user trades these manually too, they need to see them)
+      - LONG rows: either normal LONG recommendations or the separately gated
+        strong-shadow WATCH alert. WATCH rows are explicitly non-actionable.
       - Each row carries σ, expected%, trust_tag, entry_price, and a tier
         icon (🔥 ≥2σ, ✅ ≥1.5σ, ▫ weaker). Untrusted (⚠) signals are kept
         but visibly tagged so the user can skip them.
@@ -366,7 +366,13 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
 
     if not long_df.empty:
         horizon = int(long_df["horizon_h"].iloc[0]) if "horizon_h" in long_df.columns else 12
-        lines.append(f"🟢 <b>LONG</b> <code>{horizon}h</code>{_summary_chip(long_df)}")
+        long_is_watch = bool(
+            long_df["side"].astype(str).str.upper().eq("WATCH_LONG").any()
+        )
+        long_title = "LONG WATCH" if long_is_watch else "LONG"
+        lines.append(f"🟢 <b>{long_title}</b> <code>{horizon}h</code>{_summary_chip(long_df)}")
+        if long_is_watch:
+            lines.append("<code>관찰전용 · actionable=false · 자동실행 아님</code>")
         for _, row in long_df.iterrows():
             lines.append(_row(row, "LONG"))
         lines.append("")

@@ -254,8 +254,50 @@ def test_dashboard_public_summary_has_aggregates():
     assert pub.get("ic") and pub.get("realized_30d"), "public summary missing core aggregates"
     for side in ("SHORT", "WATCH_LONG"):
         side_data = (pub["realized_30d"] or {}).get(side) or {}
-        for k in ("n", "gross_pct", "net_pct", "cost_pct", "win_pct"):
+        for k in (
+            "n", "gross_pct", "net_pct", "cost_pct",
+            "gross_win_pct", "net_win_pct", "win_pct_basis",
+        ):
             assert k in side_data, f"public.realized_30d.{side} missing {k}"
+        assert side_data["win_pct_basis"] == "net_return"
+
+    policy = pub.get("long_policy") or {}
+    assert policy.get("status") == "EXECUTION_BLOCKED_CONDITIONAL_WATCH"
+    assert policy.get("execution_max") == 0
+    assert policy.get("conditional_watch_alert_max") == 1
+    gates = policy.get("watch_alert_gates") or {}
+    assert gates.get("anchor_hours_utc") == [11, 23]
+    assert gates.get("ic_min_reads") == 3
+    assert gates.get("latest_ic_gte") == 0.10
+    assert gates.get("sigma_gte") == 2.0
+    assert gates.get("direction_probability_gte") == 0.65
+    assert gates.get("cross_horizon_consensus_required") is True
+    assert policy["economic_reactivation"]["automatic"] is False
+
+
+def test_dashboard_realized_stats_separates_gross_and_net_hit_rates():
+    from utils.dashboard_export import _realized_stats
+
+    history = [
+        {
+            "entry_time": pd.Timestamp.now(tz="UTC").isoformat(),
+            "side": "WATCH_LONG",
+            "realized_pct": 0.10,
+            "net_pct": -0.10,
+        },
+        {
+            "entry_time": (pd.Timestamp.now(tz="UTC") - pd.Timedelta(hours=12)).isoformat(),
+            "side": "WATCH_LONG",
+            "realized_pct": 0.20,
+            "net_pct": -0.05,
+        },
+    ]
+    stats = _realized_stats(history, "WATCH_LONG", [30])["d30"]
+    assert stats["win_pct"] == 0.0
+    assert stats["gross_win_pct"] == 100.0
+    assert stats["net_win_pct"] == 0.0
+    assert stats["metric_basis"] == "net_return"
+    assert stats["tstat"] < 0 < stats["gross_tstat"]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -282,3 +324,15 @@ def test_telegram_format_actionable_branches():
     msg_b = format_actionable_signals(df_no, latest_ts=pd.Timestamp("2026-01-01T00:00:00Z"))
     assert msg_b and ("강한 신호 없음" in msg_b or "⏸" in msg_b), \
         "branch B (heartbeat) missing pause/no-signal marker"
+
+    # Branch C: a strong LONG shadow alert is unmistakably watch-only.
+    df_watch = pd.DataFrame([
+        {"market": "KRW-Z", "side": "WATCH_LONG", "direction": 1, "sigma": 2.2,
+         "expected_pct": 1.9, "p_correct": 0.66, "trust_tag": "", "actionable": False,
+         "tag": "🔥", "label": "강한 신호", "consensus": True, "horizon_h": 12}
+    ]).set_index("market", drop=False)
+    msg_c = format_actionable_signals(
+        df_watch, latest_ts=pd.Timestamp("2026-01-01T11:00:00Z")
+    )
+    assert "LONG WATCH" in msg_c
+    assert "관찰전용" in msg_c and "자동실행 아님" in msg_c

@@ -18,6 +18,7 @@ import pandas as pd
 
 from config import config
 from utils.logger import logger
+from utils.run_lock import stable_data_read_lock
 from data.features import (
     load_and_pivot,
     load_binance_pivot,
@@ -36,7 +37,15 @@ from data.features import (
 )
 
 
+_DATA_ACCESS_LOCK_WAIT_SEC = 480.0
+
+
 def main():
+    with stable_data_read_lock(timeout_sec=_DATA_ACCESS_LOCK_WAIT_SEC):
+        _main_locked()
+
+
+def _main_locked():
     parser = argparse.ArgumentParser()
     parser.add_argument("--days",     type=int, default=120, help="Days of history to load")
     parser.add_argument("--no-zscore", action="store_true", help="Skip cross-sectional z-score normalization")

@@ -23,6 +23,7 @@ from utils.dashboard_export import (  # noqa: E402
     PIN_DEFAULT,
     build_accuracy_payload,
     build_history_payload,
+    build_public_summary_payload,
     build_summary_payload,
     encrypt_payload,
 )
@@ -30,6 +31,7 @@ from utils.dashboard_export import (  # noqa: E402
 DEFAULT_TARGET = Path(
     "/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data"
 )
+DEFAULT_PUBLIC_TARGET = DEFAULT_TARGET.parent.parent / "public_summary.json"
 
 
 def main() -> int:
@@ -41,6 +43,14 @@ def main() -> int:
     ap.add_argument("--ic-days", type=int, default=60)
     ap.add_argument("--plain", action="store_true",
                     help="write plaintext (skip encryption) — debug only")
+    ap.add_argument(
+        "--public-target",
+        default=None,
+        help=(
+            "optional plaintext aggregate summary path; the production target "
+            "writes projects/xsec-alpha/public_summary.json automatically"
+        ),
+    )
     args = ap.parse_args()
 
     target = Path(args.target)
@@ -61,6 +71,16 @@ def main() -> int:
             env = encrypt_payload(body, args.pin)
             (target / name).write_text(json.dumps(env, ensure_ascii=False, indent=2))
         print(f"wrote {target/name}  ({len(body):,} bytes plaintext)")
+
+    public_target = Path(args.public_target) if args.public_target else None
+    if public_target is None and target.resolve() == DEFAULT_TARGET.resolve():
+        public_target = DEFAULT_PUBLIC_TARGET
+    if public_target is not None:
+        public_target.parent.mkdir(parents=True, exist_ok=True)
+        public_target.write_text(
+            json.dumps(build_public_summary_payload(), ensure_ascii=False, indent=2)
+        )
+        print(f"wrote {public_target}  (public aggregates only)")
 
     return 0
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=xsec_alpha daily holdout IC measurement (F1)
-After=network.target
+After=network.target xsec-alpha.service xsec-retrain.service
 
 [Service]
 Type=oneshot

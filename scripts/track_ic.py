@@ -4,7 +4,10 @@ Live IC tracker — appends per-period Spearman IC to output/ic_history*.json.
 
 Called before each fetch_and_rank run. Default mode tracks both:
   - short: 6h horizon
-  - long: 12h horizon, bull-regime only
+  - long: 12h horizon
+
+Both sides use the production absolute-return contract: exact live anchors,
+next-bar-open execution, and the same neutral feature imputation as inference.
 
 Usage:
     cd /mnt/20t/main/gan_t/xsec_alpha
@@ -28,23 +31,58 @@ from utils.logger import logger
 from data.features import (
     load_and_pivot,
     load_binance_pivot,
-    compute_factors,
-    compute_long_factors,
     compute_unified_factors,
     UNIFIED_CALENDAR_COLS,
     crosssection_zscore,
     compute_btc_regime,
-    compute_residual_returns,
-    CALENDAR_COLS,
-    LONG_CALENDAR_COLS,
+    compute_forward_returns,
     build_top_liquidity_universe_index,
     filter_long_frame_by_universe,
 )
 from models.xgb_ranker import XSecRanker
+from utils.run_lock import stable_data_read_lock
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
 SHORT_IC_HISTORY_PATH = os.path.join(OUTPUT_DIR, "ic_history.json")
 LONG_IC_HISTORY_PATH = os.path.join(OUTPUT_DIR, "ic_history_long.json")
+IC_CONTRACT_VERSION = "absolute_open_lag1_anchors_v1"
+_DATA_ACCESS_LOCK_WAIT_SEC = 480.0
+
+
+def _anchor_hours_for_side(side: str) -> tuple[int, ...]:
+    return (11, 23) if side == "long" else (5, 11, 17, 23)
+
+
+def _latest_complete_anchor(
+    returns: pd.DataFrame,
+    side: str,
+    min_coins: int = 5,
+) -> pd.Timestamp | None:
+    """Return the latest exact live anchor with a fully observable return."""
+    valid_counts = returns.notna().sum(axis=1)
+    anchors = set(_anchor_hours_for_side(side))
+    candidates = [
+        ts
+        for ts, count in valid_counts.items()
+        if int(count) >= int(min_coins) and pd.Timestamp(ts).hour in anchors
+    ]
+    return pd.Timestamp(candidates[-1]) if candidates else None
+
+
+def _long_regime_eligible(regime_row) -> bool:
+    if regime_row is None:
+        return False
+    try:
+        btc_7d = float(regime_row.get("btc_ret_7d"))
+        btc_30d = float(regime_row.get("btc_ret_30d"))
+    except (AttributeError, TypeError, ValueError):
+        return False
+    return bool(
+        np.isfinite(btc_7d)
+        and np.isfinite(btc_30d)
+        and btc_7d > float(getattr(config.LongModel, "BTC_7D_RETURN_GATE", 0.0))
+        and btc_30d > float(getattr(config.LongModel, "BTC_30D_RETURN_FLOOR", -0.10))
+    )
 
 
 def _history_path_for_side(side: str) -> str:
@@ -66,6 +104,12 @@ def _save_history(path: str, history: list) -> None:
 
 def _check_alerts(history: list, side: str) -> None:
     """Check consecutive low-IC readings and print warnings/alerts."""
+    aligned = [
+        row for row in history
+        if row.get("contract_version") == IC_CONTRACT_VERSION
+    ]
+    if aligned:
+        history = aligned
     if len(history) < 2:
         return
 
@@ -98,6 +142,7 @@ def _track_side(side: str, days: int) -> None:
 
     logger.info("[%s] Loading %s days of data...", side, days)
     closes, opens, highs, lows, volumes = load_and_pivot(days=days)
+    regime_closes = closes
 
     warmup = config.Data.MIN_ROWS_PER_COIN
     closes = closes.iloc[warmup:]
@@ -137,21 +182,16 @@ def _track_side(side: str, days: int) -> None:
         if side == "long"
         else config.Data.PREDICT_HORIZON
     )
-    residuals_wide = compute_residual_returns(closes, horizon=horizon, beta_window=config.Data.BETA_ROLLING_WINDOW)
-
-    valid_mask = residuals_wide.notna().any(axis=1)
-    if side == "long":
-        btc_regime = compute_btc_regime(closes)
-        bull_ts = btc_regime.index[btc_regime["regime_bull"] == 1.0]
-        factor_df = factor_df[factor_df.index.get_level_values("timestamp").isin(bull_ts)]
-        valid_mask = valid_mask & residuals_wide.index.isin(bull_ts)
-        logger.info("[%s] Regime filter: %s bull timestamps", side, int(valid_mask.sum()))
-
-    if not valid_mask.any():
-        logger.error("[%s] No valid residual return data — cannot compute IC", side)
+    execution_lag_bars = 1
+    absolute_returns = compute_forward_returns(
+        opens,
+        horizon=horizon,
+        execution_lag=execution_lag_bars,
+    )
+    last_valid_ts = _latest_complete_anchor(absolute_returns, side=side)
+    if last_valid_ts is None:
+        logger.error("[%s] No complete production-anchor return data — cannot compute IC", side)
         return
-
-    last_valid_ts = residuals_wide.index[valid_mask][-1]
     logger.info("[%s] Most recent complete period: %s", side, last_valid_ts)
 
     try:
@@ -159,15 +199,17 @@ def _track_side(side: str, days: int) -> None:
     except KeyError:
         logger.error("[%s] No factor snapshot at %s", side, last_valid_ts)
         return
-    ts_residuals = residuals_wide.loc[last_valid_ts]
+    ts_actual = absolute_returns.loc[last_valid_ts]
 
-    valid_coins = ts_factors.dropna().index.intersection(ts_residuals.dropna().index)
+    ts_factors = ts_factors.fillna(0.0)
+    ts_factors = ts_factors[ts_factors.any(axis=1)]
+    valid_coins = ts_factors.index.intersection(ts_actual.dropna().index)
     if len(valid_coins) < 5:
         logger.error("[%s] Only %s valid coins at %s — need at least 5", side, len(valid_coins), last_valid_ts)
         return
 
     X = ts_factors.loc[valid_coins]
-    actual = ts_residuals.loc[valid_coins]
+    actual = ts_actual.loc[valid_coins]
     predicted = model.predict(X)
     ic, pvalue = spearmanr(predicted, actual.values)
     if np.isnan(ic):
@@ -177,6 +219,19 @@ def _track_side(side: str, days: int) -> None:
     n_coins = len(valid_coins)
     ts_str = last_valid_ts.isoformat() if hasattr(last_valid_ts, "isoformat") else str(last_valid_ts)
     logger.info("[%s] IC = %.4f | n_coins = %s | timestamp = %s | p = %.4f", side, ic, n_coins, ts_str, pvalue)
+
+    regime_eligible = None
+    btc_ret_7d = None
+    btc_ret_30d = None
+    if side == "long":
+        btc_regime = compute_btc_regime(regime_closes)
+        regime_row = btc_regime.loc[last_valid_ts] if last_valid_ts in btc_regime.index else None
+        regime_eligible = _long_regime_eligible(regime_row)
+        if regime_row is not None:
+            raw_7d = pd.to_numeric(regime_row.get("btc_ret_7d"), errors="coerce")
+            raw_30d = pd.to_numeric(regime_row.get("btc_ret_30d"), errors="coerce")
+            btc_ret_7d = float(raw_7d) if pd.notna(raw_7d) else None
+            btc_ret_30d = float(raw_30d) if pd.notna(raw_30d) else None
 
     history_path = _history_path_for_side(side)
     history = _load_history(history_path)
@@ -190,6 +245,14 @@ def _track_side(side: str, days: int) -> None:
             "n_coins": int(n_coins),
             "side": side,
             "horizon_h": int(horizon),
+            "target": "absolute",
+            "price_source": "open",
+            "execution_lag_bars": execution_lag_bars,
+            "anchor_hours_utc": list(_anchor_hours_for_side(side)),
+            "regime_eligible": regime_eligible,
+            "btc_ret_7d": btc_ret_7d,
+            "btc_ret_30d": btc_ret_30d,
+            "contract_version": IC_CONTRACT_VERSION,
         })
         _save_history(history_path, history)
         logger.info("[%s] Appended to %s (total %s entries)", side, history_path, len(history))
@@ -199,8 +262,13 @@ def _track_side(side: str, days: int) -> None:
 
 
 def main():
+    with stable_data_read_lock(timeout_sec=_DATA_ACCESS_LOCK_WAIT_SEC):
+        _main_locked()
+
+
+def _main_locked():
     parser = argparse.ArgumentParser(description="Track live IC over time")
-    parser.add_argument("--days", type=int, default=30, help="Days of history to load (default 30)")
+    parser.add_argument("--days", type=int, default=45, help="Days of history to load (default 45; preserves 30d regime context after warmup)")
     parser.add_argument("--side", type=str, default="both", choices=["short", "long", "both"], help="Track short, long, or both (default)")
     args = parser.parse_args()
     sides = ["short", "long"] if args.side == "both" else [args.side]

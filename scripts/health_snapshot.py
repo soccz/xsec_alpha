@@ -46,6 +46,7 @@ def _status_tag(status: str) -> str:
         "FAIL":  "\033[31mFAIL\033[0m",
         "FREEZE": "\033[31mFRZ \033[0m",
         "LIQ":   "\033[31mLIQ \033[0m",
+        "BLOCKED": "\033[36mBLK \033[0m",
     }
     return colors.get(status, f"{status:>4s}")
 
@@ -114,17 +115,33 @@ def _ic_gate_status(values: list[float]) -> tuple[str, str]:
 def section_ic():
     short = _load_json_records(OUTPUT_DIR / "ic_history.json")
     long_ = _load_json_records(OUTPUT_DIR / "ic_history_long.json")
+    from utils.ic_gate import _policy_block_reason
 
-    def summarise(records):
+    def summarise(records, side):
         if not records:
             return {"n": 0}
+        latest_contract = next(
+            (
+                row.get("contract_version")
+                for row in reversed(records)
+                if row.get("contract_version")
+            ),
+            None,
+        )
+        if latest_contract:
+            records = [
+                row for row in records
+                if row.get("contract_version") == latest_contract
+            ]
         ics = [float(r["ic"]) for r in records if "ic" in r and r["ic"] is not None]
         if not ics:
             return {"n": 0}
         last1 = ics[-1]
         last7 = ics[-7:]
         last30 = ics[-30:]
-        status, note = _ic_gate_status(ics)
+        raw_status, note = _ic_gate_status(ics)
+        policy_reason = _policy_block_reason(side)
+        status = "BLOCKED" if policy_reason and raw_status in ("OK", "WARN") else raw_status
         return {
             "n":       len(ics),
             "last1":   last1,
@@ -132,13 +149,17 @@ def section_ic():
             "last30":  {"mean": sum(last30)/len(last30), "min": min(last30), "n": len(last30),
                         "neg_frac": sum(1 for v in last30 if v < 0) / len(last30)},
             "status":  status,
+            "raw_status": raw_status,
             "note":    note,
+            "execution_blocked": policy_reason is not None,
+            "policy_reason": policy_reason,
             "latest_ts": records[-1].get("timestamp"),
             "horizon_h": records[-1].get("horizon_h"),
+            "contract_version": latest_contract,
         }
 
-    short_summary = summarise(short)
-    long_summary  = summarise(long_)
+    short_summary = summarise(short, "short")
+    long_summary  = summarise(long_, "long")
     worst = "OK"
     for s in (short_summary.get("status"), long_summary.get("status")):
         if s in ("LIQ",):
@@ -165,27 +186,46 @@ def section_realized():
     cutoff = datetime.now(timezone.utc) - timedelta(days=30)
     recent = df[df["entry_time"] >= cutoff].copy()
     recent["realized_return"] = pd.to_numeric(recent["realized_return"], errors="coerce")
-    recent = recent.dropna(subset=["realized_return"])
+    if "net_return" in recent.columns:
+        recent["net_return"] = pd.to_numeric(recent["net_return"], errors="coerce")
+        recent["performance_return"] = recent["net_return"].fillna(recent["realized_return"])
+        return_metric = "net_return (legacy rows fall back to gross)"
+    else:
+        recent["performance_return"] = recent["realized_return"]
+        return_metric = "gross realized_return (legacy ledger)"
+    recent = recent.dropna(subset=["performance_return"])
+
+    from utils.ic_gate import _policy_block_reason
 
     by_side = {}
     worst = "OK"
     for side, grp in recent.groupby("side"):
         n = len(grp)
-        avg = float(grp["realized_return"].mean())
-        std = float(grp["realized_return"].std()) if n > 1 else 0.0
-        win_rate = float((grp["realized_return"] > 0).mean())
-        status = "OK"
+        avg = float(grp["performance_return"].mean())
+        std = float(grp["performance_return"].std()) if n > 1 else 0.0
+        win_rate = float((grp["performance_return"] > 0).mean())
+        raw_status = "OK"
         # 30d avg < 0 with at least 20 observations is concerning
         if n >= 20 and avg < 0:
-            status = "WARN"
-            worst = worst if worst in ("FAIL",) else "WARN"
+            raw_status = "WARN"
         if n >= 20 and win_rate < 0.45:
-            status = "WARN"
+            raw_status = "WARN"
+        policy_reason = _policy_block_reason("long") if "LONG" in str(side).upper() else None
+        status = "BLOCKED" if policy_reason else raw_status
+        if raw_status == "WARN" and not policy_reason:
             worst = worst if worst in ("FAIL",) else "WARN"
         by_side[side] = {
-            "n": n, "avg_return": avg, "std": std, "win_rate": win_rate, "status": status,
+            "n": n, "avg_return": avg, "std": std, "win_rate": win_rate,
+            "status": status, "raw_status": raw_status,
+            "execution_blocked": policy_reason is not None,
+            "policy_reason": policy_reason,
         }
-    return worst, {"window": "30d", "by_side": by_side, "total": len(recent)}
+    return worst, {
+        "window": "30d",
+        "return_metric": return_metric,
+        "by_side": by_side,
+        "total": len(recent),
+    }
 
 
 # ------------------ D. current picks ------------------ #
@@ -216,6 +256,16 @@ def section_current_picks():
             "score_abs_max": float(scores.abs().max()) if len(scores) else None,
             "actionable_n": int(grp.get("actionable", False).sum()) if "actionable" in grp.columns else None,
         }
+    from utils.ic_gate import _policy_block_reason
+    long_policy_reason = _policy_block_reason("long")
+    if long_policy_reason:
+        long_rows = int(df["side"].astype(str).str.contains("LONG", case=False, na=False).sum())
+        summary["blocked_sides"] = {"LONG": long_policy_reason}
+        if long_rows:
+            summary["policy_violation"] = (
+                f"LONG execution is blocked but latest.csv still contains {long_rows} LONG/WATCH_LONG row(s)"
+            )
+            return "FAIL", summary
     # timestamp drift: entry_time vs now
     if "entry_time" in df.columns:
         entry_ts = pd.to_datetime(df["entry_time"], utc=True, errors="coerce").max()
@@ -278,6 +328,11 @@ def section_warnings(operational_rows, ic_info, realized_info, feature_health=No
     for side, s in ic_info.items():
         if s.get("status") in ("FREEZE", "LIQ"):
             warns.append(f"§7 gate: {side.upper()} IC = {s.get('status')} ({s.get('note')})")
+        elif s.get("status") == "BLOCKED" and s.get("raw_status") == "WARN":
+            warns.append(
+                f"Contained: {side.upper()} raw IC=WARN ({s.get('note')}); "
+                f"execution blocked by {s.get('policy_reason')}"
+            )
 
     # Realized perf warning
     for side, r in realized_info.get("by_side", {}).items():
@@ -285,6 +340,11 @@ def section_warnings(operational_rows, ic_info, realized_info, feature_health=No
             warns.append(
                 f"Realized perf: {side} 30d avg={r['avg_return']*100:+.2f}%, "
                 f"win_rate={r['win_rate']*100:.0f}% over n={r['n']}"
+            )
+        elif r.get("status") == "BLOCKED" and r.get("raw_status") == "WARN":
+            warns.append(
+                f"Contained: {side} realized 30d avg={r['avg_return']*100:+.2f}%, "
+                f"win_rate={r['win_rate']*100:.0f}% over n={r['n']}; execution blocked"
             )
     return warns
 
@@ -324,16 +384,25 @@ def render_text(snap):
             f"neg30={s['last30']['neg_frac']*100:.0f}%"
         )
         lines.append(f"            {s['note']}  ({s['n']} reads, latest {s['latest_ts']})")
+        if s.get("execution_blocked"):
+            lines.append(
+                f"            raw={s.get('raw_status')} | execution BLOCKED: {s.get('policy_reason')}"
+            )
 
     # C
     lines.append("")
-    lines.append("C. REALIZED PERFORMANCE (last 30d, from ledger)")
+    metric = snap["realized"].get("return_metric", "realized_return")
+    lines.append(f"C. REALIZED PERFORMANCE (last 30d, {metric})")
     for side, r in snap["realized"].get("by_side", {}).items():
         lines.append(
             f"   [{_status_tag(r['status'])}] {side:11s} n={r['n']:3d}  "
             f"avg={r['avg_return']*100:+.2f}%  win={r['win_rate']*100:.0f}%  "
             f"σ={r['std']*100:.2f}%"
         )
+        if r.get("execution_blocked"):
+            lines.append(
+                f"               raw={r.get('raw_status')} | execution BLOCKED: {r.get('policy_reason')}"
+            )
     if not snap["realized"].get("by_side"):
         lines.append("   (no matured positions in last 30d)")
 
@@ -353,6 +422,10 @@ def render_text(snap):
                 f"score∈[{_fmt_pct(info['score_min'])}, {_fmt_pct(info['score_max'])}]"
                 f"{extra}"
             )
+        for side, reason in cur.get("blocked_sides", {}).items():
+            lines.append(f"   {side:11s} execution BLOCKED: {reason}")
+        if cur.get("policy_violation"):
+            lines.append(f"   [{_status_tag('FAIL')}] {cur['policy_violation']}")
 
     # F (feature health)
     fh = snap.get("feature_health") or {}
@@ -405,13 +478,22 @@ def render_markdown(snap):
             f"({s['n']} reads)"
         )
         lines.append(f"  - {s['note']}")
+        if s.get("execution_blocked"):
+            lines.append(
+                f"  - raw=`{s.get('raw_status')}`; execution `BLOCKED`: {s.get('policy_reason')}"
+            )
 
-    lines += ["", "## C. Realized performance (30d)", ""]
+    metric = snap["realized"].get("return_metric", "realized_return")
+    lines += ["", f"## C. Realized performance (30d, {metric})", ""]
     for side, r in snap["realized"].get("by_side", {}).items():
         lines.append(
             f"- **{side}** `{r['status']}` — n={r['n']}, "
             f"avg={r['avg_return']*100:+.2f}%, win={r['win_rate']*100:.0f}%"
         )
+        if r.get("execution_blocked"):
+            lines.append(
+                f"  - raw=`{r.get('raw_status')}`; execution `BLOCKED`: {r.get('policy_reason')}"
+            )
 
     lines += ["", "## D. Current picks", ""]
     cur = snap["current_picks"]
@@ -423,6 +505,10 @@ def render_markdown(snap):
                 f"- **{side}**: n={info['n']}, "
                 f"score∈[{_fmt_pct(info['score_min'])}, {_fmt_pct(info['score_max'])}]"
             )
+        for side, reason in cur.get("blocked_sides", {}).items():
+            lines.append(f"- **{side}** execution `BLOCKED`: {reason}")
+        if cur.get("policy_violation"):
+            lines.append(f"- **FAIL**: {cur['policy_violation']}")
 
     fh = snap.get("feature_health") or {}
     if fh.get("available"):

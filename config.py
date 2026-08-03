@@ -22,15 +22,20 @@ class Config:
         COLLECTOR_REQUEST_MAX_RETRIES = 3
         COLLECTOR_REQUEST_BACKOFF_SEC = 1.0
         COLLECTOR_PAGE_SLEEP_SEC = 0.5
+        # Upbit candle endpoint limit is 10 req/s. 0.15s caps sequential
+        # per-market collection at ~6.7 req/s before request latency.
+        COLLECTOR_MARKET_SLEEP_SEC = 0.15
 
     class Portfolio:
         LONG_N = 20    # top 10% of ~200 coins
         SHORT_N = 20   # bottom 10%
         LIVE_EXECUTION_MODE = os.getenv("XSEC_LIVE_EXECUTION_MODE", "short_only")
         # 2026-07-11 WATCH_LONG KILL (README §14-bis 사전등록 재계약): 30d 실현 net −0.22%/trade,
-        # 승률 45.3%로 §14 승격 전제와 모순 → N=0 (픽 생성·ledger·텔레그램 모두 중지).
-        # 부활은 새 사전등록으로만. env 오버라이드는 그 사전등록 통과 후에만 사용할 것.
-        LIVE_WATCH_LONG_N = int(os.getenv("XSEC_LIVE_WATCH_LONG_N", "0"))
+        # 승률 45.3%로 §14 승격 전제와 모순 → N=0 (실행 픽·recommendation ledger 중지).
+        # 단, Notification의 고정 강신호 게이트를 통과한 shadow 후보는 최대 1개까지
+        # WATCH 알림으로만 보낼 수 있다. 이 경로는 actionable=False이며 실행과 분리된다.
+        # 부활은 새 사전등록 + 코드 변경으로만 가능하다. 환경변수 우회 불가.
+        LIVE_WATCH_LONG_N = 0
         LIVE_EXEC_SHORT_N = int(os.getenv("XSEC_LIVE_EXEC_SHORT_N", "5"))
         LIVE_REQUIRE_BITGET_TRADABLE = os.getenv("XSEC_LIVE_REQUIRE_BITGET_TRADABLE", "1") != "0"
         # Paper-observation mode for the LONG side. When True:
@@ -59,6 +64,20 @@ class Config:
         TELEGRAM_MIN_SIGMA = float(os.getenv("XSEC_TELEGRAM_MIN_SIGMA", "1.5"))
         TELEGRAM_MIN_EXPECTED_ABS_PCT = float(os.getenv("XSEC_TELEGRAM_MIN_EXPECTED_ABS_PCT", "0.20"))
         TELEGRAM_HIDE_UNTRUSTED = os.getenv("XSEC_TELEGRAM_HIDE_UNTRUSTED", "1") != "0"
+
+        # WATCH_LONG KILL을 우회하지 않는 관찰전용 강신호 알림 계약.
+        # 안전 임계치는 환경변수로 낮출 수 없다. OOS calibration의 2σ+ LONG
+        # bucket(n=59, hit=66.1%, mean=+1.97%)과 §5의 실용 IC 기준을 사용한다.
+        LONG_WATCH_ALERT_MAX_N = 1
+        LONG_WATCH_ALERT_REQUIRE_BITGET_TRADABLE = True
+        LONG_WATCH_ALERT_MIN_SIGMA = 2.0
+        LONG_WATCH_ALERT_MIN_EXPECTED_PCT = 0.20
+        LONG_WATCH_ALERT_MIN_DIRECTION_PROB = 0.65
+        LONG_WATCH_ALERT_MIN_IC = 0.10
+        LONG_WATCH_ALERT_MIN_IC_READS = 3
+        LONG_WATCH_ALERT_IC_FLOOR = 0.05
+        LONG_WATCH_ALERT_REQUIRE_CONSENSUS = True
+        LONG_WATCH_ALERT_HIDE_UNTRUSTED = True
 
     class Model:
         # F1 unified (2026-04-25): 10-feature unified factor library, all-regime,
@@ -90,7 +109,10 @@ class Config:
         # Long-specific portfolio
         LONG_N = 5                      # top 5 for execution
         # "long_only" = actionable LONG, "watch" = score but WATCH only, "disabled" = skip entirely
-        # Production approval requires: holdout >= 60 timestamps, pred_std >= 0.01, long-only IC > 0
+        # Weekly model promotion is only a shadow-model refresh: exact-anchor
+        # OOS IC plus >=10 regime-active periods and mean LONG net > 0.
+        # It never lifts Portfolio.LIVE_WATCH_LONG_N=0; execution reactivation
+        # still requires the prospective preregistration in README §14-bis.
         EXECUTION_MODE = "watch"
 
 

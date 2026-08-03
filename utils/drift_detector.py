@@ -18,9 +18,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
+from utils.run_lock import stable_data_read_lock
 
 ROOT = Path(__file__).resolve().parent.parent
 STATE_FILE = ROOT / "output" / "drift_state.json"
+_DATA_ACCESS_LOCK_WAIT_SEC = 480.0
 
 DROP_THRESHOLD = 0.5   # IC drop > 50% vs 7d MA → flag
 SIGN_FLIP = True        # any sign flip vs 7d MA → flag
@@ -147,6 +149,11 @@ def render(result: dict) -> str:
 
 
 def main():
+    with stable_data_read_lock(timeout_sec=_DATA_ACCESS_LOCK_WAIT_SEC):
+        _main_locked()
+
+
+def _main_locked():
     """CLI entrypoint: compute drift on current short factors, print + persist."""
     import sys
     sys.path.insert(0, str(ROOT))

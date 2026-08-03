@@ -1,6 +1,7 @@
 [Unit]
 Description=xsec_alpha weekly model retrain (F1 pipeline: unified features, absolute target, promotion gate)
-After=network.target
+After=network.target xsec-alpha.service
+Before=xsec-measure.service
 
 [Service]
 Type=oneshot
@@ -16,5 +17,7 @@ EnvironmentFile=/mnt/20t/main/gan_t/.env
 ExecStartPre=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/update_data.py
 ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/retrain_pipeline.py
 TimeoutStartSec=1200
+Restart=on-failure
+RestartSec=60
 StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/logs/retrain.log
 StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/logs/retrain.log

@@ -1,12 +1,13 @@
 """Per-coin direction + expected-% prediction helper.
 
-The model's raw score is trained on beta-adjusted residual returns with
+The production model's raw score is trained on absolute forward returns with
 cross-sectional z-score features. Its magnitude is compressed (pred_std ~0.003);
 directly treating the score as "% move" under-predicts by 3-5×.
 
-Instead we rely on a sigma-bucket calibration built from a full-universe scan
-(scripts/build_calibration.py → output/calibration_sigma.json). For each bucket
-we record:
+Instead we rely on a sigma-bucket calibration built only from the temporal
+holdout at exact production anchors, using next-open execution
+(`scripts/rebuild_calibration.py` → `output/calibration_sigma.json`). For each
+bucket we record:
   - hit_rate           (P[sign(score) == sign(ret)])
   - mean_signed_return (E[sign(score) × ret])  ← empirical direction+magnitude
   - mean_abs_return    (typical coin move size)

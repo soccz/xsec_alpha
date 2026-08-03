@@ -1,6 +1,7 @@
 [Unit]
 Description=xsec_alpha cross-sectional ranking
 After=network.target
+Before=xsec-retrain.service xsec-measure.service
 
 [Service]
 Type=oneshot
@@ -11,5 +12,7 @@ ExecStartPre=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/update_data.p
 ExecStartPre=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/track_ic.py
 ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/fetch_and_rank.py
 TimeoutStartSec=600
+Restart=on-failure
+RestartSec=60
 StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/logs/systemd.log
 StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/logs/systemd.log

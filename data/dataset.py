@@ -2,6 +2,8 @@
 import sys
 import os
 
+import pandas as pd
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
 from config import config
@@ -32,6 +34,42 @@ except AttributeError:
     _HOLDOUT_RATIO_CONFIG = _HOLDOUT_RATIO_DEFAULT
 
 OUTLIER_THRESHOLD = 0.5  # |residual| > 0.5 in target horizon = data error
+
+
+def _prepare_training_frame(
+    factor_df: pd.DataFrame,
+    target_long: pd.Series,
+    factor_cols: list[str],
+    target_col: str,
+) -> pd.DataFrame:
+    """Apply live's neutral NaN fill and all-zero row filter to training data."""
+    combined = factor_df.join(target_long, how="inner")
+    combined = combined.dropna(subset=[target_col]).copy()
+    combined.loc[:, factor_cols] = combined.loc[:, factor_cols].fillna(0.0)
+    combined = combined[combined.loc[:, factor_cols].any(axis=1)]
+    return combined
+
+
+def _split_timestamps_with_horizon_purge(
+    all_timestamps: pd.DatetimeIndex,
+    holdout_ratio: float,
+    horizon: int,
+) -> tuple[list[pd.Timestamp], list[pd.Timestamp], pd.Timestamp]:
+    """Split chronologically and purge train labels that reach the holdout."""
+    timestamps = pd.DatetimeIndex(all_timestamps).unique().sort_values()
+    if len(timestamps) == 0:
+        raise ValueError("Cannot split an empty timestamp index")
+
+    n_holdout = max(1, int(len(timestamps) * holdout_ratio))
+    n_train = len(timestamps) - n_holdout
+    holdout_timestamps = timestamps[n_train:]
+    split_ts = holdout_timestamps[0]
+
+    candidate_train = timestamps[:n_train]
+    label_horizon = pd.Timedelta(hours=horizon)
+    train_timestamps = candidate_train[candidate_train + label_horizon < split_ts]
+
+    return train_timestamps.tolist(), holdout_timestamps.tolist(), split_ts
 
 
 def build_dataset(
@@ -126,11 +164,14 @@ def build_dataset(
     )
 
     # ------------------------------------------------------------------
-    # 4. Join X and y; drop rows where either is NaN
+    # 4. Join X and y; retain feature-NaN rows using live's neutral fill policy
     # ------------------------------------------------------------------
-    import pandas as pd
-
-    combined = factor_df.join(target_long, how="inner").dropna()
+    combined = _prepare_training_frame(
+        factor_df,
+        target_long,
+        factor_cols,
+        target_col,
+    )
 
     # ------------------------------------------------------------------
     # 4b. Regime filter for long side: keep only bull timestamps
@@ -175,16 +216,18 @@ def build_dataset(
     # 6. Temporal split — NEVER shuffle, NEVER mix
     # ------------------------------------------------------------------
     all_timestamps = combined.index.get_level_values("timestamp").unique().sort_values()
-    n_ts           = len(all_timestamps)
-    n_holdout      = max(1, int(n_ts * holdout_ratio))
-    n_train        = n_ts - n_holdout
+    n_ts = len(all_timestamps)
+    train_timestamps, holdout_timestamps, split_ts = (
+        _split_timestamps_with_horizon_purge(
+            all_timestamps,
+            holdout_ratio=holdout_ratio,
+            horizon=horizon,
+        )
+    )
 
-    train_timestamps   = all_timestamps[:n_train].tolist()
-    holdout_timestamps = all_timestamps[n_train:].tolist()
-    split_ts           = holdout_timestamps[0]
-
-    train_mask   = combined.index.get_level_values("timestamp").isin(train_timestamps)
-    holdout_mask = ~train_mask
+    row_timestamps = combined.index.get_level_values("timestamp")
+    train_mask = row_timestamps.isin(train_timestamps)
+    holdout_mask = row_timestamps.isin(holdout_timestamps)
 
     train_data   = combined[train_mask]
     holdout_data = combined[holdout_mask]
@@ -200,7 +243,8 @@ def build_dataset(
     logger.info(
         f"Train: {len(X_train)} rows, "
         f"Holdout: {len(X_holdout)} rows, "
-        f"Split at: {split_ts}"
+        f"Split at: {split_ts}, "
+        f"Purged: {n_ts - len(train_timestamps) - len(holdout_timestamps)} timestamps"
     )
 
     return {

@@ -390,7 +390,10 @@ Bitget USDT perp 공개 API로 실제 숏 가능 여부 확인:
 
 ---
 
-### 14. 라이브 프로브 계약 (2026-04-14 갱신)
+### 14. 라이브 프로브 계약 (historical · 2026-04-14)
+
+> 아래 표는 최초 프로브 계약 기록이다. 현행 집행 계약은 §14-bis/§14-ter가
+> 우선하며, LONG 실행·추천 원장은 0건, 조건부 비실행 WATCH 알림은 최대 1건이다.
 
 | 항목 | Short 모델 | Long 모델 |
 |------|-----------|-----------|
@@ -427,7 +430,15 @@ Bitget USDT perp 공개 API로 실제 숏 가능 여부 확인:
 
 - **WATCH_LONG: KILL 확정 (2026-07-11).** 근거: 30d 실현 net −0.22%/trade·승률 45.3%로
   §14 승격 전제(long IC>0 → 실행 승격)와 실측이 모순. 집행 = `config.Portfolio.LIVE_WATCH_LONG_N`
-  기본값 0 (픽 생성·ledger·텔레그램 중지). §14의 "Long 승격 조건"은 폐기 — 부활은 새 사전등록으로만.
+  고정값 0 (실행/추천 픽·recommendation ledger 중지, 환경변수 우회 불가). §14의 "Long 승격 조건"은 폐기 —
+  부활은 새 사전등록 + 코드 변경으로만. 2026-08-03 감사 후에는 `ic_gate` policy block과
+  최종 long-pick limit 모두가 0건을 강제하며, health snapshot은 raw WARN/실현성과와
+  execution `BLOCKED`를 함께 표시한다.
+  - **거버넌스↔런타임 간극:** 7월 11일 N=0 결정은 문서/설정에 기록됐지만,
+    LONG 전용 모델 override가 최종 한도를 다시 늘리는 경로를 당시에 막지 못했다.
+    그 결과 7월 11일 이후 `WATCH_LONG` 205건이 ledger에 남았다. 이는 KILL 이전
+    성과로 재해석하지 않고 집행 결함으로 보존한다. 8월 3일 수정은 최종 한도와
+    IC policy block 두 곳에서 0건을 강제한다.
 - **SHORT: 판정일 2026-09-01 (prelude와 동일 일자). UNDECIDED 불허.**
   - **GO(유지) 기준 — 전부 충족:**
     1. 재계약 구간(2026-07-11~09-01) closed per-trade mean net > 0
@@ -442,11 +453,66 @@ Bitget USDT perp 공개 API로 실제 숏 가능 여부 확인:
 
 ---
 
+### 14-ter. LONG 원천 성능 감사와 측정 계약 복구 (2026-08-03)
+
+§14-bis의 KILL은 그대로 유지한다. 이번 작업은 LONG을 다시 켠 것이 아니라,
+잘못된 낙관을 만들던 데이터·검증 계약을 먼저 고치고 다음 후보를 정직하게
+관찰할 수 있게 만든 것이다.
+
+**재현 결과:**
+
+- 현행 `xsec_12h.pkl`, 정확한 11/23 UTC·next-open lag1·Bitget top5·비용 20bp:
+  aligned IC `+0.1227` (23개 독립 슬롯)이지만, 레짐 활성 7개 슬롯의
+  gross `-0.9968%`, net `-1.1796%`, hit `14.3%`.
+- 새 Ensemble 재학습 후보: IC `+0.1219`, net `-1.5345%` → 자동 거부.
+- Ridge 단독 후보: IC `+0.1225`, net `-1.3601%` → 자동 거부.
+- 더 긴 8-fold strict WF에서도 현행 Ensemble net `-0.3162%`, 최선의 단순
+  Ridge 후보 net `-0.1041%`. 순위 신호는 있으나 LONG 경제성은 아직 없다.
+
+**복구한 계약:**
+
+- Upbit 종목 간 고정 대기를 `1.1s → 0.15s`로 줄이고 전체 수집 순서를
+  `Binance → Upbit`으로 바꿔, 추천 직전 가격 스냅샷 지연을 축소했다.
+- BTC 7d/30d 레짐을 로그만 남기지 않고 실제 선택 단계에 강제했다. 30일
+  컨텍스트를 480h warmup 뒤에 계산해 항상 NaN이 되던 경로도 warmup 전
+  45일 컨텍스트로 교정했다.
+- 학습은 live와 같은 `fillna(0)`/all-zero 제외를 사용하고, train label이
+  holdout 시작에 닿지 않도록 horizon purge를 적용한다.
+- live IC, 일일 WF, 재학습 승격을 unified production model·정확한 UTC anchor·
+  next-open lag1·비중첩 슬롯으로 통일했다.
+- 12h 모델 승격은 IC뿐 아니라 레짐 활성 슬롯 `>=10`과 Bitget top5 평균
+  비용 후 net `>0`을 요구한다. 이는 shadow model 갱신 기준일 뿐 KILL 해제
+  기준이 아니다.
+- sigma calibration은 전체 60일 재스캔이 아니라 temporal holdout만 사용한다.
+  현재 OOS 표본은 SHORT 4,600건, LONG 700건이다.
+- `predictions_*.csv`의 11/23 UTC shadow top5에 `shadow_entry_price`와
+  `entry_observed_at`을 저장하고, 만기 시 `long_shadow_ledger.csv`에 Upbit ticker
+  proxy 기준 gross/net을 중복 없이 누적한다.
+
+**조건부 강신호 WATCH 알림:** KILL은 자동실행과 추천 ledger를 0건으로
+유지하되, 11/23 UTC 정규 12h 슬롯의 Bitget 거래가능 shadow top5 중에서만
+최대 1개를 텔레그램 `LONG WATCH`로 보낼 수 있다. BTC 7d `>0` 및
+30d `>-10%`, preflight 정상, 최근 IC 3개 모두 `>=0.05` + 최신 IC `>=0.10`,
+OOS 캘리브레이션 `sigma>=2.0`, 방향 확률 `>=65%`, 기대수익 `>=+0.20%`,
+6h/12h 상승 방향 합의,
+과거 역신호(`⚠`) 아님을 모두 요구한다. 행은 항상 `actionable=false`,
+포지션 크기 0이며 `latest.csv`/recommendation ledger에 추가하지 않는다.
+
+**재활성화 조건:** 모델·top-N·threshold를 먼저 고정한 뒤 새로 쌓인 독립
+12h shadow basket 최소 60개에서 평균 net `>0`, 시간 block-bootstrap 95% 하한
+`>0`, 시간순 3개 fold와 허용 레짐 모두 net `>0`을 만족해야 별도 코드 변경으로
+KILL 해제를 검토한다. 그 전에는 IC가 높아도 실행 LONG 0건이 정상이며,
+위의 강신호 조건부 WATCH 알림은 KILL 해제로 간주하지 않는다.
+
+---
+
 ### 15. 다음 단계
 
 - [ ] 2~4주 라이브 프로브 실행 및 데이터 수집
 - [x] Long 전용 모델 연구 → v3 완성 (compression+reversal, 12h, Ensemble)
 - [x] ~~Long 승격 판정: 60+ holdout timestamps 축적 후 재평가~~ → **2026-07-11 WATCH_LONG KILL (§14-bis)**
+- [x] LONG production 측정 계약 복구 + 비용 기준 자동 승격 차단 (§14-ter)
+- [ ] 새 계약의 독립 12h shadow basket 60개 축적 후 사전등록 기준 재판정
 - [ ] app.py 대시보드에 ledger/next_rebalance/refresh_reason 노출
 - [ ] Short 모델 재저장 (Ridge feature names 경고 제거)
 - [ ] 360일+ 데이터로 추세장 포함 재검증
@@ -488,24 +554,26 @@ Binance API ─────────────────→│
                  ┌─────────────┴─────────────┐
                  │                           │
           Short 모델 (6h)          Long 모델 (12h)
-          reversal, vol_inv,       range_contraction,
-          kimchi, binance_lead     reversal, binance_lead
-          order_flow_bear          + BTC 레짐 게이트
+          unified 10 features      unified 10 features
+          absolute next-open       absolute next-open
                  │                           │
           Bitget tradable 필터     Bitget tradable 필터
                  │                           │
-          SHORT 5 (실행)          WATCH LONG 5 (관찰)
+       SHORT actionable ≤5       실행·추천 원장 0
+          (수동 판단용)          shadow top5 → 엄격 gate
+                                            │
+                                  WATCH ONLY ≤1 (비실행)
                  │                           │
                  └─────────────┬─────────────┘
                                │
                     CSV + 텔레그램 + 대시보드
                                │
-                    실현 성과 ledger (자동 누적)
+              recommendation ledger + 별도 LONG shadow ledger
 ```
 
 **스케줄:** systemd timer, 6h 간격
 - Short: 매 run 리밸런스
-- Long: 12h마다 리밸런스 (오프사이클은 carry)
+- Long: 11/23 UTC shadow 기록과 조건부 WATCH 심사 (오프사이클 알림 없음)
 
 ---
 
@@ -653,8 +721,19 @@ Bull regime 필터를 없애고도 12h 성능이 오히려 좋아졌다. 이전�
 | `xsec-alpha.timer` | 매 6h (05/11/17/23 UTC) | 예측 실행 + 텔레그램 |
 | `xsec-measure.timer` | 매일 00:00 UTC | 홀드아웃 IC + drift 체크 |
 | `xsec-retrain.timer` | 매주 일 20:00 UTC | F1 retrain_pipeline |
+| `xsec-backup.timer` | 매일 18:00 UTC | SQLite hot backup + SSD 최근 3개 이중화 |
 
-`deploy/install_f1.sh` 한 번 실행으로 전체 systemd 배포.
+시스템 유닛은 `sudo bash deploy/install.sh`와 `sudo bash deploy/install_f1.sh`,
+사용자 백업 유닛은 `bash deploy/install_backup.sh`로 배포한다.
+
+부팅 보충 실행은 `alpha → retrain → measure` 순서로 직렬화한다. 데이터
+업데이터 잠금이 겹치면 최대 8분간 기다린 뒤 Upbit/Binance 최신 시각과
+시장별 신선도를 검증한다. 검증 실패는 임시 실패로 처리하고 배포 정본의
+alpha/retrain 유닛은 60초 뒤 재시도하므로, 시장별 커밋 도중의 불완전한
+Upbit/Binance 스냅샷으로 추천이나 IC를 계산하지 않는다.
+DB 갱신과 두 IC 측정 진입점(`measure_ic.py`, `wf_holdout_harness.py`),
+후속 drift detector는 별도의 공유 data-access 잠금을 사용해 설치 유닛의
+배포 시점과 무관하게 부분 갱신 스냅샷을 읽지 않는다.
 
 ---
 

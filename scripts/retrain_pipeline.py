@@ -8,6 +8,7 @@ Runs weekly via systemd (xsec-retrain.timer). Single entry point that:
   3. Promotion gate per horizon:
      - new_holdout_ic >= old_holdout_ic - 0.015
      - new_holdout_ic >= 0.040 (absolute floor)
+     - 12h only: at least 10 production-aligned LONG periods and mean net > 0
   4. Accept: archive current, promote candidate, rebuild calibration
   5. Reject: keep current model live, log reason
 
@@ -36,6 +37,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import spearmanr
 
+from config import config
+
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"
 ARCHIVE_DIR = MODELS_DIR / "archive"
@@ -45,7 +48,193 @@ LOCK_FILE = ROOT / "output" / ".retrain.lock"
 # Promotion gate thresholds
 IC_DELTA_THRESHOLD = -0.015   # new IC must be at most 1.5pp worse than old
 IC_ABSOLUTE_FLOOR = 0.040     # new IC must be at least 0.040
+MIN_LONG_PERIODS = 10         # minimum eligible 12h LONG slots for promotion
 MAX_DATA_AGE_HOURS = 6        # refuse retrain if DB data stale. xsec-alpha.timer fires every 6h, so any retrain run between fetches sees data at most 6h old. Hard staleness (>6h) means a fetch silently failed and we should not retrain on partial data.
+_BITGET_TRADABLE_CACHE: set[str] | None = None
+
+
+def _current_bitget_tradable_markets(markets) -> set[str] | None:
+    """Load the live execution universe once per retrain process; fail closed."""
+    if not getattr(config.Portfolio, "LIVE_REQUIRE_BITGET_TRADABLE", False):
+        return None
+
+    global _BITGET_TRADABLE_CACHE
+    if _BITGET_TRADABLE_CACHE is None:
+        from utils.bitget import filter_markets_to_bitget, load_bitget_usdt_perp_map
+
+        contract_map = load_bitget_usdt_perp_map()
+        _BITGET_TRADABLE_CACHE = set(
+            filter_markets_to_bitget(list(markets), contract_map)
+        )
+    return set(_BITGET_TRADABLE_CACHE)
+
+
+def _measure_long_holdout_economics(
+    scores: pd.Series,
+    opens: pd.DataFrame,
+    btc_context: pd.DataFrame,
+    *,
+    horizon: int = 12,
+    anchor_hour_utc: int = 11,
+    long_n: int = 5,
+    btc_7d_gate: float = 0.0,
+    btc_30d_floor: float = -0.10,
+    round_trip_cost: float = 0.002,
+    tradable_markets: set[str] | None = None,
+) -> dict:
+    """Measure production-aligned LONG economics from already-computed scores."""
+    next_open_returns = opens.shift(-(horizon + 1)) / opens.shift(-1) - 1
+    timestamps = pd.DatetimeIndex(
+        scores.index.get_level_values("timestamp").unique()
+    ).sort_values()
+
+    gross_returns: list[float] = []
+    net_returns: list[float] = []
+    hits: list[float] = []
+    previous_longs: set[str] = set()
+
+    for ts in timestamps:
+        if (pd.Timestamp(ts).hour - anchor_hour_utc) % horizon != 0:
+            continue
+
+        try:
+            regime = btc_context.loc[ts]
+            btc_7d = float(regime["btc_ret_7d"])
+            btc_30d = float(regime["btc_ret_30d"])
+        except (KeyError, TypeError, ValueError):
+            previous_longs = set()
+            continue
+
+        regime_active = bool(
+            np.isfinite(btc_7d)
+            and np.isfinite(btc_30d)
+            and btc_7d > btc_7d_gate
+            and btc_30d > btc_30d_floor
+        )
+        if not regime_active:
+            previous_longs = set()
+            continue
+
+        try:
+            slot_scores = scores.xs(ts, level="timestamp").dropna()
+            slot_returns = next_open_returns.loc[ts]
+        except KeyError:
+            previous_longs = set()
+            continue
+        if tradable_markets is not None:
+            slot_scores = slot_scores[slot_scores.index.isin(tradable_markets)]
+        if len(slot_scores) < long_n:
+            previous_longs = set()
+            continue
+
+        long_markets = slot_scores.nlargest(long_n).index.tolist()
+        realized = slot_returns.reindex(long_markets)
+        if len(realized) != long_n or realized.isna().any():
+            previous_longs = set()
+            continue
+
+        current_longs = set(long_markets)
+        turnover = len(current_longs - previous_longs) / long_n
+        gross = float(realized.mean())
+        net = gross - turnover * round_trip_cost
+
+        gross_returns.append(gross)
+        net_returns.append(net)
+        hits.append(float(gross > 0))
+        previous_longs = current_longs
+
+    if not gross_returns:
+        return {
+            "long_gross": None,
+            "long_net": None,
+            "long_hit_rate": None,
+            "n_long_periods": 0,
+        }
+
+    return {
+        "long_gross": float(np.mean(gross_returns)),
+        "long_net": float(np.mean(net_returns)),
+        "long_hit_rate": float(np.mean(hits)),
+        "n_long_periods": len(gross_returns),
+    }
+
+
+def _measure_aligned_ic(
+    scores: pd.Series,
+    opens: pd.DataFrame,
+    *,
+    horizon: int,
+    anchor_hours_utc: tuple[int, ...],
+    min_cross_section: int = 20,
+) -> list[float]:
+    """Measure non-overlapping next-open IC at exact production anchors."""
+    next_open_returns = opens.shift(-(horizon + 1)) / opens.shift(-1) - 1
+    anchors = set(anchor_hours_utc)
+    values: list[float] = []
+    timestamps = pd.DatetimeIndex(
+        scores.index.get_level_values("timestamp").unique()
+    ).sort_values()
+    for ts in timestamps:
+        if pd.Timestamp(ts).hour not in anchors or ts not in next_open_returns.index:
+            continue
+        try:
+            slot_scores = scores.xs(ts, level="timestamp")
+        except KeyError:
+            continue
+        aligned = pd.concat(
+            [
+                slot_scores.rename("score"),
+                next_open_returns.loc[ts].rename("actual"),
+            ],
+            axis=1,
+        ).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(aligned) < min_cross_section:
+            continue
+        ic, _ = spearmanr(aligned["score"], aligned["actual"])
+        if np.isfinite(ic):
+            values.append(float(ic))
+    return values
+
+
+def _passes_long_economic_gate(long_net: float | None, n_long_periods: int) -> bool:
+    """Return whether a 12h candidate has enough profitable LONG observations."""
+    return bool(
+        n_long_periods >= MIN_LONG_PERIODS
+        and long_net is not None
+        and np.isfinite(long_net)
+        and long_net > 0
+    )
+
+
+def _evaluate_promotion_gate(
+    *,
+    horizon: int,
+    new_ic: float,
+    old_ic: float,
+    min_delta: float,
+    force: bool,
+    long_net: float | None = None,
+    n_long_periods: int = 0,
+) -> dict:
+    """Evaluate IC gates plus the 12h-only economic gate without side effects."""
+    delta = new_ic - old_ic if old_ic != float("-inf") else 0.0
+    pass_delta = delta >= min_delta
+    pass_floor = new_ic >= IC_ABSOLUTE_FLOOR
+    pass_long_economics = (
+        _passes_long_economic_gate(long_net, n_long_periods)
+        if horizon == 12
+        else True
+    )
+    promoted = bool(
+        force or (pass_delta and pass_floor and pass_long_economics)
+    )
+    return {
+        "delta": delta,
+        "pass_delta": bool(pass_delta),
+        "pass_floor": bool(pass_floor),
+        "pass_long_economics": bool(pass_long_economics),
+        "promoted": promoted,
+    }
 
 
 def log(msg: str) -> None:
@@ -89,7 +278,7 @@ def measure_holdout_ic(model_path: Path, horizon: int) -> float:
 
 
 def measure_holdout_stats(model_path: Path, horizon: int) -> dict:
-    """Return mean IC + t-stat + n_periods on 20% holdout.
+    """Return IC statistics and, for 12h, production-aligned LONG economics.
 
     Used by both the promotion gate (which only needs the scalar IC) and
     the dashboard export (which needs the full stats for the reconciliation
@@ -101,30 +290,65 @@ def measure_holdout_stats(model_path: Path, horizon: int) -> dict:
     ds = build_dataset(days=60, holdout_ratio=0.2, side="unified",
                        target="absolute", horizon=horizon)
     model = XSecRanker.load(str(model_path))
-    X_h = ds["X_holdout"]
-    y_h = ds["y_holdout"]
+    X_h = ds["X_holdout"].fillna(0.0)
     preds = pd.Series(model.predict(X_h), index=X_h.index)
 
-    per_slot = []
-    for ts, g in preds.groupby(level="timestamp"):
-        y_slice = y_h.loc[ts]
-        if len(g) < 20:
-            continue
-        ic, _ = spearmanr(g.values, y_slice.values)
-        if not np.isnan(ic):
-            per_slot.append(float(ic))
+    anchor_hours = (11, 23) if horizon == 12 else (5, 11, 17, 23)
+    per_slot = _measure_aligned_ic(
+        preds,
+        ds["opens"],
+        horizon=horizon,
+        anchor_hours_utc=anchor_hours,
+    )
 
     n = len(per_slot)
     if n == 0:
-        return {"ic": float("nan"), "tstat": None, "n_periods": 0}
-    mean = sum(per_slot) / n
-    if n > 1:
-        var = sum((v - mean) ** 2 for v in per_slot) / (n - 1)
-        std = var ** 0.5
-        tstat = mean / (std / (n ** 0.5)) if std > 0 else None
+        stats = {"ic": float("nan"), "tstat": None, "n_periods": 0}
     else:
-        tstat = None
-    return {"ic": float(mean), "tstat": float(tstat) if tstat is not None else None, "n_periods": n}
+        mean = sum(per_slot) / n
+        if n > 1:
+            var = sum((v - mean) ** 2 for v in per_slot) / (n - 1)
+            std = var ** 0.5
+            tstat = mean / (std / (n ** 0.5)) if std > 0 else None
+        else:
+            tstat = None
+        stats = {
+            "ic": float(mean),
+            "tstat": float(tstat) if tstat is not None else None,
+            "n_periods": n,
+        }
+
+    if horizon == 12:
+        from data.features import compute_btc_regime
+
+        fee_bps = float(getattr(config.Costs, "ONE_WAY_FEE_BPS", 6.0))
+        slippage_bps = float(getattr(config.Costs, "SLIPPAGE_BPS", 4.0))
+        round_trip_cost = 2.0 * (fee_bps + slippage_bps) / 10000.0
+        long_stats = _measure_long_holdout_economics(
+            preds,
+            ds["opens"],
+            compute_btc_regime(ds["closes"]),
+            horizon=12,
+            anchor_hour_utc=int(
+                getattr(config.LongModel, "REBALANCE_ANCHOR_HOUR_UTC", 11)
+            ),
+            long_n=int(getattr(config.LongModel, "LONG_N", 5)),
+            btc_7d_gate=float(
+                getattr(config.LongModel, "BTC_7D_RETURN_GATE", 0.0)
+            ),
+            btc_30d_floor=float(
+                getattr(config.LongModel, "BTC_30D_RETURN_FLOOR", -0.10)
+            ),
+            round_trip_cost=round_trip_cost,
+            tradable_markets=_current_bitget_tradable_markets(ds["opens"].columns),
+        )
+        long_stats["pass_long_economics"] = _passes_long_economic_gate(
+            long_stats["long_net"],
+            long_stats["n_long_periods"],
+        )
+        stats.update(long_stats)
+
+    return stats
 
 
 def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
@@ -145,7 +369,7 @@ def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
 
     def merge(side_key: str, h: int, stats: dict) -> dict:
         old = prior.get(side_key, {}) if isinstance(prior.get(side_key), dict) else {}
-        return {
+        merged = {
             "ic": round(float(stats["ic"]), 4) if stats["ic"] == stats["ic"] else None,  # NaN check
             "tstat": round(float(stats["tstat"]), 2) if stats.get("tstat") is not None else old.get("tstat"),
             "n_periods": int(stats.get("n_periods") or old.get("n_periods") or 0),
@@ -153,7 +377,27 @@ def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
             "e_signed_pct": old.get("e_signed_pct"),
             "horizon_h": h,
             "regime_filter": old.get("regime_filter"),
+            "target": "absolute",
+            "price_source": "open",
+            "execution_lag_bars": 1,
+            "anchor_hours_utc": [11, 23] if h == 12 else [5, 11, 17, 23],
+            "non_overlapping": True,
         }
+        if h == 12:
+            for key in ("long_gross", "long_net", "long_hit_rate"):
+                value = stats.get(key)
+                merged[key] = (
+                    round(float(value), 6)
+                    if value is not None and np.isfinite(value)
+                    else None
+                )
+            merged["n_long_periods"] = int(
+                stats.get("n_long_periods") or 0
+            )
+            merged["pass_long_economics"] = bool(
+                stats.get("pass_long_economics", False)
+            )
+        return merged
 
     new_doc = {
         "_provenance": {
@@ -205,74 +449,18 @@ def train_candidate(horizon: int, candidate_path: Path) -> bool:
 
 
 def rebuild_calibration() -> bool:
-    """Regenerate output/calibration_sigma.json for new models."""
-    cmd = [sys.executable, "-c", """
-import sys, json; sys.path.insert(0, '.')
-import pandas as pd, numpy as np
-from data.features import (load_and_pivot, load_binance_pivot, compute_unified_factors,
-    crosssection_zscore, build_top_liquidity_universe_index, filter_long_frame_by_universe,
-    UNIFIED_CALENDAR_COLS)
-from models.xgb_ranker import XSecRanker
-from config import config
-
-closes, opens, highs, lows, volumes = load_and_pivot(days=60)
-warmup = config.Data.MIN_ROWS_PER_COIN
-closes=closes.iloc[warmup:]; opens=opens.iloc[warmup:]
-highs=highs.iloc[warmup:]; lows=lows.iloc[warmup:]; volumes=volumes.iloc[warmup:]
-binance_closes = load_binance_pivot(closes.columns.tolist(), days=60)
-if not binance_closes.empty: binance_closes = binance_closes.iloc[warmup:]
-uni, _ = build_top_liquidity_universe_index(closes, volumes, top_n=100)
-uf = compute_unified_factors(closes,opens,highs,lows,volumes,binance_closes=binance_closes)
-zcols = [c for c in uf.columns if c not in UNIFIED_CALENDAR_COLS]
-uf = crosssection_zscore(uf, cols=zcols); uf = filter_long_frame_by_universe(uf, uni)
-
-def scan(model, h, slots):
-    ts_all = sorted([t for t in uf.index.get_level_values('timestamp').unique() if pd.notna(t)])
-    rows=[]
-    for ts in [t for t in ts_all if pd.Timestamp(t).hour in slots]:
-        fwd = ts + pd.Timedelta(hours=h)
-        if fwd not in closes.index: continue
-        try: feats = uf.xs(ts, level='timestamp').fillna(0)
-        except KeyError: continue
-        feats = feats[feats.any(axis=1)]
-        if len(feats)<30: continue
-        s = pd.Series(model.predict(feats), index=feats.index)
-        p0,p1 = closes.loc[ts], closes.loc[fwd]
-        ret = ((p1-p0)/p0).reindex(s.index).dropna()
-        s = s.loc[ret.index]; gstd = s.std()
-        if gstd==0: continue
-        for mkt in s.index:
-            rows.append({'sigma':abs(s[mkt])/gstd,'score':s[mkt],'ret':ret[mkt]})
-    return pd.DataFrame(rows)
-
-def cal(df):
-    out=[]
-    for lo,hi in [(0,0.5),(0.5,1),(1,1.5),(1.5,2),(2,100)]:
-        g = df[(df['sigma']>=lo)&(df['sigma']<hi)]
-        if len(g)==0: continue
-        signed = np.sign(g['score'])*g['ret']
-        hit = (np.sign(g['score'])==np.sign(g['ret'])).mean()
-        out.append({'sigma_low':lo,'sigma_high':(hi if hi<100 else None),'n':int(len(g)),
-                    'hit_rate':float(hit),'mean_signed_return_pct':float(signed.mean()*100),
-                    'mean_abs_return_pct':float(g['ret'].abs().mean()*100),
-                    'std_return_pct':float(g['ret'].std()*100)})
-    return out
-
-short_df = scan(XSecRanker.load('models/xsec_6h.pkl'), 6, (5,11,17,23))
-long_df = scan(XSecRanker.load('models/xsec_12h.pkl'), 12, (11,23))
-calib = {'short_6h':cal(short_df),'long_12h':cal(long_df),
-         'generated_at':pd.Timestamp.utcnow().isoformat(),
-         'model_version':'F1 unified (auto-rebuild from retrain_pipeline)'}
-with open('output/calibration_sigma.json','w') as f:
-    json.dump(calib, f, indent=2, default=str)
-print('calibration rebuilt')
-"""]
+    """Regenerate calibration through the audited OOS timing contract."""
+    cmd = [sys.executable, str(ROOT / "scripts" / "rebuild_calibration.py")]
     try:
         subprocess.run(cmd, check=True, capture_output=True, text=True,
                         cwd=str(ROOT), timeout=180)
         return True
-    except Exception as e:
-        log(f"Calibration rebuild failed: {e}")
+    except subprocess.CalledProcessError as e:
+        detail = (e.stderr or e.stdout or str(e))[-1000:]
+        log(f"Calibration rebuild failed: {detail}")
+        return False
+    except subprocess.TimeoutExpired:
+        log("Calibration rebuild failed: timeout 180s")
         return False
 
 
@@ -369,8 +557,18 @@ def main():
 
             # Measure both
             try:
-                new_ic = measure_holdout_ic(candidate_path, horizon)
-                old_ic = measure_holdout_ic(prod_path, horizon) if prod_path.exists() else float("-inf")
+                new_stats = measure_holdout_stats(candidate_path, horizon)
+                new_ic = float(new_stats["ic"])
+                old_stats = (
+                    measure_holdout_stats(prod_path, horizon)
+                    if prod_path.exists()
+                    else None
+                )
+                old_ic = (
+                    float(old_stats["ic"])
+                    if old_stats is not None
+                    else float("-inf")
+                )
             except Exception as e:
                 log(f"{horizon}h measurement failed: {e}")
                 results[horizon] = {"status": "measure_fail", "error": str(e)}
@@ -379,19 +577,51 @@ def main():
             log(f"{horizon}h: old_ic={old_ic:+.4f}  new_ic={new_ic:+.4f}  Δ={new_ic-old_ic:+.4f}")
 
             # Promotion gate
-            delta = new_ic - old_ic if old_ic != float("-inf") else 0.0
-            pass_delta = delta >= args.min_delta
-            pass_floor = new_ic >= IC_ABSOLUTE_FLOOR
-            promoted = (pass_delta and pass_floor) or args.force
+            decision = _evaluate_promotion_gate(
+                horizon=horizon,
+                new_ic=new_ic,
+                old_ic=old_ic,
+                min_delta=args.min_delta,
+                force=args.force,
+                long_net=new_stats.get("long_net"),
+                n_long_periods=int(new_stats.get("n_long_periods", 0)),
+            )
+            delta = decision["delta"]
+            promoted = decision["promoted"]
 
             results[horizon] = {
                 "old_ic": round(old_ic, 4) if old_ic != float("-inf") else None,
                 "new_ic": round(new_ic, 4),
                 "delta": round(delta, 4),
-                "pass_delta": pass_delta,
-                "pass_floor": pass_floor,
+                "pass_delta": decision["pass_delta"],
+                "pass_floor": decision["pass_floor"],
                 "promoted": promoted,
+                "forced": bool(args.force),
             }
+            if horizon == 12:
+                for key in ("long_gross", "long_net", "long_hit_rate"):
+                    value = new_stats.get(key)
+                    results[horizon][key] = (
+                        round(float(value), 6)
+                        if value is not None and np.isfinite(value)
+                        else None
+                    )
+                results[horizon]["n_long_periods"] = int(
+                    new_stats.get("n_long_periods", 0)
+                )
+                results[horizon]["pass_long_economics"] = decision[
+                    "pass_long_economics"
+                ]
+                log(
+                    "12h LONG economics: gross=%s net=%s hit=%s n=%s pass=%s"
+                    % (
+                        results[horizon]["long_gross"],
+                        results[horizon]["long_net"],
+                        results[horizon]["long_hit_rate"],
+                        results[horizon]["n_long_periods"],
+                        results[horizon]["pass_long_economics"],
+                    )
+                )
 
             if args.dry_run:
                 log(f"{horizon}h: dry-run — would {'promote' if promoted else 'reject'}")
@@ -399,7 +629,15 @@ def main():
                 continue
 
             if not promoted:
-                log(f"{horizon}h: REJECTED (delta={delta:+.4f}, floor={new_ic:.4f})")
+                economic_reason = (
+                    f", long_econ={decision['pass_long_economics']}"
+                    if horizon == 12
+                    else ""
+                )
+                log(
+                    f"{horizon}h: REJECTED "
+                    f"(delta={delta:+.4f}, floor={new_ic:.4f}{economic_reason})"
+                )
                 candidate_path.unlink(missing_ok=True)
                 continue
 
@@ -448,6 +686,7 @@ def main():
             "status": "ok" if any(r.get("promoted") for r in results.values()) else "no_promotion",
             "results": results,
             "dry_run": args.dry_run,
+            "force": args.force,
             "calibration_rebuilt": calib_rebuilt,
         })
 
