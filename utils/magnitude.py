@@ -38,19 +38,24 @@ ROOT = Path(__file__).resolve().parent.parent
 CALIB_FILE = ROOT / "output" / "calibration_sigma.json"
 
 _CALIB_CACHE: dict | None = None
+_CALIB_CACHE_STAMP: tuple | None = None
 
 
 def _load_calibration() -> dict:
-    global _CALIB_CACHE
-    if _CALIB_CACHE is not None:
-        return _CALIB_CACHE
+    global _CALIB_CACHE, _CALIB_CACHE_STAMP
     if not CALIB_FILE.exists():
         _CALIB_CACHE = {}
+        _CALIB_CACHE_STAMP = None
+        return _CALIB_CACHE
+    stat = CALIB_FILE.stat()
+    stamp = (str(CALIB_FILE), stat.st_mtime_ns, stat.st_size)
+    if _CALIB_CACHE is not None and stamp == _CALIB_CACHE_STAMP:
         return _CALIB_CACHE
     try:
         _CALIB_CACHE = json.loads(CALIB_FILE.read_text())
     except Exception:
         _CALIB_CACHE = {}
+    _CALIB_CACHE_STAMP = stamp
     return _CALIB_CACHE
 
 
@@ -182,6 +187,7 @@ def predict_batch(side: str, scores: pd.Series,
         pred["score"] = round(float(s), 5)
         rows.append(pred)
     df = pd.DataFrame(rows).set_index("market")
+    df["calibration_generated_at"] = _load_calibration().get("generated_at")
     # Sort by sigma desc so strong signals float to the top
     df = df.sort_values(["sigma", "score"], ascending=[False, True])
     return df

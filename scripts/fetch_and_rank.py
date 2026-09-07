@@ -19,6 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import argparse
 import json
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 
 import pandas as pd
 import numpy as np
@@ -28,6 +29,7 @@ from utils.bitget import filter_markets_to_bitget, load_bitget_usdt_perp_map, ma
 from utils.eval_metrics import select_positions_with_buffer
 from utils.logger import logger
 from utils.run_lock import run_lock
+from utils.model_release import artifact_sha256, model_release_guard
 
 
 def _effective_long_pick_limit(model_limit: int, portfolio_limit: int, blocked: bool) -> int:
@@ -35,6 +37,31 @@ def _effective_long_pick_limit(model_limit: int, portfolio_limit: int, blocked: 
     if blocked:
         return 0
     return max(0, min(int(model_limit), int(portfolio_limit)))
+
+
+def _short_pick_limit(requested: int, blocked: bool = False) -> int:
+    return 0 if blocked else max(0, min(int(requested), 5))
+
+
+def _short_suppression_reason(score, prediction, basket_size, batch_reason="") -> str:
+    if batch_reason:
+        return str(batch_reason)
+    if basket_size < 5:
+        return "insufficient_candidates"
+    if prediction.get("suppression"):
+        return str(prediction["suppression"])
+    values = pd.to_numeric(
+        pd.Series([score, prediction.get("sigma"), prediction.get("expected_pct")]),
+        errors="coerce",
+    )
+    if not np.isfinite(values).all():
+        return "prediction_unavailable"
+    raw_score, sigma, expected = values
+    if raw_score >= 0 or expected >= 0:
+        return "direction_mismatch"
+    if sigma < 1.0:
+        return "weak_signal"
+    return ""
 
 
 def _long_regime_allows(regime_row, btc_7d_gate: float, btc_30d_floor: float) -> bool:
@@ -67,17 +94,40 @@ def main():
     args = parser.parse_args()
 
     with run_lock("fetch_and_rank"):
-        _run(args)
+        try:
+            _run(args)
+        except Exception:
+            logger.exception("Recommendation run failed")
+            if not args.dry_run:
+                from utils.operator_report import build_report, publish_report
+                try:
+                    publish_report(
+                        build_report(error=True, reason="분석 실패 · 이전 후보는 참고용입니다"),
+                        send=not args.no_telegram,
+                    )
+                except Exception:
+                    logger.exception("Could not persist/deliver analysis failure report")
+            raise
+        finally:
+            if not args.dry_run:
+                from utils.prospective import maintain_experiment
+                maintain_experiment()
+            if not args.dry_run and not args.no_dashboard_export:
+                publish_dashboard(push=not args.no_dashboard_push)
 
-    # Post-run: refresh the public dashboard's encrypted payloads, then push.
-    # Non-fatal — a build/push failure must not block the rebalance pipeline.
-    if not args.dry_run and not args.no_dashboard_export:
-        _refresh_dashboard_export()
-        if not args.no_dashboard_push:
-            _push_dashboard_to_github()
+
+def publish_dashboard(push=True):
+    try:
+        with run_lock("dashboard_publish", timeout_sec=90, exit_code=75):
+            if not _refresh_dashboard_export():
+                return False
+            return _push_dashboard_to_github() if push else True
+    except SystemExit:
+        logger.warning("Dashboard publication deferred: another publisher is active")
+        return False
 
 
-def _refresh_dashboard_export() -> None:
+def _refresh_dashboard_export() -> bool:
     """Rebuild dashboard payloads.
 
       - encrypted: summary/history/accuracy.json under dashboard/data/
@@ -93,13 +143,15 @@ def _refresh_dashboard_export() -> None:
     public_target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/public_summary.json")
     if not encrypted_target.parent.exists():
         logger.info("Dashboard target dir absent; skipping export.")
-        return
+        return False
     try:
         from utils.dashboard_export import PIN_DEFAULT, export_to
         written = export_to(encrypted_target, PIN_DEFAULT, public_target=public_target)
         logger.info(f"Dashboard export refreshed: {len(written)} files (incl. public_summary)")
+        return True
     except Exception as e:
         logger.warning(f"Dashboard export failed (non-fatal): {e}")
+        return False
 
 
 _KIMCHI_NAN_EXPECTED_PCT = 33.0  # ~25% Binance-unmatched coins + 24h warmup
@@ -148,62 +200,74 @@ def _write_feature_health(factor_df) -> None:
     out.write_text(json.dumps(payload, indent=2))
 
 
-def _push_dashboard_to_github() -> None:
+def _push_dashboard_to_github(repo: Path | None = None) -> bool:
     """Commit+push refreshed dashboard payloads to soccz.github.io.
 
-    Scope is intentionally narrow: only `projects/xsec-alpha/dashboard/data/`
-    is staged. We pull --rebase first to absorb concurrent commits (the
-    github.io repo gets manual commits + commits from sibling projects).
-    Skipped when:
-      - github.io clone is missing
-      - data dir is missing or unchanged since last commit
-      - any git step fails (logged but non-fatal)
+    Only the four generated payload files may be committed. Unrelated staged
+    edits and dirty worktrees are never swept into a commit or auto-stashed.
     """
     import subprocess
     from pathlib import Path
 
-    repo = Path("/home/soccz/22tb/soccz.github.io")
+    repo = Path(repo) if repo is not None else Path("/home/soccz/22tb/soccz.github.io")
     data_subpath = "projects/xsec-alpha/dashboard/data"
     public_subpath = "projects/xsec-alpha/public_summary.json"
     if not (repo / data_subpath).exists():
         logger.info("Dashboard repo absent or data dir missing; skipping push.")
-        return
+        return False
+
+    paths = [f"{data_subpath}/{name}.json" for name in ("summary", "history", "accuracy")]
+    paths.append(public_subpath)
 
     def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
         return subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
                               check=check, timeout=60)
 
     try:
+        if run(["git", "branch", "--show-current"]).stdout.strip() != "main":
+            logger.warning("Dashboard push skipped: expected main branch")
+            return False
+        staged = run(["git", "diff", "--cached", "--name-only"]).stdout.splitlines()
+        if any(path not in paths for path in staged):
+            logger.warning("Dashboard push skipped: unrelated staged edits present")
+            return False
         # 1. Stage encrypted dashboard data + the public summary sibling.
         # Scope is narrow — never sweep up unrelated edits in the repo.
-        run(["git", "add", data_subpath])
-        if (repo / public_subpath).exists():
-            run(["git", "add", public_subpath])
+        paths = [path for path in paths if (repo / path).exists()]
+        run(["git", "add", "--", *paths])
 
         # 2. Skip if no real change (bytes-identical export).
-        diff = subprocess.run(["git", "diff", "--cached", "--quiet"],
-                              cwd=repo, timeout=10)
-        if diff.returncode == 0:
-            logger.info("Dashboard unchanged; nothing to push.")
-            return
+        diff = run(["git", "diff", "--cached", "--quiet", "--", *paths], check=False)
+        if diff.returncode not in (0, 1):
+            raise RuntimeError("Could not inspect staged dashboard payloads")
 
         # 3. Commit, then rebase onto remote, then push. Rebase BEFORE push
         # to absorb concurrent unrelated commits.
         from datetime import datetime, timezone
         ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-        run(["git", "commit", "-m", f"xsec-alpha: dashboard auto-refresh {ts}"])
-        try:
-            run(["git", "pull", "--rebase", "--autostash", "origin", "main"])
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"Dashboard pull --rebase failed: {e.stderr.strip()}; aborting push.")
-            run(["git", "rebase", "--abort"], check=False)
-            return
-        run(["git", "push", "origin", "main"])
+        if diff.returncode == 1:
+            run(["git", "commit", "--only", "-m", f"xsec-alpha: dashboard auto-refresh {ts}", "--", *paths])
+        run(["git", "fetch", "origin", "main"])
+        upstream_is_ancestor = run(["git", "merge-base", "--is-ancestor", "origin/main", "HEAD"], check=False)
+        if upstream_is_ancestor.returncode == 1:
+            if run(["git", "status", "--porcelain"]).stdout.strip():
+                logger.warning("Dashboard push deferred: remote advanced and worktree has edits")
+                return False
+            try:
+                run(["git", "rebase", "origin/main"])
+            except subprocess.CalledProcessError:
+                run(["git", "rebase", "--abort"], check=False)
+                raise
+        elif upstream_is_ancestor.returncode != 0:
+            raise RuntimeError("Could not verify dashboard remote ancestry")
+        run(["git", "push", "origin", "HEAD:main"])
         logger.info(f"Dashboard pushed: xsec-alpha/dashboard/data/ @ {ts}")
+        return True
     except subprocess.CalledProcessError as e:
         logger.warning(f"Dashboard push failed (non-fatal): {e.stderr.strip() if e.stderr else e}")
     except Exception as e:
         logger.warning(f"Dashboard push failed (non-fatal): {e}")
+    return False
 
 
 def _compute_score(latest_factors: "pd.DataFrame", args) -> "pd.Series":
@@ -213,9 +277,11 @@ def _compute_score(latest_factors: "pd.DataFrame", args) -> "pd.Series":
       1. XGBoost model (XSecRanker) if model file exists and --no-model not set
       2. Equal-weight mean of all factors (fallback)
     """
+    fallback = latest_factors.mean(axis=1)
+    fallback.attrs["is_fallback"] = True
     if args.no_model:
         logger.info("--no-model flag set: using equal-weight fallback")
-        return latest_factors.mean(axis=1)
+        return fallback
 
     try:
         model_path = getattr(getattr(config, "Model", None), "MODEL_PATH", "models/xsec_xgb.pkl")
@@ -223,18 +289,19 @@ def _compute_score(latest_factors: "pd.DataFrame", args) -> "pd.Series":
 
         if not os.path.exists(abs_model_path):
             logger.warning(f"Model not found at {abs_model_path}: using equal-weight fallback")
-            return latest_factors.mean(axis=1)
+            return fallback
 
         from models.xgb_ranker import XSecRanker
         model = XSecRanker.load(abs_model_path)
         scores_array = model.predict(latest_factors)
         score = pd.Series(scores_array, index=latest_factors.index)
+        score.attrs["model_sha256"] = artifact_sha256(Path(abs_model_path))
         logger.info(f"XGBoost model loaded from {abs_model_path}: {len(score)} coins scored")
         return score
 
     except Exception as e:
         logger.warning(f"Model load/predict failed ({e}): using equal-weight fallback")
-        return latest_factors.mean(axis=1)
+        return fallback
 
 
 def _load_previous_recommendations(path: str) -> pd.DataFrame:
@@ -433,6 +500,8 @@ def _prediction_meta_for(market: str, side: str, short_df=None, long_df=None) ->
         "trust_tag": "",
         "trust_note": "",
         "suppression": "",
+        "model_sha256": None,
+        "calibration_generated_at": None,
     }
     if pred_df is None or market not in pred_df.index:
         return fields
@@ -510,6 +579,8 @@ def _update_long_shadow_ledger(now=None, price_fetcher=None) -> None:
         "sigma",
         "price_source",
         "source_file",
+        "model_sha256",
+        "calibration_generated_at",
     ]
     if os.path.exists(ledger_path):
         try:
@@ -606,6 +677,8 @@ def _update_long_shadow_ledger(now=None, price_fetcher=None) -> None:
                 "sigma": pd.to_numeric(row.get("sigma"), errors="coerce"),
                 "price_source": "upbit_ticker_proxy",
                 "source_file": fname,
+                "model_sha256": row.get("model_sha256"),
+                "calibration_generated_at": row.get("calibration_generated_at"),
             })
             existing.add(key)
 
@@ -645,6 +718,8 @@ def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
         "realized_return",
         "refresh_reason",
         "source_file",
+        "model_sha256",
+        "calibration_generated_at",
     ]
 
     key_cols = ["market", "side", "entry_time", "horizon_h"]
@@ -750,6 +825,8 @@ def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
                 "realized_return": float(gross_return),
                 "refresh_reason": row.get("refresh_reason", ""),
                 "source_file": fname,
+                "model_sha256": row.get("model_sha256"),
+                "calibration_generated_at": row.get("calibration_generated_at"),
             })
             existing_keys.add(key)
 
@@ -781,6 +858,7 @@ def _update_realized_ledger(closes: "pd.DataFrame", latest_ts) -> None:
     )
 
 
+@model_release_guard()
 def _run(args):
     logger.info("=== fetch_and_rank START ===")
 
@@ -886,6 +964,8 @@ def _run(args):
 
     # Composite score (short model): XGBoost model if available, else equal-weight fallback
     score = _compute_score(latest_factors, args)
+    if score.attrs.get("is_fallback"):
+        preflight["batch_suppression"] = "model_unavailable"
     score_sorted = score.sort_values(ascending=False)
 
     # --- Per-coin full-universe prediction (direction + expected% + confidence) ---
@@ -893,7 +973,10 @@ def _run(args):
     # the basket CSV so the user can see predictions for all 100 coins, not just picks.
     try:
         from utils.magnitude import predict_batch as _predict_batch
+        if score.attrs.get("is_fallback"):
+            raise ValueError("Equal-weight fallback has no production calibration")
         short_predictions_df = _predict_batch("short_6h", score, closes=closes, horizon_h=short_horizon_h)
+        short_predictions_df["model_sha256"] = score.attrs.get("model_sha256")
         short_predictions_df["timestamp"] = pd.Timestamp(latest_ts).isoformat()
         # Apply pre-flight suppression
         short_predictions_df["suppression"] = preflight["batch_suppression"] or ""
@@ -963,6 +1046,7 @@ def _run(args):
                     horizon_h=long_horizon_h,
                 )
                 long_predictions_df["timestamp"] = pd.Timestamp(latest_ts).isoformat()
+                long_predictions_df["model_sha256"] = artifact_sha256(Path(abs_long_model_path))
                 long_predictions_df["suppression"] = preflight["batch_suppression"] or ""
                 long_predictions_df["actionable"] = (
                     (long_predictions_df["sigma"] >= 1.0)
@@ -1014,7 +1098,6 @@ def _run(args):
     )
     if short_gate.watch_only and execution_mode == "short_only":
         logger.warning(f"IC gate SHORT={short_gate.status}: forcing short to watch-only ({short_gate.reason})")
-        execution_mode = "watch_only_all"  # custom marker handled below
     if long_gate.watch_only:
         logger.warning(f"IC gate LONG={long_gate.status}: long forced to watch-only ({long_gate.reason})")
     short_blocked = short_gate.block
@@ -1036,11 +1119,11 @@ def _run(args):
 
     if execution_mode == "short_only":
         long_n = watch_long_n
-        short_n = exec_short_n
+        short_n = _short_pick_limit(exec_short_n)
         long_side_label = "WATCH_LONG"
     else:
         long_n = config.Portfolio.LONG_N
-        short_n = config.Portfolio.SHORT_N
+        short_n = _short_pick_limit(exec_short_n)
         long_side_label = "LONG"
 
         # Calendar filter: suppress LONG on Fri/Sat/Sun KST
@@ -1072,8 +1155,10 @@ def _run(args):
         logger.warning("IC gate SHORT=LIQUIDATE: emitting 0 short picks")
         short_n = 0
     short_watch_only = short_gate.watch_only and not short_blocked
+    short_watch_reason = f"ic_{short_gate.status.lower()}" if short_watch_only else ""
     if preflight["batch_suppression"]:
         short_watch_only = True
+        short_watch_reason = preflight["batch_suppression"]
     if long_predictions_df is not None and (
         long_blocked
         or long_gate.watch_only
@@ -1183,7 +1268,8 @@ def _run(args):
 
     logger.info(f"As of {latest_ts}")
     logger.info(f"{long_side_label} ({len(longs)}): {longs.index.tolist()}")
-    logger.info(f"SHORT {'EXEC' if execution_mode == 'short_only' else ''} ({len(shorts)}): {shorts.index.tolist()}")
+    short_label = "WATCH" if short_watch_only or len(shorts) < 5 else "CANDIDATES"
+    logger.info(f"SHORT {short_label} ({len(shorts)}): {shorts.index.tolist()}")
 
     saved_recommendations_df = pd.DataFrame()
     long_watch_alerts_df = pd.DataFrame()
@@ -1206,7 +1292,17 @@ def _run(args):
             next_long_rebalance_ts=next_long_rebalance_ts,
             next_short_rebalance_ts=next_short_rebalance_ts,
             short_watch_only=short_watch_only,
+            short_watch_reason=short_watch_reason,
         )
+        if short_predictions_df is not None:
+            short_predictions_df["actionable"] = False
+            short_predictions_df["selected"] = False
+            for row in saved_recommendations_df.to_dict(orient="records"):
+                market = row["market"]
+                if row["side"] == "SHORT" and market in short_predictions_df.index:
+                    short_predictions_df.loc[market, "selected"] = True
+                    short_predictions_df.loc[market, "actionable"] = bool(row["actionable"])
+                    short_predictions_df.loc[market, "suppression"] = row["suppression"]
 
         # Preserve exact paper-entry observations for the preregistered LONG
         # challenger even while the execution KILL emits no positions.
@@ -1242,21 +1338,10 @@ def _run(args):
             len(long_watch_alerts_df),
         )
 
-    # Telegram notification is intentionally decision-only. Full diagnostics
-    # are already saved to latest.csv, latest_predictions.csv and the ledger.
-    if not args.dry_run and not args.no_telegram:
+    # Report-only candidates survive execution blocks without creating trades.
+    if not args.dry_run:
         try:
-            from utils.telegram import send_message, format_actionable_signals
-
-            # Price at recommendation timestamp (close of latest_ts bar)
-            prices_at_ts = {}
-            try:
-                if latest_ts in closes.index:
-                    row = closes.loc[latest_ts]
-                    prices_at_ts = {m: float(p) for m, p in row.items()
-                                    if pd.notna(p) and p > 0}
-            except Exception as e:
-                logger.warning(f"Could not build prices_at_ts: {e}")
+            from utils.operator_report import build_report, publish_report
 
             # Realized 30d summary so the message can show recent paper performance
             # alongside the new signals — manual trader needs that context.
@@ -1274,20 +1359,36 @@ def _run(args):
                     ignore_index=True,
                     sort=False,
                 )
-            msg = format_actionable_signals(
-                recommendations_df=telegram_df,
-                latest_ts=latest_ts,
-                prices=prices_at_ts,
-                min_sigma=getattr(config.Notification, "TELEGRAM_MIN_SIGMA", 1.5),
-                min_expected_abs_pct=getattr(config.Notification, "TELEGRAM_MIN_EXPECTED_ABS_PCT", 0.20),
-                hide_untrusted=getattr(config.Notification, "TELEGRAM_HIDE_UNTRUSTED", True),
-                realized_summary=realized_summary,
+            observed_scores = selection_scores.dropna().sort_values().head(5)
+            candidates = pd.DataFrame({"market": observed_scores.index, "score": observed_scores.values})
+            report = build_report(
+                telegram_df, candidates, asof=latest_ts,
+                reason=(f"SHORT IC {short_gate.status}: {short_gate.reason}"
+                        if short_blocked else short_watch_reason),
             )
-            sent = send_message(msg)
+            sent = publish_report(report, send=not args.no_telegram, realized_summary=realized_summary)
             if sent:
-                logger.info("Telegram run heartbeat/recommendation report sent")
+                logger.info("Telegram coin proposal report acknowledged")
         except Exception as e:
-            logger.warning(f"Telegram notification failed: {e}")
+            logger.warning(f"Operator report failed: {e}")
+
+        # Shadow recording follows Telegram; it cannot delay or change live picks.
+        try:
+            from utils.prospective import record_snapshot
+
+            live_columns = [c for c in ("market", "actionable", "suppression", "model_sha256")
+                            if c in saved_recommendations_df.columns]
+            live_rows = json.loads(saved_recommendations_df[live_columns].to_json(orient="records"))
+            result = record_snapshot(
+                latest_ts, latest_factors, latest_factors_raw,
+                tradable_score_sorted.index.tolist(), live_rows=live_rows,
+                context={"short_gate": short_gate.status,
+                         "preflight_suppression": preflight["batch_suppression"],
+                         "live_model_sha256": score.attrs.get("model_sha256")},
+            )
+            logger.info("Prospective snapshot: %s", result)
+        except Exception:
+            logger.exception("Prospective snapshot failed; live recommendations unchanged")
 
     logger.info("=== fetch_and_rank END ===")
 
@@ -1340,6 +1441,7 @@ def _save_predictions_full(
 
     df = pd.concat(frames, ignore_index=True)
     cols = ["timestamp", "market", "horizon_h", "side_hint", "direction",
+            "model_sha256", "calibration_generated_at", "selected",
             "direction_prob", "sigma", "tag", "label",
             "expected_pct", "ci_95_low", "ci_95_high",
             "hit_rate", "typical_move_pct", "coin_vol_pct",
@@ -1387,7 +1489,9 @@ def _save_recommendations(
     next_long_rebalance_ts=None,
     next_short_rebalance_ts=None,
     short_watch_only=False,
+    short_watch_reason="",
 ):
+    shorts = shorts.head(_short_pick_limit(len(shorts)))
     out_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
     os.makedirs(out_dir, exist_ok=True)
 
@@ -1445,6 +1549,11 @@ def _save_recommendations(
     for market, score in shorts.items():
         cost = _cost_assumptions_for_side(short_side_label)
         pred_meta = _prediction_meta_for(market, short_side_label, short_predictions_df, long_predictions_df)
+        reason = _short_suppression_reason(
+            score, pred_meta, len(shorts),
+            short_watch_reason or ("watch_only" if short_watch_only else ""),
+        )
+        pred_meta["suppression"] = reason
         entry_price = get_current_price(market)
         entry_observed_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         _time.sleep(0.1)
@@ -1459,7 +1568,7 @@ def _save_recommendations(
             "refresh_reason": "refresh_6h",
             "next_rebalance_at": pd.Timestamp(next_short_rebalance_ts).isoformat() if next_short_rebalance_ts is not None else None,
             "bitget_symbol": market_to_bitget_symbol(market, contract_map or {}),
-            "actionable": not short_watch_only,
+            "actionable": not bool(reason),
             **cost,
             **pred_meta,
         })

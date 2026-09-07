@@ -40,6 +40,7 @@ from data.features import (
     filter_long_frame_by_universe,
 )
 from models.xgb_ranker import XSecRanker
+from utils.model_release import model_release_guard
 from utils.run_lock import stable_data_read_lock
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
@@ -266,6 +267,7 @@ def main():
         _main_locked()
 
 
+@model_release_guard()
 def _main_locked():
     parser = argparse.ArgumentParser(description="Track live IC over time")
     parser.add_argument("--days", type=int, default=45, help="Days of history to load (default 45; preserves 30d regime context after warmup)")

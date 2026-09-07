@@ -198,8 +198,16 @@ def section_realized():
     from utils.ic_gate import _policy_block_reason
 
     by_side = {}
+    excluded_short_rows = 0
     worst = "OK"
     for side, grp in recent.groupby("side"):
+        if str(side).upper() == "SHORT":
+            actionable = grp.get("actionable", pd.Series(False, index=grp.index))
+            mask = actionable.astype(str).str.lower().isin(["true", "1"])
+            excluded_short_rows = int((~mask).sum())
+            grp = grp[mask]
+            if grp.empty:
+                continue
         n = len(grp)
         avg = float(grp["performance_return"].mean())
         std = float(grp["performance_return"].std()) if n > 1 else 0.0
@@ -219,12 +227,17 @@ def section_realized():
             "status": status, "raw_status": raw_status,
             "execution_blocked": policy_reason is not None,
             "policy_reason": policy_reason,
+            "cohort": "actionable" if str(side).upper() == "SHORT" else "observation",
         }
+    if not by_side:
+        worst = "WARN"
     return worst, {
         "window": "30d",
         "return_metric": return_metric,
         "by_side": by_side,
-        "total": len(recent),
+        "total": sum(info["n"] for info in by_side.values()),
+        "recorded_total": len(recent),
+        "excluded_short_observation_or_unknown": excluded_short_rows,
     }
 
 

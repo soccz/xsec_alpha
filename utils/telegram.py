@@ -1,5 +1,8 @@
 """Telegram notification for xsec_alpha recommendations."""
 import os
+import time
+from html import escape
+import pandas as pd
 import requests
 from utils.logger import logger
 
@@ -11,20 +14,44 @@ def send_message(text: str, parse_mode: str = "HTML") -> bool:
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram not configured (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)")
         return False
-    try:
-        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-        resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": parse_mode,
-            "disable_web_page_preview": True,
-        }, timeout=(3.05, 10))
-        resp.raise_for_status()
-        logger.info("Telegram message sent successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Telegram send failed: {e}")
-        return False
+    for attempt in range(3):
+        delay = 2 ** attempt
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": text,
+                      "parse_mode": parse_mode, "disable_web_page_preview": True},
+                timeout=(3.05, 10),
+            )
+            try:
+                payload = resp.json()
+            except ValueError:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            if resp.status_code == 200 and payload.get("ok") is True:
+                result = payload.get("result")
+                logger.info("Telegram message sent successfully (message_id=%s)",
+                            result.get("message_id") if isinstance(result, dict) else None)
+                return True
+            status = payload.get("error_code", resp.status_code)
+            if status != 429 and not (isinstance(status, int) and status >= 500):
+                logger.error("Telegram rejected message (status=%s)", status)
+                return False
+            parameters = payload.get("parameters")
+            if isinstance(parameters, dict):
+                try:
+                    delay = max(delay, float(parameters.get("retry_after", 0)))
+                except (TypeError, ValueError):
+                    pass
+        except requests.RequestException as exc:
+            # Do not log exception URLs: Telegram embeds the bot token there.
+            logger.warning("Telegram transport failure (%s)", type(exc).__name__)
+        if attempt == 2 or delay > 30:
+            break
+        time.sleep(delay)
+    logger.error("Telegram delivery unconfirmed after bounded retries")
+    return False
 
 
 def _fmt_krw(price):
@@ -214,7 +241,8 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
                               min_sigma: float = 1.5,
                               min_expected_abs_pct: float = 0.20,
                               hide_untrusted: bool = True,
-                              realized_summary: dict | None = None) -> str:
+                              realized_summary: dict | None = None,
+                              status_note: str = "") -> str:
     """Telegram surface — designed for an operator who trades manually.
 
     The user executes both sides by hand on Bitget / Upbit, so the message
@@ -228,8 +256,8 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
         icon (🔥 ≥2σ, ✅ ≥1.5σ, ▫ weaker). Untrusted (⚠) signals are kept
         but visibly tagged so the user can skip them.
 
-    If absolutely nothing meets even the soft threshold (σ ≥ 1.0), we still
-    emit a heartbeat with reason — confirms the loop ran.
+    Non-actionable SHORT rows remain visible in a separate WATCH section.
+    An empty batch still emits a heartbeat so the loop is observable.
     """
     prices = prices or {}
     ts_str = str(latest_ts)[:16]
@@ -250,11 +278,11 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
         bits = []
         for side, label in (("SHORT", "SHORT"), ("WATCH_LONG", "LONG")):
             d = (realized_summary.get(side) or {}).get("d30") or {}
-            net = d.get("avg_net")
-            n = d.get("n")
+            net = d.get("avg_net_per_window", d.get("avg_net"))
+            n = d.get("n_windows", d.get("n"))
             if net is not None and n:
                 sign = "+" if net > 0 else ""
-                bits.append(f"{label} {sign}{net:.2f}% (n={n})")
+                bits.append(f"{label} {sign}{net:.2f}% ({n}회)")
         return "  ·  ".join(bits) if bits else ""
 
     def _clean_str(v) -> str:
@@ -287,8 +315,8 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
         lines = [
             f"📌 <b>xsec</b> · <code>{ts_str} UTC</code>",
             "",
-            "⏸ <b>강한 신호 없음</b>",
-            f"<code>{reason}</code>",
+            "⏸ <b>추천 보류</b>" if status_note else "⏸ <b>강한 신호 없음</b>",
+            f"<code>{escape(status_note) if status_note else reason}</code>",
         ]
         if raw_df is not None and len(raw_df):
             total = len(raw_df)
@@ -296,7 +324,7 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
         tail = _realized_tail()
         if tail:
             lines.append("")
-            lines.append(f"<code>📊 30d net  {tail}</code>")
+            lines.append(f"<code>📊 30d 모의 묶음 net  {tail}</code>")
         lines.append("<code>세부는 대시보드/ledger</code>")
         return "\n".join(lines).rstrip()
 
@@ -304,19 +332,18 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
         return _heartbeat("추천 데이터 없음")
 
     raw_df = recommendations_df.copy()
-    if "sigma" in raw_df.columns:
-        raw_df["sigma"] = raw_df["sigma"].apply(
-            lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan")
-        )
-    if "expected_pct" in raw_df.columns:
-        raw_df["expected_pct"] = raw_df["expected_pct"].apply(
-            lambda v: float(v) if not _nan(v) and str(v) != "" else float("nan")
-        )
+    for column in ("sigma", "expected_pct"):
+        raw_df[column] = pd.to_numeric(raw_df.get(column, pd.Series(index=raw_df.index, dtype=float)), errors="coerce")
 
-    # Split sides BEFORE filtering so we can show both regardless of actionable.
+    # Recommendations and observations must remain distinct on the user surface.
     side_u = raw_df["side"].astype(str).str.upper() if "side" in raw_df.columns else pd.Series([""] * len(raw_df))
     short_df = raw_df[side_u.str.contains("SHORT", na=False)].copy()
     long_df = raw_df[side_u.str.contains("LONG", na=False)].copy()
+
+    short_actionable = short_df.get("actionable", pd.Series(False, index=short_df.index)).apply(_truthy)
+    short_actionable &= short_df["sigma"].ge(1.0) & short_df["expected_pct"].lt(0)
+    short_watch_df = short_df[~short_actionable].copy()
+    short_df = short_df[short_actionable].copy()
 
     # Direction sanity per side
     if "expected_pct" in short_df.columns:
@@ -336,8 +363,12 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
         short_df = short_df.sort_values("sigma", ascending=False).head(5)
     if not long_df.empty:
         long_df = long_df.sort_values("sigma", ascending=False).head(5)
+    if not short_watch_df.empty:
+        short_watch_df = short_watch_df.sort_values("sigma", ascending=False).head(
+            max(0, 5 - len(short_df))
+        )
 
-    if short_df.empty and long_df.empty:
+    if short_df.empty and long_df.empty and short_watch_df.empty:
         return _heartbeat(
             f"전 사이드 σ &lt; {SOFT_SIGMA:.1f} (강신호 0)",
             raw_df,
@@ -364,6 +395,22 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
             lines.append(_row(row, "SHORT"))
         lines.append("")
 
+    if not short_watch_df.empty:
+        lines.append("⏸ <b>SHORT WATCH</b>")
+        lines.append("<code>관찰전용 · actionable=false · 신규 추천 아님</code>")
+        reason_labels = {
+            "weak_signal": "신호 약화", "insufficient_candidates": "후보 수 부족",
+            "prediction_unavailable": "예측 정보 부족", "direction_mismatch": "방향 불일치",
+            "ic_freeze": "IC 동결", "watch_only": "추천 보류",
+            "model_unavailable": "운영 모델 사용 불가",
+        }
+        for _, row in short_watch_df.iterrows():
+            side_key = "LONG" if not _nan(row.get("expected_pct")) and float(row["expected_pct"]) > 0 else "SHORT"
+            lines.append(_row(row, side_key))
+            reason = _clean_str(row.get("suppression")) or "watch_only"
+            lines.append(f"    <code>{escape(reason_labels.get(reason, reason))}</code>")
+        lines.append("")
+
     if not long_df.empty:
         horizon = int(long_df["horizon_h"].iloc[0]) if "horizon_h" in long_df.columns else 12
         long_is_watch = bool(
@@ -381,7 +428,7 @@ def format_actionable_signals(recommendations_df, latest_ts, prices: dict | None
     # how the signal has actually paid off recently).
     tail = _realized_tail()
     if tail:
-        lines.append(f"<code>📊 30d net  {tail}</code>")
+        lines.append(f"<code>📊 30d 모의 묶음 net  {tail}</code>")
 
     lines.append("<code>⭐ 신뢰 (적중≥60%) · ⚠ 역신호 (≤40%) · 세부는 대시보드</code>")
     return "\n".join(lines).rstrip()

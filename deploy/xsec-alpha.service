@@ -2,6 +2,7 @@
 Description=xsec_alpha cross-sectional ranking
 After=network.target
 Before=xsec-retrain.service xsec-measure.service
+OnFailure=xsec-telegram-failure.service
 
 [Service]
 Type=oneshot

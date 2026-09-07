@@ -1,0 +1,10 @@
+[Unit]
+Description=xsec_alpha supervise the registered trial every ten minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/10:00 UTC
+Persistent=true
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

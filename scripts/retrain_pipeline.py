@@ -28,6 +28,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -38,6 +39,8 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from config import config
+from utils.model_release import model_release_guard, publish_release
+from utils.run_lock import run_lock
 
 ROOT = Path(__file__).resolve().parent.parent
 MODELS_DIR = ROOT / "models"
@@ -351,15 +354,15 @@ def measure_holdout_stats(model_path: Path, horizon: int) -> dict:
     return stats
 
 
-def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
+def _write_holdout_report(per_horizon: dict[int, dict], stamp: str,
+                          output_path: Path | None = None,
+                          calibration: dict | None = None) -> None:
     """Update output/holdout_report.json with fresh holdout stats + provenance.
 
     `per_horizon[h]` should be the dict returned by measure_holdout_stats(...).
-    Static fields (hit_2sigma, e_signed_pct, regime_filter) are preserved from
-    the prior file when present so we do not silently zero out values not yet
-    re-measured.
+    Sigma estimates come from the matching calibration, never an older model.
     """
-    out_path = ROOT / "output" / "holdout_report.json"
+    out_path = output_path or ROOT / "output" / "holdout_report.json"
     prior = {}
     if out_path.exists():
         try:
@@ -368,15 +371,14 @@ def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
             prior = {}
 
     def merge(side_key: str, h: int, stats: dict) -> dict:
-        old = prior.get(side_key, {}) if isinstance(prior.get(side_key), dict) else {}
         merged = {
             "ic": round(float(stats["ic"]), 4) if stats["ic"] == stats["ic"] else None,  # NaN check
-            "tstat": round(float(stats["tstat"]), 2) if stats.get("tstat") is not None else old.get("tstat"),
-            "n_periods": int(stats.get("n_periods") or old.get("n_periods") or 0),
-            "hit_2sigma": old.get("hit_2sigma"),
-            "e_signed_pct": old.get("e_signed_pct"),
+            "tstat": round(float(stats["tstat"]), 2) if stats.get("tstat") is not None else None,
+            "n_periods": int(stats.get("n_periods") or 0),
+            "hit_2sigma": None,
+            "e_signed_pct": None,
             "horizon_h": h,
-            "regime_filter": old.get("regime_filter"),
+            "regime_filter": "strict_btc_7d_30d" if h == 12 else None,
             "target": "absolute",
             "price_source": "open",
             "execution_lag_bars": 1,
@@ -405,9 +407,8 @@ def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
             "source": f"retrain_pipeline.py auto-emit at {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
             "documented_in": "projects/xsec-alpha/index.html (Executive Summary)",
             "regenerate_with": "python scripts/retrain_pipeline.py",
-            "note": "Auto-updated after a successful promotion. Static fields "
-                    "(hit_2sigma, e_signed_pct, regime_filter) are preserved from "
-                    "the prior file until re-measured by an explicit holdout pass.",
+            "note": "IC and sigma calibration are independently measured on the staged model set.",
+            "model_sha256": (calibration or {}).get("_provenance", {}).get("model_sha256", {}),
         },
     }
     if 6 in per_horizon:
@@ -419,7 +420,9 @@ def _write_holdout_report(per_horizon: dict[int, dict], stamp: str) -> None:
     elif "long_h12" in prior:
         new_doc["long_h12"] = prior["long_h12"]
 
-    out_path.write_text(json.dumps(new_doc, indent=2, ensure_ascii=False))
+    from utils.dashboard_export import _holdout_with_calibration
+    new_doc = _holdout_with_calibration(new_doc, calibration or {})
+    out_path.write_text(json.dumps(new_doc, indent=2, ensure_ascii=False, allow_nan=False))
     log(f"holdout_report.json updated: {sorted(per_horizon.keys())}")
 
 
@@ -465,17 +468,13 @@ def rebuild_calibration() -> bool:
 
 
 def _refresh_dashboard_export() -> None:
-    """Rebuild encrypted dashboard payloads after a successful promotion.
+    """Publish the same public/private dashboard set after successful promotion.
     Non-fatal — must not abort the retrain run.
     """
-    target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data")
-    if not target.parent.exists():
-        log("Dashboard target dir absent; skipping export.")
-        return
     try:
-        from utils.dashboard_export import PIN_DEFAULT, export_to
-        written = export_to(target, PIN_DEFAULT)
-        log(f"Dashboard export refreshed: {len(written)} files")
+        from scripts.fetch_and_rank import publish_dashboard
+        published = publish_dashboard()
+        log(f"Dashboard publication {'confirmed' if published else 'deferred/failed'}")
     except Exception as e:
         log(f"Dashboard export failed (non-fatal): {e}")
 
@@ -494,7 +493,45 @@ def append_history(entry: dict) -> None:
     HISTORY_FILE.write_text(json.dumps(existing, indent=2, default=str))
 
 
+def _stage_and_publish(candidates: dict[int, Path], stamp: str) -> None:
+    """Validation completes before any production artifact is replaced."""
+    from scripts.rebuild_calibration import build_calibration_document, write_calibration
+
+    with tempfile.TemporaryDirectory(prefix="release_", dir=MODELS_DIR,
+                                     ignore_cleanup_errors=True) as directory:
+        stage = Path(directory)
+        model_paths = {}
+        with model_release_guard(root=ROOT):
+            for horizon in (6, 12):
+                source = candidates.get(horizon, MODELS_DIR / f"xsec_{horizon}h.pkl")
+                target = stage / f"xsec_{horizon}h.pkl"
+                shutil.copy2(source, target)
+                model_paths[horizon] = target
+
+        calibration = build_calibration_document(model_paths=model_paths)
+        for key in ("short_6h", "long_12h"):
+            if not calibration.get(key):
+                raise ValueError(f"Staged calibration has no samples: {key}")
+        calibration_path = stage / "calibration_sigma.json"
+        write_calibration(calibration, calibration_path)
+
+        stats = {h: measure_holdout_stats(path, h) for h, path in model_paths.items()}
+        if any(not np.isfinite(s["ic"]) or not s.get("n_periods") for s in stats.values()):
+            raise ValueError("Staged report has no finite IC evidence")
+        report_path = stage / "holdout_report.json"
+        _write_holdout_report(stats, stamp, report_path, calibration)
+        staged = {MODELS_DIR / path.name: path for path in model_paths.values()}
+        staged[ROOT / "output" / calibration_path.name] = calibration_path
+        staged[ROOT / "output" / report_path.name] = report_path
+        publish_release(staged, stamp, root=ROOT)
+
+
 def main():
+    with run_lock("retrain_pipeline", exit_code=os.EX_TEMPFAIL):
+        _main()
+
+
+def _main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="Train + measure, do not promote")
     ap.add_argument("--force", action="store_true", help="Skip promotion gate (dangerous)")
@@ -544,6 +581,7 @@ def main():
         ARCHIVE_DIR.mkdir(exist_ok=True)
         stamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%S")
         results = {}
+        candidates = {}
 
         for horizon in horizons:
             name = f"xsec_{horizon}h"
@@ -595,7 +633,8 @@ def main():
                 "delta": round(delta, 4),
                 "pass_delta": decision["pass_delta"],
                 "pass_floor": decision["pass_floor"],
-                "promoted": promoted,
+                "gate_passed": promoted,
+                "promoted": False,
                 "forced": bool(args.force),
             }
             if horizon == 12:
@@ -641,39 +680,27 @@ def main():
                 candidate_path.unlink(missing_ok=True)
                 continue
 
-            # Archive + promote
-            if prod_path.exists():
-                archive_path = ARCHIVE_DIR / f"{name}_{stamp}.pkl"
-                shutil.move(str(prod_path), str(archive_path))
-                log(f"Archived {name} → {archive_path.name}")
-            shutil.move(str(candidate_path), str(prod_path))
-            log(f"{horizon}h: PROMOTED")
+            candidates[horizon] = candidate_path
+            log(f"{horizon}h: gate passed; waiting for complete release validation")
 
-        # Rebuild calibration if any model promoted
-        any_promoted = any(r.get("promoted") for r in results.values())
+        any_promoted = False
         calib_rebuilt = False
-        if any_promoted and not args.dry_run:
-            calib_rebuilt = rebuild_calibration()
-
-        # Auto-update holdout_report.json from the newly-promoted prod models.
-        # Re-measure stats fresh (with t-stat + n_periods) so the dashboard
-        # reconciliation card reflects the just-promoted weights, not the
-        # frozen 2026-04-25 baseline.
-        if any_promoted and not args.dry_run:
-            per_h: dict[int, dict] = {}
-            for h in (6, 12):
-                prod = MODELS_DIR / f"xsec_{h}h.pkl"
-                if not prod.exists():
-                    continue
-                try:
-                    per_h[h] = measure_holdout_stats(prod, h)
-                except Exception as e:
-                    log(f"holdout stats refresh failed for h={h}: {e}")
-            if per_h:
-                try:
-                    _write_holdout_report(per_h, stamp)
-                except Exception as e:
-                    log(f"holdout_report.json write failed (non-fatal): {e}")
+        release_error = None
+        if candidates and not args.dry_run:
+            try:
+                _stage_and_publish(candidates, stamp)
+            except Exception as exc:
+                release_error = str(exc)
+                log(f"Release failed; production preserved/recovered: {exc}")
+            else:
+                any_promoted = calib_rebuilt = True
+                for horizon, candidate in candidates.items():
+                    results[horizon]["promoted"] = True
+                    try:
+                        candidate.unlink(missing_ok=True)
+                    except OSError as exc:
+                        log(f"Release committed; candidate cleanup failed: {exc}")
+                log("Complete model/calibration/report release published")
 
         # Refresh the public dashboard's encrypted payloads so the new
         # holdout/calibration numbers go live immediately after promotion.
@@ -683,14 +710,17 @@ def main():
         # Log run
         append_history({
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "status": "ok" if any(r.get("promoted") for r in results.values()) else "no_promotion",
+            "status": "release_fail" if release_error else ("ok" if any_promoted else "no_promotion"),
             "results": results,
             "dry_run": args.dry_run,
             "force": args.force,
             "calibration_rebuilt": calib_rebuilt,
+            "release_error": release_error,
         })
 
         log(f"=== retrain_pipeline END  results: {results}  calib_rebuilt={calib_rebuilt} ===")
+        if release_error:
+            raise SystemExit(2)
 
     finally:
         LOCK_FILE.unlink(missing_ok=True)

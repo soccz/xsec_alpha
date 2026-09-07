@@ -222,6 +222,7 @@ def build_calibration_document(
     model_loader: Callable | None = None,
     regime_builder: Callable | None = None,
     generated_at: str | None = None,
+    model_paths: dict[int, Path] | None = None,
 ) -> dict:
     """Build both production calibrations with injectable dependencies for tests."""
     if dataset_builder is None:
@@ -254,8 +255,13 @@ def build_calibration_document(
         ),
     )
     document: dict = {}
+    hashes = {}
 
     for side_key, horizon_h, anchors_utc, model_path, is_long in specs:
+        model_path = Path((model_paths or {}).get(horizon_h, model_path))
+        if model_path.exists():
+            from utils.model_release import artifact_sha256
+            hashes[side_key] = artifact_sha256(model_path)
         dataset = dataset_builder(
             days=DATASET_DAYS,
             holdout_ratio=HOLDOUT_RATIO,
@@ -286,6 +292,7 @@ def build_calibration_document(
         "F1 unified production models; temporal-holdout next-open calibration"
     )
     document["_provenance"] = _provenance()
+    document["_provenance"]["model_sha256"] = hashes
     return document
 
 
@@ -311,8 +318,10 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    document = build_calibration_document()
-    write_calibration(document, args.output)
+    from utils.model_release import model_release_guard
+    with model_release_guard():
+        document = build_calibration_document()
+        write_calibration(document, args.output)
     print(
         "calibration rebuilt: "
         f"short_n={sum(b['n'] for b in document['short_6h'])} "

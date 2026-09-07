@@ -348,6 +348,7 @@ def test_health_prefers_cost_adjusted_net_return(tmp_path, monkeypatch):
             "side": "SHORT",
             "realized_return": 0.01,
             "net_return": -0.002,
+            "actionable": True,
         }
         for _ in range(20)
     ]).to_csv(output / "recommendation_ledger.csv", index=False)

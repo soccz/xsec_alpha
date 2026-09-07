@@ -180,6 +180,7 @@ def _live_meta(df):
 
 def _ledger_summary(df):
     import pandas as pd
+    from utils.dashboard_export import _pick_history, _realized_cohorts
 
     summary = {
         "total_closed": 0,
@@ -195,11 +196,15 @@ def _ledger_summary(df):
         "mean_net_watch_long": None,
         "mean_net_short": None,
         "last_exit_time": None,
+        "decision_cohorts_30d": {},
     }
     if df is None or df.empty:
         return summary
 
     summary["total_closed"] = int(len(df))
+    summary["decision_cohorts_30d"] = _realized_cohorts(
+        _pick_history(df.to_dict(orient="records"), days=30), [30],
+    )
     if "actionable" in df.columns:
         actionable_mask = df["actionable"].apply(_safe_bool)
         summary["actionable_closed"] = int(actionable_mask.sum())
@@ -294,6 +299,16 @@ def api_ledger():
     })
 
 
+@app.route("/api/experiment")
+def api_experiment():
+    from utils.prospective import experiment_summary
+    try:
+        return _json_response(experiment_summary())
+    except Exception:
+        app.logger.exception("Prospective experiment unavailable")
+        return _json_response({"status": "error"}, 503)
+
+
 @app.route("/api/status")
 def api_status():
     db_ts = get_latest_db_timestamp()
@@ -349,9 +364,9 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   h1 { color: #58a6ff; margin-bottom: 4px; font-size: 1.4em; }
   .subtitle { color: #8b949e; font-size: 0.85em; margin-bottom: 20px; }
   .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 20px; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
+  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; min-width: 0; overflow-x: auto; }
   .card h2 { color: #58a6ff; font-size: 1em; margin-bottom: 10px; border-bottom: 1px solid #21262d; padding-bottom: 6px; }
-  .stat { display: flex; justify-content: space-between; padding: 4px 0; font-size: 0.9em; }
+  .stat { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; padding: 4px 0; font-size: 0.9em; }
   .stat .label { color: #8b949e; }
   .stat .value { color: #f0f6fc; font-weight: 600; }
   .long { color: #3fb950; }
@@ -367,6 +382,11 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .badge-watch { background: #2d2200; color: #d29922; }
   .full-width { grid-column: 1 / -1; }
   .refresh-note { text-align: center; color: #484f58; font-size: 0.75em; margin-top: 12px; }
+  @media (max-width: 700px) {
+    body { padding: 12px; }
+    .grid { grid-template-columns: minmax(0, 1fr); }
+    .stat .value { overflow-wrap: anywhere; }
+  }
 </style>
 </head>
 <body>
@@ -528,6 +548,7 @@ def _render_ledger_block(summary):
         return f"{v:+.2%}"
 
     html = [
+        '<div class="stat"><span class="label">Return Basis</span><span class="value">Paper / Upbit proxy</span></div>',
         f'<div class="stat"><span class="label">Closed Positions</span><span class="value">{summary["total_closed"]}</span></div>',
         f'<div class="stat"><span class="label">Actionable Closed</span><span class="value">{summary["actionable_closed"]}</span></div>',
         f'<div class="stat"><span class="label">Watch Long Closed</span><span class="value">{summary["watch_long_closed"]}</span></div>',
@@ -541,6 +562,14 @@ def _render_ledger_block(summary):
         f'<div class="stat"><span class="label">Mean Net Short</span><span class="value">{_pct(summary["mean_net_short"])}</span></div>',
         f'<div class="stat"><span class="label">Last Exit</span><span class="value">{summary["last_exit_time"] or "N/A"}</span></div>',
     ]
+    for cohort, label in (("actionable", "Recommendations"), ("watch", "Observations")):
+        stats = summary.get("decision_cohorts_30d", {}).get(cohort, {}).get("SHORT", {}).get("d30", {})
+        net = stats.get("avg_net_per_window")
+        value = f"{net:+.2f}%" if net is not None else "N/A"
+        html.append(
+            f'<div class="stat"><span class="label">30d SHORT {label}</span>'
+            f'<span class="value">{value} ({stats.get("n_windows", 0)} baskets)</span></div>'
+        )
     return "".join(html)
 
 

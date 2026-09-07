@@ -1,0 +1,13 @@
+[Unit]
+Description=xsec_alpha retry newest pending Telegram report
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=soccz
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+EnvironmentFile=/mnt/20t/main/gan_t/.env
+ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/retry_telegram.py
+TimeoutStartSec=120
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/logs/telegram-retry.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/logs/telegram-retry.log

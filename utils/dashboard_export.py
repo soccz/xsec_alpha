@@ -27,6 +27,7 @@ from typing import Any, Iterable
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
+from utils.model_release import model_release_guard
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "output"
@@ -267,7 +268,7 @@ def _pick_history(ledger: list[dict], days: int) -> list[dict]:
         out.append({
             "market": r.get("market"),
             "side": r.get("side"),
-            "actionable": str(r.get("actionable", "")).lower() == "true",
+            "actionable": _actionable_state(r.get("actionable")),
             "entry_time": ts,
             "exit_time": r.get("exit_time_actual") or r.get("exit_time_target"),
             "horizon_h": _to_int(r.get("horizon_h")),
@@ -279,6 +280,48 @@ def _pick_history(ledger: list[dict], days: int) -> list[dict]:
         })
     out.sort(key=lambda x: x["entry_time"], reverse=True)
     return out
+
+
+def _actionable_state(value) -> bool | None:
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "1"}:
+        return True
+    if normalized in {"false", "0"}:
+        return False
+    return None
+
+
+def _decision_histories(history: list[dict]) -> dict[str, list[dict]]:
+    return {
+        "all": history,
+        "actionable": [r for r in history if _actionable_state(r.get("actionable")) is True],
+        "watch": [r for r in history if _actionable_state(r.get("actionable")) is False],
+        "unknown": [r for r in history if _actionable_state(r.get("actionable")) is None],
+    }
+
+
+def _realized_cohorts(history: list[dict], windows: list[int]) -> dict:
+    return {
+        cohort: {side: _realized_stats(rows, side, windows) for side in ("SHORT", "WATCH_LONG")}
+        for cohort, rows in _decision_histories(history).items()
+    }
+
+
+def _holdout_with_calibration(holdout: dict, calib: dict) -> dict:
+    """Keep ranking IC separate from explicitly dated sigma-bucket estimates."""
+    result = dict(holdout)
+    for report_key, calibration_key in (("short_h6", "short_6h"), ("long_h12", "long_12h")):
+        if report_key not in result:
+            continue
+        row = dict(result[report_key])
+        top = next((b for b in calib.get(calibration_key, []) if b.get("sigma_low") == 2), None)
+        row["hit_2sigma"] = top.get("hit_rate") if top else None
+        row["e_signed_pct"] = top.get("mean_signed_return_pct") if top else None
+        row["sigma_sample_n"] = top.get("n") if top else 0
+        row["sigma_asof"] = calib.get("generated_at")
+        row["sigma_basis"] = "horizon sigma bucket, both predicted directions; not selected-pick performance"
+        result[report_key] = row
+    return result
 
 
 # Cost assumptions (round-trip, per pick) — disclosed so reviewers can audit
@@ -386,6 +429,7 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
         if n == 0:
             out[f"d{d}"] = {
                 "n": 0, "n_windows": 0, "avg": None, "avg_net": None, "win_pct": None,
+                "avg_net_per_window": None,
                 "gross_win_pct": None, "net_win_pct": None,
                 "win_ci_lo": None, "win_ci_hi": None,
                 "gross_win_ci_lo": None, "gross_win_ci_hi": None,
@@ -418,6 +462,10 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
         net_sharpe = (mean_net / net_std) if (net_std and net_std > 0) else None
         gross_n_windows, gross_tstat_clustered = _clustered_t(gross_picks)
         n_windows, net_tstat_clustered = _clustered_t(net_picks)
+        by_window = {}
+        for ts, value in net_picks:
+            by_window.setdefault(ts, []).append(value)
+        window_means = [sum(values) / len(values) for values in by_window.values()]
         gross_ci_lo, gross_ci_hi = _wilson_ci(gross_wins, n)
         net_ci_lo, net_ci_hi = _wilson_ci(net_wins, n)
         out[f"d{d}"] = {
@@ -425,6 +473,7 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
             "n_windows": n_windows,
             "avg": round(mean, 4),
             "avg_net": round(mean_net, 4),
+            "avg_net_per_window": round(sum(window_means) / len(window_means), 4),
             # Primary inference/hit fields are net of configured costs. Gross
             # counterparts stay explicit for backward-compatible analysis.
             "win_pct": round(100 * net_wins / n, 1),
@@ -594,6 +643,7 @@ def _long_policy_state(gates: dict | None = None) -> dict:
     }
 
 
+@model_release_guard()
 def build_summary_payload() -> dict:
     gate = _safe_load_json(OUTPUT_DIR / "gate_state.json") or {}
     drift = _safe_load_json(OUTPUT_DIR / "drift_state.json") or {}
@@ -609,7 +659,16 @@ def build_summary_payload() -> dict:
     ledger = _read_csv(OUTPUT_DIR / "recommendation_ledger.csv")
     history = _pick_history(ledger, days=60)
 
-    holdout = _safe_load_json(OUTPUT_DIR / "holdout_report.json") or {}
+    holdout = _holdout_with_calibration(
+        _safe_load_json(OUTPUT_DIR / "holdout_report.json") or {}, calib,
+    )
+    cohorts = _realized_cohorts(history, [30])
+    operator_report = _safe_load_json(OUTPUT_DIR / "latest_operator_report.json") or {}
+    try:
+        from utils.prospective import experiment_summary
+        prospective = experiment_summary(root=OUTPUT_DIR.parent)
+    except Exception:
+        prospective = {"status": "error"}
 
     return {
         "asof": _now_utc_iso(),
@@ -631,9 +690,16 @@ def build_summary_payload() -> dict:
             },
         },
         "realized_summary": {
-            "SHORT": _realized_stats(history, "SHORT", [30]),
-            "WATCH_LONG": _realized_stats(history, "WATCH_LONG", [30]),
+            "SHORT": cohorts["actionable"]["SHORT"],
+            "WATCH_LONG": cohorts["watch"]["WATCH_LONG"],
         },
+        "realized_cohorts": cohorts,
+        "realized_basis": "SHORT actionable only; WATCH_LONG observation only; paper/proxy returns",
+        "prospective_experiment": prospective,
+        "experiment_supervision": _safe_load_json(OUTPUT_DIR / "experiment_supervision/status.json"),
+        "operator_report": {key: operator_report.get(key) for key in (
+            "run_id", "generated_at", "data_asof", "status", "reason", "signals", "ideas", "telegram",
+        )} if operator_report else None,
         "drift": _drift_rows(drift),
         "drift_generated_at": drift.get("generated_at"),
         "latest_picks": _picks_from_latest(latest),
@@ -991,47 +1057,55 @@ def _calibration_reliability(calib: dict) -> dict:
     return out
 
 
+@model_release_guard()
 def build_accuracy_payload(history_days: int = 60) -> dict:
     ledger = _read_csv(OUTPUT_DIR / "recommendation_ledger.csv")
     history = _pick_history(ledger, history_days)
     calib = _safe_load_json(OUTPUT_DIR / "calibration_sigma.json") or {}
+    histories = _decision_histories(history)
+    cohorts = _realized_cohorts(history, [7, 14, 30])
+    # Existing SHORT charts follow the same actionable cohort as the headline.
+    chart_history = histories["actionable"] + [
+        r for r in histories["watch"] if (r.get("side") or "").upper() == "WATCH_LONG"
+    ]
 
     return {
         "asof": _now_utc_iso(),
         "window_days": history_days,
         "realized": {
-            "SHORT": _realized_stats(history, "SHORT", [7, 14, 30]),
-            "WATCH_LONG": _realized_stats(history, "WATCH_LONG", [7, 14, 30]),
+            "SHORT": cohorts["actionable"]["SHORT"],
+            "WATCH_LONG": cohorts["watch"]["WATCH_LONG"],
         },
+        "realized_cohorts": cohorts,
         "calibration_buckets": calib,
         # New (2026-05-08): per-side daily pnl/dd series + return distribution
         # for cumulative PnL chart, daily heatmap, and return histogram.
         "daily_series": {
-            "SHORT": _daily_pnl_series(history, "SHORT"),
-            "WATCH_LONG": _daily_pnl_series(history, "WATCH_LONG"),
+            "SHORT": _daily_pnl_series(chart_history, "SHORT"),
+            "WATCH_LONG": _daily_pnl_series(chart_history, "WATCH_LONG"),
         },
         "return_distribution": {
-            "SHORT": _return_distribution(history, "SHORT"),
-            "WATCH_LONG": _return_distribution(history, "WATCH_LONG"),
+            "SHORT": _return_distribution(chart_history, "SHORT"),
+            "WATCH_LONG": _return_distribution(chart_history, "WATCH_LONG"),
         },
         "best_worst": {
-            "SHORT": _best_worst(history, "SHORT", k=5),
-            "WATCH_LONG": _best_worst(history, "WATCH_LONG", k=5),
+            "SHORT": _best_worst(chart_history, "SHORT", k=5),
+            "WATCH_LONG": _best_worst(chart_history, "WATCH_LONG", k=5),
         },
         "monthly_returns": {
-            "SHORT": _monthly_returns(history, "SHORT"),
-            "WATCH_LONG": _monthly_returns(history, "WATCH_LONG"),
+            "SHORT": _monthly_returns(chart_history, "SHORT"),
+            "WATCH_LONG": _monthly_returns(chart_history, "WATCH_LONG"),
         },
         "rolling_stats": {
-            "SHORT": _rolling_stats(history, "SHORT", window=7),
-            "WATCH_LONG": _rolling_stats(history, "WATCH_LONG", window=7),
+            "SHORT": _rolling_stats(chart_history, "SHORT", window=7),
+            "WATCH_LONG": _rolling_stats(chart_history, "WATCH_LONG", window=7),
         },
         "calibration_reliability": _calibration_reliability(calib),
         # New (2026-05-25): live shadow comparison between current operational
         # strategy (SHORT-only) and the candidate long_short5 from
         # portfolio_experiment.py. Computed from the SAME ledger — no new
         # paper trades, just a different aggregation rule.
-        "shadow_strategy_compare": _shadow_strategy_comparison(history),
+        "shadow_strategy_compare": _shadow_strategy_comparison(chart_history),
         "n_total": len(history),
     }
 
@@ -1076,6 +1150,8 @@ def build_public_summary_payload() -> dict:
             "win_pct_basis": "net_return",
             "gross_pct": d30.get("avg"),
             "net_pct": d30.get("avg_net"),
+            "net_per_basket_pct": d30.get("avg_net_per_window"),
+            "n_baskets": d30.get("n_windows"),
             "cost_pct": d30.get("cost_pct"),
             "tstat_clustered": d30.get("tstat_clustered"),
             "sharpe": d30.get("sharpe"),
@@ -1107,6 +1183,7 @@ def build_public_summary_payload() -> dict:
             "SHORT": _side("SHORT"),
             "WATCH_LONG": _side("WATCH_LONG"),
         },
+        "realized_basis": summary.get("realized_basis"),
         "model_age_days": summary.get("model_age_days") or {},
         "cost_assumptions": summary.get("cost_assumptions") or {},
         "long_policy": summary.get("long_policy") or {},
@@ -1114,6 +1191,7 @@ def build_public_summary_payload() -> dict:
     }
 
 
+@model_release_guard()
 def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
               history_days: int = 60, ic_days: int = 60,
               public_target: Path | None = None) -> dict[str, Path]:

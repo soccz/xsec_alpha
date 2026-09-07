@@ -31,6 +31,7 @@ import pandas as pd
 from scipy.stats import spearmanr
 
 from utils.run_lock import stable_data_read_lock
+from utils.model_release import model_release_guard
 
 ROOT = Path(__file__).resolve().parent.parent
 HISTORY_FILE = ROOT / "output" / "wf_history.json"
@@ -448,6 +449,7 @@ def main():
         _main_locked()
 
 
+@model_release_guard()
 def _main_locked():
     ap = argparse.ArgumentParser()
     ap.add_argument("--measure-only", action="store_true", help="Evaluate current models (default)")
