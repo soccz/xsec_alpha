@@ -73,6 +73,10 @@ Telegram API의 `sent` 및 수신 확인 시각이 있을 때만 연결 확인�
 6. 같은 가격·비용에서 모델 5개와 운영 선택 5개의 차이를 표시한다. 비실행 WATCH의
    가상 성적을 실제 거래 성과로 바꾸지 않으며, actionable 0건을 성공한 거래로 세지 않는다.
 
+후속 [선정 경로·금액별 호가 잔량·확정 펀딩 이력](execution_diagnostics.md)은 별도 진단
+규약으로 추가했다. 이 문서의 기존 고정 비용 성적표는 바꾸지 않으며, 공개 펀딩 정산율을
+수집하더라도 실제 계좌의 펀딩 현금흐름으로 간주하지 않는다.
+
 공식 필드·엔드포인트: [Bitget Classic Contract Market, Get All Tickers](https://www.bitget.com/docs/catalog/classic-contract-market/classic-contract-market).
 읽기 전용 `GET /api/v2/mix/market/tickers?productType=USDT-FUTURES`만 사용하며 주문·인증키는 없다.
 관찰 창과 신선도·비용은 이 프로젝트의 명시적 가정이며 업계에서 검증된 최적값이 아니다.

@@ -19,7 +19,7 @@ from utils.model_release import artifact_sha256
 from utils.run_lock import run_lock
 
 ROOT = trial.ROOT
-TABLES = ("signals", "outcomes", "comparisons", "deliveries", "venue_intents", "quotes", "venue_outcomes", "ingestion_events")
+TABLES = ("signals", "outcomes", "comparisons", "deliveries", "venue_intents", "quotes", "venue_outcomes", "ingestion_events", "execution_details")
 LEGACY_CONTRACT = "absolute_open_lag1_anchors_v1"
 
 
@@ -128,7 +128,8 @@ def _append(conn, table, key, body):
     if table not in TABLES:
         raise ValueError("Unknown audit table")
     if not conn.execute(f"SELECT 1 FROM {table} WHERE key=?", (key,)).fetchone():
-        sources = (Path(__file__), Path(__file__).with_name("venue_observer.py"), Path(trial.__file__))
+        sources = (Path(__file__), Path(__file__).with_name("venue_observer.py"), Path(trial.__file__),
+                   Path(__file__).with_name("execution_audit.py"), Path(__file__).with_name("selection_trace.py"))
         document = {**body, "_writer": {
             "sources": {p.name: artifact_sha256(p) for p in sources},
             "packages": {name: version(name) for name in ("numpy", "pandas", "scipy")},
@@ -287,7 +288,7 @@ def _read(conn):
     tables = {}
     for table in TABLES:
         records = {}
-        if table == "ingestion_events" and not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+        if table in ("ingestion_events", "execution_details") and not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
             tables[table] = records
             continue
         for key, raw, digest in conn.execute(f"SELECT key,payload,sha256 FROM {table} ORDER BY key"):
@@ -357,8 +358,14 @@ def _read(conn):
         if (_delivery(result["report"], slot, witness_sha, result["observed_at"]) != result
                 or key != slot + "/" + trial._digest(result["report"])):
             raise ValueError("Delivery binding mismatch")
+        trace = result["report"].get("selection_trace")
+        if trace and trace["status"] == "recorded":
+            from utils.selection_trace import verify_selection_trace
+            verify_selection_trace(trace, result["report"], source.get("witness") if result["linked"] else None)
     from utils.venue_observer import verify_venue
     verify_venue(tables, policy)
+    from utils.execution_audit import verify_execution
+    verify_execution(tables, policy)
     return policy, tables
 
 
@@ -489,6 +496,10 @@ def _report_delivery(path, tables, current):
     if trial._utc(report["generated_at"]) > current or (ack and trial._utc(ack) > current):
         return None
     digest = trial._digest(source["witness"]) if source.get("witness") else None
+    trace = report.get("selection_trace")
+    if trace and trace["status"] == "recorded":
+        from utils.selection_trace import verify_selection_trace
+        verify_selection_trace(trace, report, source.get("witness") if report.get("score_evidence_sha256") == digest else None)
     return _delivery(report, slot, digest, current)
 
 
@@ -504,7 +515,7 @@ def _advance_deliveries(conn, tables, root, current):
             _append(conn, "deliveries", result["signal_at"] + "/" + trial._digest(result["report"]), result)
 
 
-def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None):
+def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None, execution_loader=None):
     root, current = Path(root), trial._utc(now)
     folder = _folder(root)
     if not (folder / "ledger.sqlite").exists():
@@ -571,8 +582,14 @@ def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None):
                 from utils.venue_observer import advance_venue, venue_summary
                 advance_venue(conn, tables, policy, root, now=now, quote_loader=quote_loader)
                 policy, tables = _read(conn)
+                from utils.execution_audit import advance_execution, execution_summary
+                from utils.selection_trace import selection_summary
+                advance_execution(conn, tables, policy, now=now, loader=execution_loader)
+                policy, tables = _read(conn)
                 state = _summary(policy, tables, trial._utc(now), pending, current_comparisons)
                 state["venue"] = venue_summary(tables)
+                state["execution"] = execution_summary(tables)
+                state["selection"] = selection_summary(tables)
             _write(folder / "summary.json", state)
             return state
     except (Exception, SystemExit) as exc:

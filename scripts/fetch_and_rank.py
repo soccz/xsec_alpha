@@ -1180,6 +1180,7 @@ def _run(args):
     saved_recommendations_df = pd.DataFrame()
     long_watch_alerts_df = pd.DataFrame()
     if not args.dry_run:
+        selection_quality = short_predictions_df.copy(deep=True) if short_predictions_df is not None else None
         saved_recommendations_df = _save_recommendations(
             latest_ts,
             longs,
@@ -1278,6 +1279,9 @@ def _run(args):
                 "tradable_symbols": {m: symbol for m in score.index
                                      if (symbol := market_to_bitget_symbol(m, contract_map or {}))},
             }
+            from utils.selection_trace import attach_selection_trace
+            attach_selection_trace(report, score, selection_scores, shorts, prev_shorts, prev_longs,
+                                   short_n, long_n, rebal_buffer, selection_quality)
             sent = publish_report(report, send=not args.no_telegram, realized_summary=realized_summary)
             if sent:
                 logger.info("Telegram coin proposal report acknowledged")

@@ -50,6 +50,14 @@ def operational_checks(root=ROOT, now=None, secondary=None):
                        audit.get("venue", {}).get("status") == "observing"))
         checks.append(("FORECAST_BACKUP", state, "checked_at", 30,
                        (state.get("forecast_backup") or {}).get("restore_verified") is True))
+        if audit.get("execution"):
+            checks.append(("EXECUTION_DIAGNOSTICS", audit, "checked_at", 30,
+                           audit["execution"].get("status") == "observing"))
+        if audit.get("selection", {}).get("status") == "recorded":
+            checks.append(("SELECTION_TRACE", audit, "checked_at", 30,
+                           audit["selection"].get("replay_matches") is True and audit["selection"].get("report_matches") is True))
+        elif audit.get("selection", {}).get("status") == "error":
+            checks.append(("SELECTION_TRACE", audit, "checked_at", 30, False))
     for name, doc, key, max_minutes, good in checks:
         try:
             age = (now - datetime.fromisoformat(doc[key])).total_seconds() / 60
