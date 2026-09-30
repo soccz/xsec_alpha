@@ -698,6 +698,7 @@ def build_summary_payload() -> dict:
         "prospective_experiment": prospective,
         "experiment_supervision": _safe_load_json(OUTPUT_DIR / "experiment_supervision/status.json"),
         "regime_observation": _safe_load_json(OUTPUT_DIR / "regime_observation/summary.json"),
+        "trial_diagnostics": _safe_load_json(OUTPUT_DIR / "trial_diagnostics/summary.json"),
         "operator_report": {key: operator_report.get(key) for key in (
             "run_id", "generated_at", "data_asof", "status", "reason", "signals", "ideas", "telegram",
         )} if operator_report else None,

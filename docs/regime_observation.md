@@ -66,6 +66,14 @@ Those are proposals, not tuned or proven rules. The present observer supplies
 timely evidence for choosing such a follow-up; it does not establish causality,
 forecast future regimes or turn explanation into an accuracy claim.
 
+September 30 follow-up: [completed-trial diagnostics](completed_trial_analysis.md)
+now quantify tail/influence risk, unbalanced retrospective regimes and fixed-model
+power scenarios. [The rotation candidate](rotation_followup.md) has pure decision
+functions and leakage/cooldown/cost tests. Its 84-day feasibility pilot is designed,
+not registered or running; existing observation data is not silently relabeled as
+an adaptive-policy trial. The fixed-model power calculation cannot establish power
+for a different adaptive-minus-unchanged endpoint.
+
 ## Operations Recovery
 
 The completed original trial was sealed before changing its registered runtime.
