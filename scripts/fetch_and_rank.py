@@ -117,41 +117,8 @@ def main():
 
 
 def publish_dashboard(push=True):
-    try:
-        with run_lock("dashboard_publish", timeout_sec=90, exit_code=75):
-            if not _refresh_dashboard_export():
-                return False
-            return _push_dashboard_to_github() if push else True
-    except SystemExit:
-        logger.warning("Dashboard publication deferred: another publisher is active")
-        return False
-
-
-def _refresh_dashboard_export() -> bool:
-    """Rebuild dashboard payloads.
-
-      - encrypted: summary/history/accuracy.json under dashboard/data/
-        (PIN-gated; picks, ledger detail, drift IC stay private)
-      - public:    public_summary.json under projects/xsec-alpha/
-        (aggregates only; safe to ship plaintext for narrative HTML auto-fetch)
-
-    Skipped silently if the target directory is missing (host doesn't host
-    the public site).
-    """
-    from pathlib import Path
-    encrypted_target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/dashboard/data")
-    public_target = Path("/home/soccz/22tb/soccz.github.io/projects/xsec-alpha/public_summary.json")
-    if not encrypted_target.parent.exists():
-        logger.info("Dashboard target dir absent; skipping export.")
-        return False
-    try:
-        from utils.dashboard_export import PIN_DEFAULT, export_to
-        written = export_to(encrypted_target, PIN_DEFAULT, public_target=public_target)
-        logger.info(f"Dashboard export refreshed: {len(written)} files (incl. public_summary)")
-        return True
-    except Exception as e:
-        logger.warning(f"Dashboard export failed (non-fatal): {e}")
-        return False
+    from utils.dashboard_publish import publish_dashboard as isolated_publish
+    return isolated_publish(push=push)
 
 
 _KIMCHI_NAN_EXPECTED_PCT = 33.0  # ~25% Binance-unmatched coins + 24h warmup
@@ -198,76 +165,6 @@ def _write_feature_health(factor_df) -> None:
         }
     out = Path(__file__).resolve().parent.parent / "output" / "feature_health.json"
     out.write_text(json.dumps(payload, indent=2))
-
-
-def _push_dashboard_to_github(repo: Path | None = None) -> bool:
-    """Commit+push refreshed dashboard payloads to soccz.github.io.
-
-    Only the four generated payload files may be committed. Unrelated staged
-    edits and dirty worktrees are never swept into a commit or auto-stashed.
-    """
-    import subprocess
-    from pathlib import Path
-
-    repo = Path(repo) if repo is not None else Path("/home/soccz/22tb/soccz.github.io")
-    data_subpath = "projects/xsec-alpha/dashboard/data"
-    public_subpath = "projects/xsec-alpha/public_summary.json"
-    if not (repo / data_subpath).exists():
-        logger.info("Dashboard repo absent or data dir missing; skipping push.")
-        return False
-
-    paths = [f"{data_subpath}/{name}.json" for name in ("summary", "history", "accuracy")]
-    paths.append(public_subpath)
-
-    def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess:
-        return subprocess.run(cmd, cwd=repo, capture_output=True, text=True,
-                              check=check, timeout=60)
-
-    try:
-        if run(["git", "branch", "--show-current"]).stdout.strip() != "main":
-            logger.warning("Dashboard push skipped: expected main branch")
-            return False
-        staged = run(["git", "diff", "--cached", "--name-only"]).stdout.splitlines()
-        if any(path not in paths for path in staged):
-            logger.warning("Dashboard push skipped: unrelated staged edits present")
-            return False
-        # 1. Stage encrypted dashboard data + the public summary sibling.
-        # Scope is narrow — never sweep up unrelated edits in the repo.
-        paths = [path for path in paths if (repo / path).exists()]
-        run(["git", "add", "--", *paths])
-
-        # 2. Skip if no real change (bytes-identical export).
-        diff = run(["git", "diff", "--cached", "--quiet", "--", *paths], check=False)
-        if diff.returncode not in (0, 1):
-            raise RuntimeError("Could not inspect staged dashboard payloads")
-
-        # 3. Commit, then rebase onto remote, then push. Rebase BEFORE push
-        # to absorb concurrent unrelated commits.
-        from datetime import datetime, timezone
-        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
-        if diff.returncode == 1:
-            run(["git", "commit", "--only", "-m", f"xsec-alpha: dashboard auto-refresh {ts}", "--", *paths])
-        run(["git", "fetch", "origin", "main"])
-        upstream_is_ancestor = run(["git", "merge-base", "--is-ancestor", "origin/main", "HEAD"], check=False)
-        if upstream_is_ancestor.returncode == 1:
-            if run(["git", "status", "--porcelain"]).stdout.strip():
-                logger.warning("Dashboard push deferred: remote advanced and worktree has edits")
-                return False
-            try:
-                run(["git", "rebase", "origin/main"])
-            except subprocess.CalledProcessError:
-                run(["git", "rebase", "--abort"], check=False)
-                raise
-        elif upstream_is_ancestor.returncode != 0:
-            raise RuntimeError("Could not verify dashboard remote ancestry")
-        run(["git", "push", "origin", "HEAD:main"])
-        logger.info(f"Dashboard pushed: xsec-alpha/dashboard/data/ @ {ts}")
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.warning(f"Dashboard push failed (non-fatal): {e.stderr.strip() if e.stderr else e}")
-    except Exception as e:
-        logger.warning(f"Dashboard push failed (non-fatal): {e}")
-    return False
 
 
 def _compute_score(latest_factors: "pd.DataFrame", args) -> "pd.Series":
@@ -1373,6 +1270,19 @@ def _run(args):
             logger.warning(f"Operator report failed: {e}")
 
         # Shadow recording follows Telegram; it cannot delay or change live picks.
+        try:
+            from utils.regime_observer import load_btc_history, record_observation, refresh_observation
+            observed_markets = tradable_score_sorted.index
+            result = record_observation(
+                latest_ts, load_btc_history(latest_ts), score.reindex(observed_markets),
+                latest_factors_raw["reversal_4h"].reindex(observed_markets),
+                score.attrs.get("model_sha256"),
+            )
+            refresh_observation()
+            logger.info("Regime observation: %s", result)
+        except Exception:
+            logger.exception("Regime observation failed; live recommendations unchanged")
+
         try:
             from utils.prospective import record_snapshot
 

@@ -159,8 +159,39 @@ def test_failed_publish_retries_next_pass(registered, tmp_path):
         calls.append(True)
         return len(calls) > 1
     for now in ("2026-09-07T04:10Z", "2026-09-07T04:20Z"):
-        monitor.supervise(root, tmp_path / "secondary", now=now, publisher=publish, require_separate=False)
+        state = monitor.supervise(root, tmp_path / "secondary", now=now, publisher=publish, require_separate=False)
+        if len(calls) == 1:
+            assert state["status"] == "attention"
+            assert "publisher returned False" in state["errors"][-1]
     assert len(calls) == 2
+    assert not state["errors"]
+
+
+def test_completed_archive_survives_live_code_changes_but_not_evidence_changes(registered, tmp_path):
+    root, plan = registered
+    monitor.supervise(root, tmp_path / "secondary", now=plan["hard_review_at"], require_separate=False)
+    final = (root / "output/experiment_supervision/final_review.json").read_bytes()
+    sealed = monitor.seal_completed(root)
+    (root / "scripts/fetch_and_rank.py").write_text("new operational publisher\n")
+    summary = monitor.review_summary(root)
+    assert summary["runtime_matches"] and not summary["live_runtime_matches"]
+    assert summary["integrity_basis"] == "sealed_completed_archive"
+    assert monitor.seal_completed(root) == sealed
+    state = monitor.supervise(root, tmp_path / "secondary", now=plan["hard_review_at"], require_separate=False)
+    assert not state["errors"]
+    assert (root / "output/experiment_supervision/final_review.json").read_bytes() == final
+    assert monitor.verify_checkpoint(state["backup"]["secondary"])
+    (root / "output/prospective/model.pkl").write_bytes(b"changed")
+    with pytest.raises(ValueError, match="Completed evidence changed"):
+        monitor.review_summary(root)
+
+
+def test_cannot_seal_after_frozen_code_has_changed(registered, tmp_path):
+    root, plan = registered
+    monitor.supervise(root, tmp_path / "secondary", now=plan["hard_review_at"], require_separate=False)
+    (root / "scripts/fetch_and_rank.py").write_text("already changed\n")
+    with pytest.raises(ValueError, match="Cannot seal"):
+        monitor.seal_completed(root)
 
 
 def test_missed_first_run_and_terminal_report_are_automatic_and_immutable(registered, tmp_path):

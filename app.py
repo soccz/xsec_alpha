@@ -301,9 +301,9 @@ def api_ledger():
 
 @app.route("/api/experiment")
 def api_experiment():
-    from utils.prospective import experiment_summary
+    from utils.experiment_supervisor import review_summary
     try:
-        return _json_response(experiment_summary())
+        return _json_response(review_summary())
     except Exception:
         app.logger.exception("Prospective experiment unavailable")
         return _json_response({"status": "error"}, 503)

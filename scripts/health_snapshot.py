@@ -84,6 +84,11 @@ def section_operational():
             worst = "FAIL"
         elif status == "WARN" and worst != "FAIL":
             worst = "WARN"
+    from utils.ops_status import operational_checks
+    extra = operational_checks(ROOT)
+    rows.extend(extra)
+    if any(row["status"] == "FAIL" for row in extra):
+        worst = "FAIL"
     return worst, rows
 
 

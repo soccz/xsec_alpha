@@ -665,8 +665,8 @@ def build_summary_payload() -> dict:
     cohorts = _realized_cohorts(history, [30])
     operator_report = _safe_load_json(OUTPUT_DIR / "latest_operator_report.json") or {}
     try:
-        from utils.prospective import experiment_summary
-        prospective = experiment_summary(root=OUTPUT_DIR.parent)
+        from utils.experiment_supervisor import review_summary
+        prospective = review_summary(root=OUTPUT_DIR.parent)
     except Exception:
         prospective = {"status": "error"}
 
@@ -697,6 +697,7 @@ def build_summary_payload() -> dict:
         "realized_basis": "SHORT actionable only; WATCH_LONG observation only; paper/proxy returns",
         "prospective_experiment": prospective,
         "experiment_supervision": _safe_load_json(OUTPUT_DIR / "experiment_supervision/status.json"),
+        "regime_observation": _safe_load_json(OUTPUT_DIR / "regime_observation/summary.json"),
         "operator_report": {key: operator_report.get(key) for key in (
             "run_id", "generated_at", "data_asof", "status", "reason", "signals", "ideas", "telegram",
         )} if operator_report else None,

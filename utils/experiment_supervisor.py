@@ -235,9 +235,63 @@ def verify_checkpoint(path):
     return manifest
 
 
-def backup_checkpoint(root=ROOT, secondary=SECONDARY, require_separate=True):
-    """SQLite online backup plus immutable model/code copies on two filesystems."""
-    root, secondary = Path(root), Path(secondary)
+def _sealed_archive(root):
+    """Validate the completed experiment independently of later live-code edits."""
+    root = Path(root)
+    seal = _verified_document(_folder(root) / "completed_archive.json")
+    archive = root / "output/prospective_backups" / seal["checkpoint"]
+    archive.resolve().relative_to((root / "output/prospective_backups").resolve())
+    manifest = verify_checkpoint(archive)
+    if trial._digest(manifest) != seal["checkpoint"]:
+        raise ValueError("Completed archive identity mismatch")
+    if trial._digest(_read_ledger(root / "output/prospective/ledger.sqlite")) != seal["ledger_sha256"]:
+        raise ValueError("Completed ledger changed after sealing")
+    for name in ("output/prospective/model.pkl", "output/experiment_supervision/final_review.json",
+                 "output/experiment_supervision/review_plan.json"):
+        if artifact_sha256(root / name) != manifest["files"][name]:
+            raise ValueError(f"Completed evidence changed: {name}")
+    return seal, archive
+
+
+def review_summary(root=ROOT):
+    if not (_folder(root) / "completed_archive.json").exists():
+        return trial.experiment_summary(root)
+    seal, _ = _sealed_archive(root)
+    summary = seal["summary"]
+    summary["integrity_basis"] = "sealed_completed_archive"
+    summary["live_runtime_matches"] = summary["protocol"]["runtime"] == trial._runtime_contract(root)
+    return summary
+
+
+def seal_completed(root=ROOT):
+    """Seal once, before changing registered source; never rewrite the final verdict."""
+    root = Path(root)
+    with run_lock("experiment_supervisor", lock_dir=str(root / "logs/locks")):
+        path = _folder(root) / "completed_archive.json"
+        if path.exists():
+            return _sealed_archive(root)[0]
+        final = _verified_document(_folder(root) / "final_review.json")
+        summary = trial.experiment_summary(root)
+        if not (final["decision"]["terminal"] and summary["runtime_matches"] and summary["frozen_model_matches"]):
+            raise ValueError("Cannot seal an unfinished or changed experiment")
+        target, manifest = _primary_checkpoint(root)
+        plan = _verified_document(_folder(root) / "review_plan.json")
+        if (final["review_plan_sha256"] != trial._digest(plan)
+                or plan["protocol_sha256"] != manifest["protocol_sha256"]):
+            raise ValueError("Final review protocol mismatch")
+        document = {"sealed_at": trial._utc().isoformat(), "checkpoint": target.name,
+                    "ledger_sha256": trial._digest(_read_ledger(root / "output/prospective/ledger.sqlite")),
+                    "summary": summary}
+        _write(path, _envelope(document), immutable=True)
+        _sealed_archive(root)
+        return document
+
+
+def _primary_checkpoint(root):
+    root = Path(root)
+    if (_folder(root) / "completed_archive.json").exists():
+        _, target = _sealed_archive(root)
+        return target, verify_checkpoint(target)
     source_dir = root / "output/prospective"
     plan_path = _folder(root) / "review_plan.json"
     plan = _verified_document(plan_path)
@@ -285,9 +339,17 @@ def backup_checkpoint(root=ROOT, secondary=SECONDARY, require_separate=True):
         else:
             stage.rename(target)
             _sync(primary)
+    return target, manifest
+
+
+def backup_checkpoint(root=ROOT, secondary=SECONDARY, require_separate=True):
+    """SQLite online backup plus immutable model/code copies on two filesystems."""
+    root, secondary = Path(root), Path(secondary)
+    target, manifest = _primary_checkpoint(root)
+    key, files = target.name, manifest["files"]
     # Keep the on-disk snapshot even if the second filesystem is temporarily unavailable.
     secondary.mkdir(parents=True, exist_ok=True, mode=0o700)
-    separate = source_dir.stat().st_dev != secondary.stat().st_dev
+    separate = (root / "output/prospective").stat().st_dev != secondary.stat().st_dev
     if require_separate and not separate:
         raise ValueError("Secondary checkpoint must be on a different filesystem")
     offdisk = secondary / key
@@ -304,7 +366,7 @@ def backup_checkpoint(root=ROOT, secondary=SECONDARY, require_separate=True):
             _sync(secondary)
     verify_checkpoint(offdisk)
     # Restore the whole bundle into a temporary location, never over production.
-    with tempfile.TemporaryDirectory(prefix="xsec-restore-") as temp:
+    with tempfile.TemporaryDirectory(dir=root / "output/prospective_backups", prefix=".restore-") as temp:
         restored = Path(temp) / "checkpoint"
         shutil.copytree(offdisk, restored)
         if verify_checkpoint(restored) != manifest:
@@ -333,6 +395,11 @@ def supervise(root=ROOT, secondary=SECONDARY, now=None, publisher=None, require_
     with run_lock("experiment_supervisor", lock_dir=str(root / "logs/locks"), timeout_sec=1, exit_code=75):
         plan = _verified_document(folder / "review_plan.json")
         errors = []
+        try:
+            from utils.regime_observer import refresh_observation
+            refresh_observation(root=root, now=current)
+        except Exception as exc:
+            errors.append(f"regime_observation: {type(exc).__name__}: {exc}")
         final_path = folder / "final_review.json"
         if not final_path.exists():
             try:
@@ -342,7 +409,7 @@ def supervise(root=ROOT, secondary=SECONDARY, now=None, publisher=None, require_
                 errors.append(f"settlement: {type(exc).__name__}: {exc}")
         try:
             _read_ledger(root / "output/prospective/ledger.sqlite")
-            summary = trial.experiment_summary(root)
+            summary = review_summary(root)
             if trial._digest(summary["protocol"]) != plan["protocol_sha256"]:
                 raise ValueError("Live protocol changed since review registration")
             if not (summary["runtime_matches"] and summary["frozen_model_matches"]):
@@ -379,6 +446,8 @@ def supervise(root=ROOT, secondary=SECONDARY, now=None, publisher=None, require_
                  "status": "attention" if errors else "complete" if decision["terminal"] else "monitoring",
                  "plan": plan, "milestones": _milestones(summary, plan, current),
                  "runtime_matches": summary.get("runtime_matches"),
+                 "integrity_basis": summary.get("integrity_basis", "registered_live_runtime"),
+                 "live_runtime_matches": summary.get("live_runtime_matches", summary.get("runtime_matches")),
                  "frozen_model_matches": summary.get("frozen_model_matches"),
                  "backup": backup, "decision": decision, "errors": errors}
         _write(folder / "status.json", state)
@@ -390,6 +459,8 @@ def supervise(root=ROOT, secondary=SECONDARY, now=None, publisher=None, require_
             try:
                 if publisher():
                     _write(publication_path, {"published_at": current.isoformat(), "signature": signature})
+                else:
+                    raise RuntimeError("publisher returned False; public site not refreshed")
             except Exception as exc:
                 state["errors"].append(f"publication: {type(exc).__name__}: {exc}")
                 state["status"] = "attention"

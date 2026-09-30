@@ -4,6 +4,16 @@ This is a prospective ranking experiment, not a backtest, trade executor, or
 replacement for the live recommendation policy. Production retraining, the
 SHORT safety gates, LONG KILL, and mandatory Telegram reports are unchanged.
 
+September 30 status: the original 60-window trial finished `inconclusive` on
+September 23 KST. Its final report and ledger remain unchanged. Before editing
+registered operational source, `seal_completed()` preserved and verified the
+complete checkpoint. `utils.experiment_supervisor.review_summary()` now checks
+that sealed evidence separately from current live runtime. Direct calls to the
+old `experiment_summary()` still truthfully report current-source mismatch;
+that is not a rewritten historical protocol. See
+[separate regime observation](regime_observation.md) for the new, non-switching
+diagnostic stream. Completed secondary backup remains blocked by disk capacity.
+
 ## Registration
 
 `python scripts/prospective_experiment.py --start` copies the current 6h model

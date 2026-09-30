@@ -2,7 +2,7 @@ import subprocess
 
 import pytest
 
-from scripts.fetch_and_rank import _push_dashboard_to_github
+from utils.dashboard_publish import PAYLOAD_PATHS, publish_files
 
 
 def git(repo, *args):
@@ -33,29 +33,53 @@ def site(tmp_path):
     return repo, remote
 
 
-def test_dashboard_push_never_commits_unrelated_worktree_edits(site):
+def test_dashboard_push_never_commits_unrelated_worktree_edits(site, tmp_path):
     repo, remote = site
     (repo / "unrelated.txt").write_text("user edits")
-    assert _push_dashboard_to_github(repo)
+    before = git(repo, "rev-parse", "HEAD")
+    assert publish_files(repo, cache=tmp_path / "publisher", remote=str(remote))
     assert git(remote, "show", "main:unrelated.txt") == "original"
     assert (repo / "unrelated.txt").read_text() == "user edits"
-    assert git(repo, "diff", "--name-only") == "unrelated.txt"
-    assert git(repo, "rev-parse", "HEAD") == git(remote, "rev-parse", "main")
+    assert git(repo, "rev-parse", "HEAD") == before
+    assert "unrelated.txt" in git(repo, "diff", "--name-only")
+    assert git(remote, "show", f"main:{PAYLOAD_PATHS[0]}") == '{"encrypted": "new"}'
 
 
-def test_dashboard_push_refuses_unrelated_staged_files(site):
+def test_dashboard_push_leaves_unrelated_staged_files_untouched(site, tmp_path):
     repo, remote = site
     before = git(remote, "rev-parse", "main")
     (repo / "unrelated.txt").write_text("staged user edits")
     git(repo, "add", "unrelated.txt")
-    assert not _push_dashboard_to_github(repo)
+    assert publish_files(repo, cache=tmp_path / "publisher", remote=str(remote))
     assert git(repo, "diff", "--cached", "--name-only") == "unrelated.txt"
-    assert git(remote, "rev-parse", "main") == before
+    assert git(remote, "rev-parse", "main^") == before
+    assert git(remote, "show", "main:unrelated.txt") == "original"
 
 
-def test_no_new_payload_still_pushes_prior_unpublished_commit(site):
+def test_diverged_checkout_and_untracked_files_do_not_block_or_leak(site, tmp_path):
     repo, remote = site
     git(repo, "add", "projects/xsec-alpha/dashboard/data/summary.json")
     git(repo, "commit", "-m", "previous pending publish")
-    assert _push_dashboard_to_github(repo)
-    assert git(repo, "rev-parse", "HEAD") == git(remote, "rev-parse", "main")
+    (repo / "private.txt").write_text("must remain local")
+    peer = tmp_path / "peer"
+    git(tmp_path, "clone", str(remote), str(peer))
+    git(peer, "config", "user.name", "Peer")
+    git(peer, "config", "user.email", "peer@example.invalid")
+    (peer / "unrelated.txt").write_text("remote update")
+    git(peer, "add", "unrelated.txt")
+    git(peer, "commit", "-m", "unrelated remote update")
+    git(peer, "push", "origin", "main")
+    head = git(repo, "rev-parse", "HEAD")
+    assert publish_files(repo, cache=tmp_path / "publisher", remote=str(remote))
+    published = git(remote, "rev-parse", "main")
+    assert git(remote, "show", "main:unrelated.txt") == "remote update"
+    assert "private.txt" not in git(remote, "ls-tree", "-r", "--name-only", "main")
+    assert git(repo, "rev-parse", "HEAD") == head
+    assert publish_files(repo, cache=tmp_path / "publisher", remote=str(remote))
+    assert git(remote, "rev-parse", "main") == published
+
+
+def test_publisher_refuses_unscoped_paths(site, tmp_path):
+    repo, remote = site
+    with pytest.raises(ValueError, match="explicitly allowed"):
+        publish_files(repo, paths=["unrelated.txt"], cache=tmp_path / "publisher", remote=str(remote))

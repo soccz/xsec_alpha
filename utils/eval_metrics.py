@@ -47,12 +47,17 @@ def build_btc_context(
     if btc_col not in closes.columns:
         raise ValueError("KRW-BTC not in closes — cannot compute BTC regime context")
 
-    btc = closes[btc_col].copy()
-    btc_ret_7d = btc.pct_change(return_lookback_hours)
-    btc_ret_30d = btc.pct_change(trend_lookback_hours)
-    btc_vol_7d = btc.pct_change().rolling(vol_lookback_hours).std()
+    btc = closes[btc_col].sort_index().copy()
+    if btc.index.has_duplicates:
+        raise ValueError("Duplicate BTC timestamps")
+    btc = btc.reindex(pd.date_range(btc.index.min(), btc.index.max(), freq="h"))
+    btc = btc.where(np.isfinite(btc) & (btc > 0))
+    btc_ret_7d = btc.pct_change(return_lookback_hours, fill_method=None)
+    btc_ret_30d = btc.pct_change(trend_lookback_hours, fill_method=None)
+    btc_vol_7d = btc.pct_change(fill_method=None).rolling(vol_lookback_hours).std()
 
-    vol_median = btc_vol_7d.dropna().median()
+    # Each historical label must be invariant to candles appended in the future.
+    vol_median = btc_vol_7d.shift(1).rolling(trend_lookback_hours, min_periods=vol_lookback_hours).median()
     direction = pd.Series(
         np.where(btc_ret_7d >= 0, "bull", "bear"),
         index=btc.index,
@@ -64,13 +69,14 @@ def build_btc_context(
         dtype="object",
     )
     regime = direction.str.cat(vol_bucket, sep="_").rename("regime")
-    regime[btc_ret_7d.isna() | btc_vol_7d.isna()] = "unknown"
+    regime[btc_ret_7d.isna() | btc_vol_7d.isna() | vol_median.isna()] = "unknown"
 
     return pd.DataFrame(
         {
             "btc_ret_7d": btc_ret_7d,
             "btc_ret_30d": btc_ret_30d,
             "btc_vol_7d": btc_vol_7d,
+            "vol_reference": vol_median,
             "regime": regime,
         }
     )
