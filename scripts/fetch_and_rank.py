@@ -865,11 +865,12 @@ def _run(args):
         preflight["batch_suppression"] = "model_unavailable"
     score_sorted = score.sort_values(ascending=False)
 
+    score_witness = None
     if not args.dry_run and score.attrs.get("model_sha256"):
         try:
             from utils.score_evidence import record_score_evidence
-            record_score_evidence("signal", latest_ts, latest_factors_raw.loc[score.index],
-                                  score, score.attrs["model_sha256"])
+            score_witness = record_score_evidence("signal", latest_ts, latest_factors_raw.loc[score.index],
+                                                  score, score.attrs["model_sha256"])
         except (Exception, SystemExit) as exc:
             logger.warning("Signal diagnostic witness failed; scoring unchanged: %s", exc)
 
@@ -1271,6 +1272,12 @@ def _run(args):
                 reason=(f"SHORT IC {short_gate.status}: {short_gate.reason}"
                         if short_blocked else short_watch_reason),
             )
+            report["score_evidence_sha256"] = score_witness.stem if score_witness else None
+            report["audit_context"] = {
+                "short_gate": short_gate.status,
+                "tradable_symbols": {m: symbol for m in score.index
+                                     if (symbol := market_to_bitget_symbol(m, contract_map or {}))},
+            }
             sent = publish_report(report, send=not args.no_telegram, realized_summary=realized_summary)
             if sent:
                 logger.info("Telegram coin proposal report acknowledged")

@@ -43,6 +43,13 @@ def operational_checks(root=ROOT, now=None, secondary=None):
                                                "pilot_complete_not_confirmatory")))
         checks.append(("ROTATION_BACKUP", state, "checked_at", 30,
                        (state.get("rotation_backup") or {}).get("restore_verified") is True))
+    if (root / "output/forecast_audit/ledger.sqlite").exists():
+        audit = _load(root / "output/forecast_audit/summary.json")
+        checks.append(("FORECAST_AUDIT", audit, "checked_at", 30, audit.get("status") == "monitoring"))
+        checks.append(("VENUE_OBSERVATION", audit, "checked_at", 30,
+                       audit.get("venue", {}).get("status") == "observing"))
+        checks.append(("FORECAST_BACKUP", state, "checked_at", 30,
+                       (state.get("forecast_backup") or {}).get("restore_verified") is True))
     for name, doc, key, max_minutes, good in checks:
         try:
             age = (now - datetime.fromisoformat(doc[key])).total_seconds() / 60

@@ -37,7 +37,9 @@ def publish_files(source, *, paths=PAYLOAD_PATHS, cache=None, remote=REMOTE):
     if git("remote", "get-url", "origin").stdout.decode().strip() != remote:
         raise ValueError("Publication cache has an unexpected remote")
     for _ in range(2):
-        git("fetch", "--depth=1", "--filter=blob:none", "origin", "refs/heads/main:refs/remotes/origin/main")
+        # A depth-one fetch may hide ancestry even for a normal remote advance.
+        # Refresh only this disposable tracking ref; the remote push stays non-force.
+        git("fetch", "--depth=1", "--filter=blob:none", "origin", "+refs/heads/main:refs/remotes/origin/main")
         parent = git("rev-parse", "refs/remotes/origin/main").stdout.decode().strip()
         with tempfile.TemporaryDirectory(dir=cache, prefix="index-") as folder:
             env = {**os.environ, "GIT_INDEX_FILE": str(Path(folder) / "index")}

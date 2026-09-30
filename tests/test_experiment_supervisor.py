@@ -238,6 +238,33 @@ def test_rotation_heartbeat_does_not_publish_every_pass(registered, monkeypatch)
     assert len(calls) == 1
 
 
+def test_forecast_failure_cannot_stop_existing_supervision(registered, monkeypatch):
+    from utils import forecast_audit
+    root, _ = registered
+    def fail(**kwargs):
+        raise ValueError("audit failure test")
+    monkeypatch.setattr(forecast_audit, "refresh_audit", fail)
+    monkeypatch.setattr(forecast_audit, "backup_audit", lambda root: {"restore_verified": True})
+    state = monitor.supervise(root, now="2026-09-07T04:10Z")
+    assert state["errors"] == ["forecast_audit: ValueError: audit failure test"]
+    assert state["backup"]["restore_verified"] and state["forecast_backup"]["restore_verified"]
+    assert state["decision"]["code"] == "collecting"
+
+
+def test_forecast_heartbeat_alone_does_not_republish(registered, monkeypatch):
+    from utils import forecast_audit
+    root, _ = registered
+    calls = []
+    monkeypatch.setattr(forecast_audit, "refresh_audit", lambda **kwargs: {
+        "status": "monitoring", "checked_at": trial._utc(kwargs["now"]).isoformat(),
+        "counts": {"recorded": 0},
+    })
+    for now in ("2026-09-07T04:10Z", "2026-09-07T04:20Z"):
+        state = monitor.supervise(root, now=now, publisher=lambda: calls.append(True) or True)
+        assert not state["errors"]
+    assert len(calls) == 1
+
+
 def test_completed_archive_survives_live_code_changes_but_not_evidence_changes(registered, tmp_path):
     root, plan = registered
     monitor.supervise(root, tmp_path / "secondary", now=plan["hard_review_at"], require_separate=False)

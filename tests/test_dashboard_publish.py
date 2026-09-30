@@ -83,3 +83,29 @@ def test_publisher_refuses_unscoped_paths(site, tmp_path):
     repo, remote = site
     with pytest.raises(ValueError, match="explicitly allowed"):
         publish_files(repo, paths=["unrelated.txt"], cache=tmp_path / "publisher", remote=str(remote))
+
+
+def test_tracking_cache_can_follow_replaced_remote_without_force_pushing_or_losing_work(site, tmp_path):
+    repo, remote = site
+    cache = tmp_path / "publisher"
+    assert publish_files(repo, cache=cache, remote=str(remote))
+    git(cache, "fetch", "origin", "+refs/heads/main:refs/remotes/origin/main")
+    (repo / "unrelated.txt").write_text("new authoritative remote work")
+    git(repo, "add", "unrelated.txt")
+    git(repo, "commit", "-m", "independent remote branch")
+    replacement = git(repo, "rev-parse", "HEAD")
+    git(remote, "fetch", str(repo), "+refs/heads/main:refs/heads/main")
+    assert publish_files(repo, cache=cache, remote=str(remote))
+    assert git(remote, "rev-parse", "main^") == replacement
+    assert git(remote, "show", "main:unrelated.txt") == "new authoritative remote work"
+    assert git(repo, "rev-parse", "HEAD") == replacement
+
+
+def test_depth_one_fetch_can_follow_a_normal_remote_child(site, tmp_path):
+    repo, remote = site
+    cache = tmp_path / "publisher"
+    # file:// exercises actual shallow fetches; plain local paths ignore --depth.
+    assert publish_files(repo, cache=cache, remote=remote.as_uri())
+    head = git(remote, "rev-parse", "main")
+    assert publish_files(repo, cache=cache, remote=remote.as_uri())
+    assert git(remote, "rev-parse", "main") == head

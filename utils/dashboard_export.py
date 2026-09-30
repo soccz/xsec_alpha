@@ -702,6 +702,7 @@ def build_summary_payload() -> dict:
         "rotation_pilot": _safe_load_json(OUTPUT_DIR / "rotation_pilot/summary.json"),
         "ic_incident": _safe_load_json(OUTPUT_DIR / "ic_incident/summary.json"),
         "score_evidence": _safe_load_json(OUTPUT_DIR / "score_evidence/status.json"),
+        "forecast_audit": _safe_load_json(OUTPUT_DIR / "forecast_audit/summary.json"),
         "operator_report": {key: operator_report.get(key) for key in (
             "run_id", "generated_at", "data_asof", "status", "reason", "signals", "ideas", "telegram",
         )} if operator_report else None,

@@ -73,3 +73,21 @@ def test_registered_pilot_requires_fresh_processing_and_verified_backup(tmp_path
     (folder / "summary.json").write_text('{"status":"integrity_failure","checked_at":"2026-09-30T03:00:00+00:00"}')
     rows = ops_status.operational_checks(tmp_path, now)
     assert next(r for r in rows if r["check"] == "ROTATION_PILOT")["status"] == "FAIL"
+
+
+def test_forecast_audit_must_be_fresh_and_backed_up_without_treating_ic_gap_as_failure(tmp_path):
+    folder = tmp_path / "output/forecast_audit"
+    folder.mkdir(parents=True)
+    (folder / "ledger.sqlite").touch()
+    (folder / "summary.json").write_text(json.dumps({"status": "monitoring", "checked_at": "2026-09-30T03:00:00+00:00",
+                                                    "counts": {"differences": 2}}))
+    supervisor = tmp_path / "output/experiment_supervision"
+    supervisor.mkdir()
+    (supervisor / "status.json").write_text(json.dumps({"checked_at": "2026-09-30T03:00:00+00:00",
+                                                        "forecast_backup": {"restore_verified": True}}))
+    now = datetime(2026, 9, 30, 3, 10, tzinfo=timezone.utc)
+    assert all(r["status"] == "OK" for r in ops_status.operational_checks(tmp_path, now)
+               if r["check"].startswith("FORECAST"))
+    (folder / "summary.json").write_text('{"status":"attention","checked_at":"2026-09-30T03:00:00+00:00"}')
+    rows = ops_status.operational_checks(tmp_path, now)
+    assert next(r for r in rows if r["check"] == "FORECAST_AUDIT")["status"] == "FAIL"

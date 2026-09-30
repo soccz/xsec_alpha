@@ -462,6 +462,12 @@ def supervise(root=ROOT, secondary=None, now=None, publisher=None, require_separ
             pilot = refresh_pilot(root=root, now=now)
         except (Exception, SystemExit) as exc:
             errors.append(f"rotation_pilot: {type(exc).__name__}: {exc}")
+        forecast_audit = None
+        try:
+            from utils.forecast_audit import refresh_audit
+            forecast_audit = refresh_audit(root=root, now=now)
+        except (Exception, SystemExit) as exc:
+            errors.append(f"forecast_audit: {type(exc).__name__}: {exc}")
         final_path = folder / "final_review.json"
         if not final_path.exists():
             try:
@@ -496,6 +502,12 @@ def supervise(root=ROOT, secondary=None, now=None, publisher=None, require_separ
             pilot_backup = backup_pilot(root)
         except (Exception, SystemExit) as exc:
             errors.append(f"rotation_backup: {type(exc).__name__}: {exc}")
+        forecast_backup = None
+        try:
+            from utils.forecast_audit import backup_audit
+            forecast_backup = backup_audit(root)
+        except (Exception, SystemExit) as exc:
+            errors.append(f"forecast_backup: {type(exc).__name__}: {exc}")
         if final_path.exists():
             final = _verified_document(final_path)
             if final["review_plan_sha256"] != trial._digest(plan):
@@ -523,13 +535,16 @@ def supervise(root=ROOT, secondary=None, now=None, publisher=None, require_separ
                  "live_runtime_matches": summary.get("live_runtime_matches", summary.get("runtime_matches")),
                  "frozen_model_matches": summary.get("frozen_model_matches"),
                  "backup": backup, "regime_backup": regime_backup, "rotation_pilot": pilot,
-                 "rotation_backup": pilot_backup, "decision": decision, "errors": errors}
+                 "rotation_backup": pilot_backup, "forecast_audit": forecast_audit,
+                 "forecast_backup": forecast_backup, "decision": decision, "errors": errors}
         _write(folder / "status.json", state)
         publication_path = folder / "publication.json"
         previous = _load(publication_path) if publication_path.exists() else {}
         signature_state = {key: value for key, value in state.items() if key != "checked_at"}
         if pilot:
             signature_state["rotation_pilot"] = {key: value for key, value in pilot.items() if key != "checked_at"}
+        if forecast_audit:
+            signature_state["forecast_audit"] = {key: value for key, value in forecast_audit.items() if key != "checked_at"}
         signature = trial._digest(signature_state)
         elapsed = (current - trial._utc(previous["published_at"])).total_seconds() if previous else float("inf")
         if publisher is not None and (signature != previous.get("signature") or elapsed >= 3600):
