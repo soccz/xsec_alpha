@@ -19,7 +19,7 @@ from utils.model_release import artifact_sha256
 from utils.run_lock import run_lock
 
 ROOT = trial.ROOT
-TABLES = ("signals", "outcomes", "comparisons", "deliveries", "venue_intents", "quotes", "venue_outcomes")
+TABLES = ("signals", "outcomes", "comparisons", "deliveries", "venue_intents", "quotes", "venue_outcomes", "ingestion_events")
 LEGACY_CONTRACT = "absolute_open_lag1_anchors_v1"
 
 
@@ -29,6 +29,52 @@ def _folder(root):
 
 def _connect(path, mode="rw"):
     return sqlite3.connect(Path(path).resolve().as_uri() + f"?mode={mode}", uri=True, timeout=5)
+
+
+def _event_table(conn):
+    # Additive operational journal; old evidence and the registered policy stay intact.
+    conn.execute("CREATE TABLE IF NOT EXISTS ingestion_events(key TEXT PRIMARY KEY, payload TEXT NOT NULL, sha256 TEXT NOT NULL)")
+    for action in ("UPDATE", "DELETE"):
+        conn.execute(f"CREATE TRIGGER IF NOT EXISTS ingestion_events_{action.lower()} BEFORE {action} ON ingestion_events "
+                     "BEGIN SELECT RAISE(ABORT,'append-only audit'); END")
+
+
+def _input_case(stage, source, slot):
+    return trial._digest([stage, source, slot])
+
+
+def _try_input(conn, tables, stage, source, slot, now, reader):
+    """Isolate external input errors, never ledger writes or integrity failures."""
+    error, result = None, None
+    try:
+        result = reader()
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"[:500]
+    case = _input_case(stage, source, slot)
+    events = tables["ingestion_events"]
+    previous = max((r for r in events.values() if r["case"] == case),
+                   key=lambda r: r["sequence"], default=None)
+    state = "error" if error else "recovered"
+    if (error or previous) and (previous is None or (previous["state"], previous["error"]) != (state, error)):
+        sequence = previous["sequence"] + 1 if previous else 1
+        body = {"schema": 1, "case": case, "sequence": sequence, "stage": stage,
+                "source": source, "signal_at": slot, "observed_at": trial._utc(now).isoformat(),
+                "state": state, "error": error}
+        key = case + f"/{sequence:08d}"
+        _append(conn, "ingestion_events", key, body)
+        events[key] = body
+    return error is None, result
+
+
+def _ingestion_summary(tables):
+    events = sorted(tables["ingestion_events"].values(), key=lambda r: (r["observed_at"], r["case"], r["sequence"]))
+    latest = {}
+    for row in events:
+        if row["sequence"] > latest.get(row["case"], {}).get("sequence", 0):
+            latest[row["case"]] = row
+    return {"active": [r for r in latest.values() if r["state"] == "error"],
+            "recovered": sum(r["state"] == "recovered" for r in events),
+            "event_count": len(events), "recent_events": list(reversed(events[-40:]))}
 
 
 def start_audit(root=ROOT, now=None):
@@ -100,7 +146,7 @@ def _frame(witness, kind, slot, now):
     if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
         raise ValueError("Invalid witness model hash")
     frame = pd.DataFrame(witness["rows"]).set_index("market")
-    if (len(frame) < 10 or not frame.index.is_unique or not np.isfinite(frame.score).all()
+    if (len(frame) < (10 if kind == "signal" else 5) or not frame.index.is_unique or not np.isfinite(frame.score).all()
             or not all(isinstance(m, str) and m.startswith("KRW-") for m in frame.index)):
         raise ValueError("Invalid full-pool witness membership or scores")
     features = witness["features"]
@@ -136,8 +182,8 @@ def _witnesses(root, kind, slot, now):
     return sorted(records, key=lambda body: (body["recorded_at"], trial._digest(body)))
 
 
-def _ic(scores, actual):
-    if len(scores) < 10 or len(set(scores)) < 2 or len(set(actual)) < 2:
+def _ic(scores, actual, minimum=10):
+    if len(scores) < minimum or len(set(scores)) < 2 or len(set(actual)) < 2:
         return None
     return float(spearmanr(scores, actual).statistic)
 
@@ -200,7 +246,7 @@ def compare(witness, outcome, history, measurement, now):
               "score_rank_correlation": None, "max_target_difference": None}
     if measurement:
         measured = _frame(measurement, "measurement", witness["signal_at"], now)
-        measured_ic = _ic(measured.score, measured.actual)
+        measured_ic = _ic(measured.score, measured.actual, minimum=5)
         same_pool = measured.index.equals(original.index)
         common = original.index.intersection(measured.index)
         result.update(same_model=measurement["model_sha256"] == witness["model_sha256"],
@@ -241,6 +287,9 @@ def _read(conn):
     tables = {}
     for table in TABLES:
         records = {}
+        if table == "ingestion_events" and not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone():
+            tables[table] = records
+            continue
         for key, raw, digest in conn.execute(f"SELECT key,payload,sha256 FROM {table} ORDER BY key"):
             body = json.loads(raw)
             if trial._digest(body) != digest:
@@ -250,6 +299,20 @@ def _read(conn):
                 raise ValueError("Missing audit writer provenance")
             records[key] = body
         tables[table] = records
+    previous_events = {}
+    for key, event in tables["ingestion_events"].items():
+        case = _input_case(event["stage"], event["source"], event["signal_at"])
+        previous = previous_events.get(case)
+        if (event["schema"] != 1 or event["case"] != case
+                or event["stage"] not in ("signal", "prices", "outcome", "history", "history_row", "measurement", "comparison", "report")
+                or event["sequence"] != (previous["sequence"] + 1 if previous else 1)
+                or key != case + f'/{event["sequence"]:08d}'
+                or event["state"] not in ("error", "recovered")
+                or (event["state"] == "error") != bool(event["error"])
+                or (event["state"] == "recovered" and (not previous or previous["state"] != "error"))
+                or (previous and trial._utc(event["observed_at"]) < trial._utc(previous["observed_at"]))):
+            raise ValueError("Invalid ingestion event sequence")
+        previous_events[case] = event
     for slot, record in tables["signals"].items():
         signal = trial._utc(slot)
         first = trial._utc(policy["first_signal_at"])
@@ -299,20 +362,29 @@ def _read(conn):
     return policy, tables
 
 
-def _summary(policy, tables, now, pending):
+def _summary(policy, tables, now, pending, current_comparisons):
     signals, outcomes = tables["signals"], tables["outcomes"]
+    ingestion = _ingestion_summary(tables)
     first, current = trial._utc(policy["first_signal_at"]), trial._utc(now)
     expected = list(pd.date_range(first, current, freq="6h")) if current >= first else []
     rows = []
     for signal in expected:
         slot = signal.isoformat()
         source, outcome = signals.get(slot, {}), outcomes.get(slot, {})
-        comparisons = [r for r in tables["comparisons"].values() if r["signal_at"] == slot]
-        latest = max(comparisons, key=lambda r: (r["compared_at"], (r["measurement"] or {}).get("recorded_at", ""),
-                                                trial._digest(r))) if comparisons else None
+        latest = tables["comparisons"].get(current_comparisons.get(slot))
         deliveries = [r for r in tables["deliveries"].values() if r["signal_at"] == slot]
         complete = any(r["complete"] for r in deliveries)
-        rows.append({"signal_at": slot, "status": outcome.get("status") or source.get("status", "awaiting_signal"),
+        problems = [r for r in ingestion["active"] if r["signal_at"] in (None, slot)]
+        stages = {r["stage"] for r in problems}
+        overdue = current > signal + pd.Timedelta(hours=55)
+        legacy_status = ("error" if stages & {"history", "history_row", "comparison"} else
+                         "available" if latest and latest["legacy_ic"] is not None else
+                         "missing" if overdue else "waiting")
+        measurement_status = ("error" if "measurement" in stages else
+                              "available" if latest and latest["measurement"] else
+                              "missing" if overdue else "waiting")
+        rows.append({"signal_at": slot, "status": outcome.get("status") or source.get("status") or
+                     ("source_error" if "signal" in stages else "awaiting_signal"),
                      "reason": outcome.get("reason") or pending.get(slot), "saved_ic": outcome.get("saved_ic"),
                      "n_coins": outcome.get("n_coins") or len(source.get("witness", {}).get("rows", [])),
                      "model_sha256": source.get("witness", {}).get("model_sha256"),
@@ -323,17 +395,20 @@ def _summary(policy, tables, now, pending):
                      "same_model": latest["same_model"] if latest else None,
                      "same_pool": latest["same_pool"] if latest else None,
                      "measurement_raw_ic": latest["measurement_raw_ic"] if latest else None,
-                     "legacy_status": "available" if latest and latest["legacy_ic"] is not None else
-                     "missing" if current > signal + pd.Timedelta(hours=55) else "waiting",
+                     "legacy_status": legacy_status, "measurement_status": measurement_status,
+                     "comparison_status": "error" if "error" in (legacy_status, measurement_status) else legacy_status,
                      "delivery": "verified" if complete else "waiting" if current <= signal + pd.Timedelta(minutes=45) else "unverified"})
     valid = [row for row in rows if row["status"] == "evaluated"]
     counts = {"scheduled": len(rows), "recorded": sum(r["status"] == "recorded" for r in signals.values()),
               "evaluated": len(valid), "missed": sum(r["status"] == "missed" for r in signals.values()),
               "invalid": sum(r["status"] == "invalid" for r in outcomes.values()),
-              "pending": sum(r["status"] in ("recorded", "awaiting_signal") for r in rows),
+              "pending": sum(r["status"] in ("recorded", "awaiting_signal", "source_error") for r in rows),
               "compared": sum(r["legacy_ic"] is not None for r in valid),
               "differences": sum(r["comparison_warning"] for r in rows),
-              "delivery_verified": sum(r["delivery"] == "verified" for r in rows)}
+              "delivery_verified": sum(r["delivery"] == "verified" for r in rows),
+              "source_errors": sum(r["status"] == "source_error" for r in rows),
+              "comparison_errors": sum(r["comparison_status"] == "error" for r in valid),
+              "legacy_missing": sum(r["legacy_status"] == "missing" for r in valid)}
     issues = []
     closed = [r for r in rows if trial._utc(r["signal_at"]) + pd.Timedelta(minutes=45) < current]
     if closed and closed[-1]["status"] == "missed":
@@ -343,10 +418,90 @@ def _summary(policy, tables, now, pending):
     finished = [r for r in rows if r["status"] in ("evaluated", "invalid")]
     if finished and finished[-1]["status"] == "invalid":
         issues.append("latest_outcome_invalid")
+    if ingestion["active"]:
+        issues.append("input_errors_active")
+    if counts["legacy_missing"]:
+        issues.append("legacy_comparison_missing")
     return {"status": "attention" if issues else "monitoring", "checked_at": current.isoformat(), "policy": policy,
             "counts": counts, "mean_saved_ic": float(np.mean([r["saved_ic"] for r in valid])) if valid else None,
             "first_cycle": rows[0] if rows else None, "recent_windows": list(reversed(rows[-40:])),
-            "changes_gate": False, "automatic_promotion": False, "operational_issues": issues, "errors": []}
+            "changes_gate": False, "automatic_promotion": False, "operational_issues": issues,
+            "ingestion": ingestion, "errors": []}
+
+
+def _history_rows(path):
+    rows = json.loads(path.read_text())
+    if not isinstance(rows, list) or any(not isinstance(r, dict) for r in rows):
+        raise ValueError("Legacy history must be a list of rows")
+    grouped = {}
+    for row in rows:
+        if row.get("contract_version") == LEGACY_CONTRACT and row.get("side") == "short" and row.get("horizon_h") == 6:
+            slot = trial._utc(row["timestamp"]).isoformat()
+            grouped.setdefault(slot, []).append(row)
+    return grouped
+
+
+def _legacy_row(rows):
+    if len(rows) > 1:
+        raise ValueError("Ambiguous legacy IC history")
+    if rows and (not np.isfinite(rows[0]["ic"]) or not -1 <= rows[0]["ic"] <= 1):
+        raise ValueError("Invalid legacy IC value")
+    return rows[0] if rows else None
+
+
+def _advance_comparisons(conn, tables, root, current):
+    selected = {}
+    path = root / "output/ic_history.json"
+    previously_failed = any(r["stage"] == "history" for r in tables["ingestion_events"].values())
+    history_ok, history = _try_input(conn, tables, "history", "output/ic_history.json", None, current,
+                                    lambda: _history_rows(path)) if path.exists() or previously_failed else (True, {})
+    for slot, outcome in tables["outcomes"].items():
+        if outcome["status"] != "evaluated":
+            continue
+        legacy = None
+        if history_ok:
+            _, legacy = _try_input(conn, tables, "history_row", "output/ic_history.json", slot, current,
+                                   lambda: _legacy_row(history.get(slot, [])))
+        _, measured = _try_input(conn, tables, "measurement", "output/score_evidence/measurement", slot, current,
+                                 lambda: _witnesses(root, "measurement", slot, current))
+        ok, results = _try_input(conn, tables, "comparison", "saved_scores_vs_legacy", slot, current,
+                                 lambda: [(slot + "/" + trial._digest([legacy, measurement]),
+                                           compare(tables["signals"][slot]["witness"], outcome, legacy, measurement, current))
+                                          for measurement in measured or [None] if legacy is not None or measurement is not None])
+        if ok:
+            for key, result in results:
+                _append(conn, "comparisons", key, result)
+                selected[slot] = key
+    return selected
+
+
+def _report_delivery(path, tables, current):
+    report = json.loads(path.read_text())
+    if not isinstance(report, dict):
+        raise ValueError("Operator report must be an object")
+    if not report.get("data_asof"):
+        return None
+    slot = trial._utc(report["data_asof"]).isoformat()
+    source = tables["signals"].get(slot)
+    if source is None:
+        return None
+    ack = report.get("telegram", {}).get("acknowledged_at")
+    if trial._utc(report["generated_at"]) > current or (ack and trial._utc(ack) > current):
+        return None
+    digest = trial._digest(source["witness"]) if source.get("witness") else None
+    return _delivery(report, slot, digest, current)
+
+
+def _advance_deliveries(conn, tables, root, current):
+    complete = {r["signal_at"] for r in tables["deliveries"].values() if r["complete"]}
+    days = {trial._utc(slot).strftime("%Y%m%d") for slot in tables["signals"] if slot not in complete}
+    paths = {path for day in days for path in (root / "output/operator_reports").glob(day + "*.json")}
+    paths.update(root / r["source"] for r in _ingestion_summary(tables)["active"] if r["stage"] == "report")
+    for path in sorted(paths):
+        ok, result = _try_input(conn, tables, "report", str(path.relative_to(root)), None, current,
+                                lambda: _report_delivery(path, tables, current))
+        if ok and result:
+            _append(conn, "deliveries", result["signal_at"] + "/" + trial._digest(result["report"]), result)
 
 
 def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None):
@@ -360,13 +515,17 @@ def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None):
                 policy, tables = _read(conn)
                 if _verified_document(folder / "policy.json") != policy:
                     raise ValueError("Audit policy copy mismatch")
+                _event_table(conn)
                 first = trial._utc(policy["first_signal_at"])
                 slots = pd.date_range(first, current, freq="6h") if current >= first else []
                 for signal in slots:
                     slot = signal.isoformat()
                     if slot in tables["signals"]:
                         continue
-                    candidates = _witnesses(root, "signal", slot, current)
+                    ok, candidates = _try_input(conn, tables, "signal", "output/score_evidence/signal", slot, current,
+                                                lambda: _witnesses(root, "signal", slot, current))
+                    if not ok:
+                        continue
                     eligible = [r for r in candidates if r["timely_signal"]]
                     row = {"signal_at": slot, "observed_at": current.isoformat()}
                     if eligible:
@@ -382,54 +541,37 @@ def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None):
                           if r["status"] == "recorded" and slot not in tables["outcomes"]
                           and trial._utc(slot) + pd.Timedelta(hours=8) <= current
                           <= trial._utc(slot) + pd.Timedelta(hours=55)]
-                prices = (price_loader or trial._raw_prices)(
-                    min(trial._utc(w["signal_at"]) + pd.Timedelta(hours=1) for w in mature),
-                    max(trial._utc(w["signal_at"]) + pd.Timedelta(hours=7) for w in mature),
-                ) if mature else pd.DataFrame(columns=["timestamp", "market", "open"])
+                prices = pd.DataFrame(columns=["timestamp", "market", "open"])
+                prices_ok = True
+                if mature:
+                    prices_ok, prices = _try_input(conn, tables, "prices", "raw_upbit_database", None, current,
+                                                  lambda: (price_loader or trial._raw_prices)(
+                                                      min(trial._utc(w["signal_at"]) + pd.Timedelta(hours=1) for w in mature),
+                                                      max(trial._utc(w["signal_at"]) + pd.Timedelta(hours=7) for w in mature)))
                 for slot, source in tables["signals"].items():
                     if source["status"] != "recorded" or slot in tables["outcomes"]:
                         continue
-                    result, reason = evaluate(source["witness"], prices, trial._utc(now))
+                    if not prices_ok and trial._utc(slot) + pd.Timedelta(hours=8) <= current <= trial._utc(slot) + pd.Timedelta(hours=55):
+                        pending[slot] = "price_source_error"
+                        continue
+                    ok, evaluated = _try_input(conn, tables, "outcome", "raw_upbit_database", slot, current,
+                                               lambda: evaluate(source["witness"], prices, trial._utc(now)))
+                    if not ok:
+                        pending[slot] = "price_source_error"
+                        continue
+                    result, reason = evaluated
                     if result:
                         _append(conn, "outcomes", slot, result)
                         tables["outcomes"][slot] = result
                     else:
                         pending[slot] = reason
-                path = root / "output/ic_history.json"
-                history = json.loads(path.read_text()) if path.exists() else []
-                for slot, outcome in tables["outcomes"].items():
-                    if outcome["status"] != "evaluated":
-                        continue
-                    matches = [r for r in history if r.get("contract_version") == LEGACY_CONTRACT
-                               and trial._utc(r["timestamp"]) == trial._utc(slot)]
-                    if len(matches) > 1:
-                        raise ValueError("Ambiguous legacy IC history")
-                    legacy = matches[0] if matches else None
-                    measured = _witnesses(root, "measurement", slot, current)
-                    for measurement in measured or [None]:
-                        if legacy is None and measurement is None:
-                            continue
-                        key = slot + "/" + trial._digest([legacy, measurement])
-                        result = compare(tables["signals"][slot]["witness"], outcome, legacy, measurement, current)
-                        _append(conn, "comparisons", key, result)
-                for slot, source in tables["signals"].items():
-                    if any(r["signal_at"] == slot and r["complete"] for r in tables["deliveries"].values()):
-                        continue
-                    for path in sorted((root / "output/operator_reports").glob(trial._utc(slot).strftime("%Y%m%d") + "*.json")):
-                        report = json.loads(path.read_text())
-                        if not report.get("data_asof") or trial._utc(report["data_asof"]) != trial._utc(slot):
-                            continue
-                        ack = report.get("telegram", {}).get("acknowledged_at")
-                        if trial._utc(report["generated_at"]) > current or (ack and trial._utc(ack) > current):
-                            continue
-                        digest = trial._digest(source["witness"]) if source.get("witness") else None
-                        result = _delivery(report, slot, digest, current)
-                        _append(conn, "deliveries", slot + "/" + trial._digest(report), result)
+                current_comparisons = _advance_comparisons(conn, tables, root, current)
+                _advance_deliveries(conn, tables, root, current)
                 policy, tables = _read(conn)
                 from utils.venue_observer import advance_venue, venue_summary
                 advance_venue(conn, tables, policy, root, now=now, quote_loader=quote_loader)
                 policy, tables = _read(conn)
-                state = _summary(policy, tables, trial._utc(now), pending)
+                state = _summary(policy, tables, trial._utc(now), pending, current_comparisons)
                 state["venue"] = venue_summary(tables)
             _write(folder / "summary.json", state)
             return state

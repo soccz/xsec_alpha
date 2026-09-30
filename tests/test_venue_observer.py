@@ -117,6 +117,19 @@ def test_quote_api_failure_is_isolated_from_saved_score_settlement(scenario):
     assert state["counts"]["evaluated"] == 1
 
 
+@pytest.mark.parametrize("field,value", [("tradable_symbols", None), ("tradable_symbols", ["bad"]), ("signals", [{"side": "SHORT"}])])
+def test_malformed_venue_metadata_cannot_cancel_original_score_or_delivery(scenario, field, value):
+    root, _, report = scenario
+    target = report if field == "signals" else report["audit_context"]
+    target[field] = value
+    _write(root / "output/operator_reports/20260930T110600.json", report)
+    state = audit.refresh_audit(root, now="2026-09-30T11:10Z")
+    assert state["counts"]["recorded"] == 1 and state["first_cycle"]["delivery"] == "verified"
+    assert state["venue"]["invalid"] == 1
+    state = audit.refresh_audit(root, now="2026-09-30T19:10Z", price_loader=raw_prices)
+    assert state["counts"]["evaluated"] == 1
+
+
 def test_report_received_after_capture_window_is_not_a_preentry_decision(scenario):
     root, _, _ = scenario
     state = audit.refresh_audit(root, now="2026-09-30T11:50Z")

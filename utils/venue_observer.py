@@ -137,7 +137,7 @@ def advance_venue(conn, tables, policy, root, now=None, quote_loader=None):
                 chosen = min(reports, key=lambda r: (r["generated_at"], trial._digest(r)))
                 try:
                     intent = make_intent(source["witness"], chosen, current)
-                except ValueError as exc:
+                except (ValueError, KeyError, TypeError, AttributeError) as exc:
                     intent = {"status": "invalid", "signal_at": slot, "observed_at": current.isoformat(), "reason": str(exc)}
             elif current > signal + pd.Timedelta(minutes=45):
                 intent = {"status": "missed", "signal_at": slot, "observed_at": current.isoformat(), "reason": "no_preentry_venue_intent"}
