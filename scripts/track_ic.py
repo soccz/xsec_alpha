@@ -40,7 +40,7 @@ from data.features import (
     filter_long_frame_by_universe,
 )
 from models.xgb_ranker import XSecRanker
-from utils.model_release import model_release_guard
+from utils.model_release import artifact_sha256, model_release_guard
 from utils.run_lock import stable_data_read_lock
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "output")
@@ -202,6 +202,7 @@ def _track_side(side: str, days: int) -> None:
         return
     ts_actual = absolute_returns.loc[last_valid_ts]
 
+    raw_factors = ts_factors.copy()
     ts_factors = ts_factors.fillna(0.0)
     ts_factors = ts_factors[ts_factors.any(axis=1)]
     valid_coins = ts_factors.index.intersection(ts_actual.dropna().index)
@@ -220,6 +221,15 @@ def _track_side(side: str, days: int) -> None:
     n_coins = len(valid_coins)
     ts_str = last_valid_ts.isoformat() if hasattr(last_valid_ts, "isoformat") else str(last_valid_ts)
     logger.info("[%s] IC = %.4f | n_coins = %s | timestamp = %s | p = %.4f", side, ic, n_coins, ts_str, pvalue)
+
+    if side == "short":
+        try:
+            from utils.score_evidence import record_score_evidence
+            record_score_evidence("measurement", last_valid_ts, raw_factors.loc[valid_coins],
+                                  pd.Series(predicted,index=valid_coins), artifact_sha256(Path(abs_model_path)),
+                                  actual=actual)
+        except (Exception, SystemExit) as exc:
+            logger.warning("IC diagnostic witness failed; gate measurement unchanged: %s", exc)
 
     regime_eligible = None
     btc_ret_7d = None

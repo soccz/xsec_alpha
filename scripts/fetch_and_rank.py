@@ -865,6 +865,14 @@ def _run(args):
         preflight["batch_suppression"] = "model_unavailable"
     score_sorted = score.sort_values(ascending=False)
 
+    if not args.dry_run and score.attrs.get("model_sha256"):
+        try:
+            from utils.score_evidence import record_score_evidence
+            record_score_evidence("signal", latest_ts, latest_factors_raw.loc[score.index],
+                                  score, score.attrs["model_sha256"])
+        except (Exception, SystemExit) as exc:
+            logger.warning("Signal diagnostic witness failed; scoring unchanged: %s", exc)
+
     # --- Per-coin full-universe prediction (direction + expected% + confidence) ---
     # Uses sigma-bucket calibration (output/calibration_sigma.json). Saved alongside
     # the basket CSV so the user can see predictions for all 100 coins, not just picks.
