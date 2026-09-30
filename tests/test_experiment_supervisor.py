@@ -110,6 +110,46 @@ def test_checkpoint_restore_is_idempotent_and_source_unchanged(registered, tmp_p
         assert (Path(destination) / "output/prospective/model.pkl").stat().st_mode & 0o777 == 0o600
 
 
+def test_local_recovery_does_not_touch_offdisk_or_claim_disk_failure_protection(registered, monkeypatch):
+    root, _ = registered
+    visited = []
+    def disk_usage(path):
+        visited.append(Path(path))
+        assert Path(path).is_relative_to(root)
+        return SimpleNamespace(free=10 * 1024**3)
+    monkeypatch.setattr(monitor.shutil, "disk_usage", disk_usage)
+    one = monitor.backup_checkpoint(root)
+    assert one == monitor.backup_checkpoint(root)
+    assert one["mode"] == "same_disk" and one["secondary"] is None
+    assert one["restore_verified"] and not one["separate_filesystem"]
+    assert not one["disk_failure_protected"] and visited
+    state = monitor.supervise(root, now="2026-09-07T04:10Z")
+    assert not state["errors"]
+
+
+def test_regime_ledger_local_snapshot_is_consistent_idempotent_and_verified(tmp_path):
+    import sqlite3
+    folder = tmp_path / "output/regime_observation"
+    folder.mkdir(parents=True)
+    source = folder / "ledger.sqlite"
+    protocol = {"test": "regime"}
+    with sqlite3.connect(source) as conn:
+        conn.executescript("CREATE TABLE protocol(payload TEXT, sha256 TEXT);"
+                           "CREATE TABLE observations(slot TEXT PRIMARY KEY, payload TEXT);"
+                           "CREATE TABLE outcomes(slot TEXT PRIMARY KEY, payload TEXT);")
+        conn.execute("INSERT INTO protocol VALUES (?, ?)", (trial._json(protocol), trial._digest(protocol)))
+        conn.execute("INSERT INTO observations VALUES ('slot', '{}')")
+    original = source.read_bytes()
+    first = monitor.backup_regime_ledger(tmp_path)
+    assert first == monitor.backup_regime_ledger(tmp_path)
+    assert first["row_counts"] == [1, 0] and first["restore_verified"]
+    assert not first["disk_failure_protected"]
+    assert source.read_bytes() == original
+    Path(first["primary"]).write_bytes(b"corrupted")
+    with pytest.raises(ValueError, match="recovery copy changed"):
+        monitor.backup_regime_ledger(tmp_path)
+
+
 def test_same_filesystem_not_misrepresented_as_offdisk(registered, tmp_path):
     root, _ = registered
     with pytest.raises(ValueError, match="different filesystem"):

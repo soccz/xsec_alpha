@@ -83,6 +83,19 @@ age. Operational notices retry unacknowledged failures and suppress unchanged
 acknowledged incidents. Recovery gets a separate notice. Public HTML deployment
 still needs GitHub Pages success verification; a Git push is not that verification.
 
-As of the September 30 audit, the secondary backup disk has less than 1 GiB free.
-The 5 GiB reserve remains enforced. The full primary checkpoint exists, but the
-completed secondary copy is not repaired by merely changing reporting code.
+At the September 30 audit, the secondary backup disk had less than 1 GiB free.
+The operator subsequently chose local recovery on the ample 20TB working disk
+instead of requiring another disk. The supervisor retains the verified completed
+checkpoint, tests its restoration and also snapshots the separate ongoing regime
+ledger with SQLite Online Backup, protocol checksum, file hash, integrity/counts
+and copy-back verification. These are not full-host/environment backups.
+
+The daily market DB script now defaults to local-only verified snapshots, keeping
+its existing 30-day retention. It never touches the old secondary directory unless
+`XSEC_SECONDARY_BACKUP_DIR` is explicitly supplied. Supervisor off-device copies
+are opt-in via `--secondary-backup PATH`; explicit requests retain strict device
+and reserve checks, not silent fallback. The 5 GiB reserve is still enforced on
+active backup storage. Old secondary snapshots and historical errors are preserved.
+
+Health and dashboard distinguish successful same-disk recovery copies from
+physical-disk protection. Disk failure or whole-host loss remains unprotected.

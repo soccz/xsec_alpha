@@ -342,37 +342,44 @@ def _primary_checkpoint(root):
     return target, manifest
 
 
-def backup_checkpoint(root=ROOT, secondary=SECONDARY, require_separate=True):
-    """SQLite online backup plus immutable model/code copies on two filesystems."""
-    root, secondary = Path(root), Path(secondary)
+def backup_checkpoint(root=ROOT, secondary=None, require_separate=True):
+    """Verified local recovery by default; off-device copy is an explicit opt-in."""
+    root = Path(root)
     target, manifest = _primary_checkpoint(root)
     key, files = target.name, manifest["files"]
-    # Keep the on-disk snapshot even if the second filesystem is temporarily unavailable.
-    secondary.mkdir(parents=True, exist_ok=True, mode=0o700)
-    separate = (root / "output/prospective").stat().st_dev != secondary.stat().st_dev
-    if require_separate and not separate:
-        raise ValueError("Secondary checkpoint must be on a different filesystem")
-    offdisk = secondary / key
-    if not offdisk.exists():
-        size = sum((target / name).stat().st_size for name in files)
-        if shutil.disk_usage(secondary).free < size + RESERVE_BYTES:
-            raise OSError("Secondary backup requires at least 5 GiB reserve")
-        with tempfile.TemporaryDirectory(dir=secondary, prefix=".staging-") as temp:
-            copied = Path(temp) / "checkpoint"
-            shutil.copytree(target, copied)
-            verify_checkpoint(copied)
-            _sync_tree(copied)
-            copied.rename(offdisk)
-            _sync(secondary)
-    verify_checkpoint(offdisk)
+    size = sum((target / name).stat().st_size for name in files)
+    separate, copied_target = False, None
+    if secondary is not None:
+        # Opting in remains strict; an off-device failure never silently downgrades.
+        secondary = Path(secondary)
+        secondary.mkdir(parents=True, exist_ok=True, mode=0o700)
+        separate = (root / "output/prospective").stat().st_dev != secondary.stat().st_dev
+        if require_separate and not separate:
+            raise ValueError("Secondary checkpoint must be on a different filesystem")
+        copied_target = secondary / key
+        if not copied_target.exists():
+            if shutil.disk_usage(secondary).free < size + RESERVE_BYTES:
+                raise OSError("Secondary backup requires at least 5 GiB reserve")
+            with tempfile.TemporaryDirectory(dir=secondary, prefix=".staging-") as temp:
+                copied = Path(temp) / "checkpoint"
+                shutil.copytree(target, copied)
+                verify_checkpoint(copied)
+                _sync_tree(copied)
+                copied.rename(copied_target)
+                _sync(secondary)
+        verify_checkpoint(copied_target)
+    if secondary is None and shutil.disk_usage(target.parent).free < size + RESERVE_BYTES:
+        raise OSError("Local restore drill requires at least 5 GiB reserve")
     # Restore the whole bundle into a temporary location, never over production.
     with tempfile.TemporaryDirectory(dir=root / "output/prospective_backups", prefix=".restore-") as temp:
         restored = Path(temp) / "checkpoint"
-        shutil.copytree(offdisk, restored)
+        shutil.copytree(copied_target or target, restored)
         if verify_checkpoint(restored) != manifest:
             raise ValueError("Restore drill failed")
     return {"status": "verified", "checkpoint": key, "primary": str(target),
-            "secondary": str(offdisk), "separate_filesystem": separate,
+            "secondary": str(copied_target) if copied_target else None, "separate_filesystem": separate,
+            "mode": "separate_disk" if separate else "same_disk",
+            "disk_failure_protected": separate,
             "restore_verified": True, "row_counts": manifest["row_counts"]}
 
 
@@ -387,7 +394,56 @@ def _milestones(summary, plan, now):
             "pending": summary.get("n_pending"), "target": plan["scheduled_windows"]}
 
 
-def supervise(root=ROOT, secondary=SECONDARY, now=None, publisher=None, require_separate=True):
+def backup_regime_ledger(root=ROOT):
+    """A consistent local recovery copy of the separate, ongoing observation ledger."""
+    root = Path(root)
+    source = root / "output/regime_observation/ledger.sqlite"
+    if not source.exists():
+        return None
+    primary = root / "output/regime_backups"
+    primary.mkdir(parents=True, exist_ok=True, mode=0o700)
+    if shutil.disk_usage(primary).free < 2 * source.stat().st_size + RESERVE_BYTES:
+        raise OSError("Local regime backup requires at least 5 GiB reserve")
+
+    def verify(path):
+        with closing(sqlite3.connect(Path(path).resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as conn:
+            if conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                raise ValueError("Regime backup SQLite integrity failure")
+            protocol = trial._manifest(conn)
+            counts = [conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                      for table in ("observations", "outcomes")]
+        return {"protocol_sha256": trial._digest(protocol), "row_counts": counts}
+
+    with tempfile.TemporaryDirectory(dir=primary, prefix=".staging-") as folder:
+        snapshot = Path(folder) / "ledger.sqlite"
+        started = time.monotonic()
+        def bounded_backup(status, remaining, total):
+            if time.monotonic() - started > 20:
+                raise TimeoutError("Regime backup exceeded 20 seconds")
+        with closing(sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True, timeout=5)) as src:
+            with closing(sqlite3.connect(snapshot)) as dst:
+                src.backup(dst, pages=128, progress=bounded_backup, sleep=0.1)
+        details = verify(snapshot)
+        checksum = artifact_sha256(snapshot)
+        target = primary / f"{checksum}.sqlite"
+        if target.exists():
+            if artifact_sha256(target) != checksum:
+                raise ValueError("Existing regime recovery copy changed")
+        else:
+            os.chmod(snapshot, 0o600)
+            _sync(snapshot)
+            snapshot.rename(target)
+            _sync(primary)
+        restored = Path(folder) / "restored.sqlite"
+        shutil.copy2(target, restored)
+        if artifact_sha256(restored) != checksum or verify(restored) != details:
+            raise ValueError("Regime ledger restore drill failed")
+    return {"status": "verified", "primary": str(target), "checkpoint": checksum,
+            "mode": "same_disk", "disk_failure_protected": False,
+            "restore_verified": True, **details}
+
+
+def supervise(root=ROOT, secondary=None, now=None, publisher=None, require_separate=True):
     """One bounded, restartable pass. Only final evidence is classified as terminal."""
     root = Path(root)
     current = trial._utc(now)
@@ -423,6 +479,11 @@ def supervise(root=ROOT, secondary=SECONDARY, now=None, publisher=None, require_
             backup = backup_checkpoint(root, secondary, require_separate=require_separate)
         except Exception as exc:
             errors.append(f"backup: {type(exc).__name__}: {exc}")
+        regime_backup = None
+        try:
+            regime_backup = backup_regime_ledger(root)
+        except Exception as exc:
+            errors.append(f"regime_backup: {type(exc).__name__}: {exc}")
         if final_path.exists():
             final = _verified_document(final_path)
             if final["review_plan_sha256"] != trial._digest(plan):
@@ -449,7 +510,7 @@ def supervise(root=ROOT, secondary=SECONDARY, now=None, publisher=None, require_
                  "integrity_basis": summary.get("integrity_basis", "registered_live_runtime"),
                  "live_runtime_matches": summary.get("live_runtime_matches", summary.get("runtime_matches")),
                  "frozen_model_matches": summary.get("frozen_model_matches"),
-                 "backup": backup, "decision": decision, "errors": errors}
+                 "backup": backup, "regime_backup": regime_backup, "decision": decision, "errors": errors}
         _write(folder / "status.json", state)
         publication_path = folder / "publication.json"
         previous = _load(publication_path) if publication_path.exists() else {}

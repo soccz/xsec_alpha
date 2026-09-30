@@ -43,3 +43,16 @@ def test_notifications_deduplicate_acknowledged_incidents_and_recovery(tmp_path,
     assert ops_status.notify_operations(tmp_path, sender=send)
     assert len(messages) == 3
     assert "복구" in messages[-1]
+    assert "디스크 자체 고장" in messages[-1]
+
+
+def test_default_storage_checks_stay_on_primary_volume(tmp_path, monkeypatch):
+    visited = []
+    def disk_usage(path):
+        visited.append(path)
+        assert path.is_relative_to(tmp_path)
+        return SimpleNamespace(free=20 * 1024**3)
+    monkeypatch.setattr(ops_status.shutil, "disk_usage", disk_usage)
+    rows = ops_status.operational_checks(tmp_path)
+    assert len(visited) == 2
+    assert all(row["status"] == "OK" for row in rows[:2])

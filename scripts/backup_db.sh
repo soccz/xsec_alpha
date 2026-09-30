@@ -13,10 +13,12 @@ umask 077
 
 DB="${XSEC_DB_PATH:-/mnt/20t/main/gan_t/data/crypto_data.db}"
 BACKUP_DIR="${XSEC_BACKUP_DIR:-/home/soccz/22tb/backups/xsec_db}"
-SECONDARY_BACKUP_DIR="${XSEC_SECONDARY_BACKUP_DIR:-/home/soccz/xsec_db_offdisk}"
+# Same-disk recovery is the approved default; a second filesystem is optional.
+SECONDARY_BACKUP_DIR="${XSEC_SECONDARY_BACKUP_DIR:-}"
 KEEP_DAYS="${XSEC_BACKUP_KEEP_DAYS:-30}"
 SECONDARY_KEEP_COUNT="${XSEC_SECONDARY_BACKUP_KEEP_COUNT:-3}"
 SECONDARY_RESERVE_KB="${XSEC_SECONDARY_BACKUP_RESERVE_KB:-5242880}"
+PRIMARY_RESERVE_KB="${XSEC_PRIMARY_BACKUP_RESERVE_KB:-5242880}"
 REQUIRE_SEPARATE_DEVICE="${XSEC_REQUIRE_SEPARATE_DEVICE:-1}"
 BUSY_TIMEOUT_MS="${XSEC_BACKUP_BUSY_TIMEOUT_MS:-60000}"
 ATTEMPTS="${XSEC_BACKUP_ATTEMPTS:-3}"
@@ -35,6 +37,7 @@ require_nonnegative_integer() {
 require_nonnegative_integer XSEC_BACKUP_KEEP_DAYS "${KEEP_DAYS}"
 require_nonnegative_integer XSEC_SECONDARY_BACKUP_KEEP_COUNT "${SECONDARY_KEEP_COUNT}"
 require_nonnegative_integer XSEC_SECONDARY_BACKUP_RESERVE_KB "${SECONDARY_RESERVE_KB}"
+require_nonnegative_integer XSEC_PRIMARY_BACKUP_RESERVE_KB "${PRIMARY_RESERVE_KB}"
 require_nonnegative_integer XSEC_REQUIRE_SEPARATE_DEVICE "${REQUIRE_SEPARATE_DEVICE}"
 require_nonnegative_integer XSEC_BACKUP_BUSY_TIMEOUT_MS "${BUSY_TIMEOUT_MS}"
 require_nonnegative_integer XSEC_BACKUP_ATTEMPTS "${ATTEMPTS}"
@@ -67,31 +70,48 @@ if [[ ! -f "${DB}" || ! -r "${DB}" || ! -s "${DB}" ]]; then
   exit 1
 fi
 
-mkdir -p "${BACKUP_DIR}" "${SECONDARY_BACKUP_DIR}"
+mkdir -p "${BACKUP_DIR}"
 
 SOURCE_DEVICE=$(stat -c %d "${DB}")
-SECONDARY_DEVICE=$(stat -c %d "${SECONDARY_BACKUP_DIR}")
-if (( REQUIRE_SEPARATE_DEVICE == 1 )) && [[ "${SOURCE_DEVICE}" == "${SECONDARY_DEVICE}" ]]; then
-  echo "[backup_db] secondary backup must be on a different physical filesystem: ${SECONDARY_BACKUP_DIR}" >&2
+SOURCE_KB=$(( ($(stat -c %s "${DB}") + 1023) / 1024 ))
+PRIMARY_AVAILABLE_KB=$(df -Pk -- "${BACKUP_DIR}" | awk 'NR == 2 {print $4}')
+if (( PRIMARY_AVAILABLE_KB < SOURCE_KB + PRIMARY_RESERVE_KB )); then
+  echo "[backup_db] insufficient primary space: need ${SOURCE_KB} KiB plus ${PRIMARY_RESERVE_KB} KiB reserve" >&2
   exit 1
 fi
-
-SOURCE_KB=$(( ($(stat -c %s "${DB}") + 1023) / 1024 ))
-SECONDARY_AVAILABLE_KB=$(df -Pk -- "${SECONDARY_BACKUP_DIR}" | awk 'NR == 2 {print $4}')
-if (( SECONDARY_AVAILABLE_KB < SOURCE_KB + SECONDARY_RESERVE_KB )); then
-  echo "[backup_db] insufficient secondary space: need ${SOURCE_KB} KiB plus ${SECONDARY_RESERVE_KB} KiB reserve" >&2
-  exit 1
+if [[ -n "${SECONDARY_BACKUP_DIR}" ]]; then
+  mkdir -p "${SECONDARY_BACKUP_DIR}"
+  if [[ "$(realpath "${BACKUP_DIR}")" == "$(realpath "${SECONDARY_BACKUP_DIR}")" ]]; then
+    echo "[backup_db] primary and secondary directories must differ" >&2
+    exit 1
+  fi
+  SECONDARY_DEVICE=$(stat -c %d "${SECONDARY_BACKUP_DIR}")
+  if (( REQUIRE_SEPARATE_DEVICE == 1 )) && [[ "${SOURCE_DEVICE}" == "${SECONDARY_DEVICE}" ]]; then
+    echo "[backup_db] secondary backup must be on a different physical filesystem: ${SECONDARY_BACKUP_DIR}" >&2
+    exit 1
+  fi
+  SECONDARY_AVAILABLE_KB=$(df -Pk -- "${SECONDARY_BACKUP_DIR}" | awk 'NR == 2 {print $4}')
+  if (( SECONDARY_AVAILABLE_KB < SOURCE_KB + SECONDARY_RESERVE_KB )); then
+    echo "[backup_db] insufficient secondary space: need ${SOURCE_KB} KiB plus ${SECONDARY_RESERVE_KB} KiB reserve" >&2
+    exit 1
+  fi
 fi
 
 TS=$(date -u +%Y%m%dT%H%M%SZ)
 TARGET="${BACKUP_DIR}/crypto_data_${TS}_$$.db"
 PARTIAL="${TARGET}.partial"
-SECONDARY_TARGET="${SECONDARY_BACKUP_DIR}/${TARGET##*/}"
-SECONDARY_PARTIAL="${SECONDARY_TARGET}.partial"
+SECONDARY_TARGET=""
+SECONDARY_PARTIAL=""
+if [[ -n "${SECONDARY_BACKUP_DIR}" ]]; then
+  SECONDARY_TARGET="${SECONDARY_BACKUP_DIR}/${TARGET##*/}"
+  SECONDARY_PARTIAL="${SECONDARY_TARGET}.partial"
+fi
 
 cleanup_partial() {
   rm -f -- "${PARTIAL}"
-  rm -f -- "${SECONDARY_PARTIAL}"
+  if [[ -n "${SECONDARY_PARTIAL}" ]]; then
+    rm -f -- "${SECONDARY_PARTIAL}"
+  fi
 }
 
 trap cleanup_partial EXIT
@@ -142,18 +162,21 @@ if [[ "${HAS_CRYPTO_DATA}" != "1" ]]; then
   exit 2
 fi
 
-# Copy the verified snapshot to a separate physical filesystem. A byte-for-byte
-# comparison is required before either snapshot is published under its final name.
-cp --reflink=never -- "${PARTIAL}" "${SECONDARY_PARTIAL}"
-sync -f "${SECONDARY_PARTIAL}"
-if ! cmp -s -- "${PARTIAL}" "${SECONDARY_PARTIAL}"; then
-  echo "[backup_db] secondary copy verification failed: ${SECONDARY_PARTIAL}" >&2
-  exit 2
+# An explicitly configured secondary is still verified before publication.
+if [[ -n "${SECONDARY_BACKUP_DIR}" ]]; then
+  cp --reflink=never -- "${PARTIAL}" "${SECONDARY_PARTIAL}"
+  sync -f "${SECONDARY_PARTIAL}"
+  if ! cmp -s -- "${PARTIAL}" "${SECONDARY_PARTIAL}"; then
+    echo "[backup_db] secondary copy verification failed: ${SECONDARY_PARTIAL}" >&2
+    exit 2
+  fi
+  mv -- "${SECONDARY_PARTIAL}" "${SECONDARY_TARGET}"
 fi
 
 # Publish only complete, verified snapshots.
-mv -- "${SECONDARY_PARTIAL}" "${SECONDARY_TARGET}"
+sync -f "${PARTIAL}"
 mv -- "${PARTIAL}" "${TARGET}"
+sync -f "${BACKUP_DIR}"
 trap - EXIT HUP INT TERM
 
 # Prune older than KEEP_DAYS
@@ -178,13 +201,23 @@ prune_to_count() {
   done
 }
 
-prune_to_count "${SECONDARY_BACKUP_DIR}" "${SECONDARY_KEEP_COUNT}"
+if [[ -n "${SECONDARY_BACKUP_DIR}" ]]; then
+  prune_to_count "${SECONDARY_BACKUP_DIR}" "${SECONDARY_KEEP_COUNT}"
+fi
 
 # Report
 COUNT=$(find "${BACKUP_DIR}" -maxdepth 1 -type f -name "crypto_data_*.db" \
   -size +0c | wc -l)
 SIZE=$(du -sh "${BACKUP_DIR}" | cut -f1)
-SECONDARY_COUNT=$(find "${SECONDARY_BACKUP_DIR}" -maxdepth 1 -type f \
-  -name "crypto_data_*.db" -size +0c | wc -l)
 echo "[backup_db] ok: ${TARGET} (kept ${COUNT} primary snapshots, total ${SIZE})"
-echo "[backup_db] off-device: ${SECONDARY_TARGET} (kept ${SECONDARY_COUNT})"
+if [[ -n "${SECONDARY_BACKUP_DIR}" ]]; then
+  SECONDARY_COUNT=$(find "${SECONDARY_BACKUP_DIR}" -maxdepth 1 -type f \
+    -name "crypto_data_*.db" -size +0c | wc -l)
+  if [[ "${SOURCE_DEVICE}" != "${SECONDARY_DEVICE}" ]]; then
+    echo "[backup_db] off-device: ${SECONDARY_TARGET} (kept ${SECONDARY_COUNT})"
+  else
+    echo "[backup_db] same-device secondary: ${SECONDARY_TARGET} (disk failure NOT protected)"
+  fi
+else
+  echo "[backup_db] local recovery only; off-device backup disabled (disk failure NOT protected)"
+fi

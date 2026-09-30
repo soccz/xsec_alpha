@@ -26,6 +26,7 @@ def backup_env(source: Path, backup_dir: Path, **overrides: str) -> dict[str, st
             "XSEC_BACKUP_KEEP_DAYS": "30",
             "XSEC_SECONDARY_BACKUP_KEEP_COUNT": "3",
             "XSEC_SECONDARY_BACKUP_RESERVE_KB": "0",
+            "XSEC_PRIMARY_BACKUP_RESERVE_KB": "0",
             "XSEC_REQUIRE_SEPARATE_DEVICE": "0",
             "XSEC_BACKUP_BUSY_TIMEOUT_MS": "100",
             "XSEC_BACKUP_ATTEMPTS": "3",
@@ -207,3 +208,36 @@ def test_secondary_retention_keeps_newest_three(tmp_path: Path) -> None:
 
     assert len(snapshots(backup_dir)) == 4
     assert len(snapshots(tmp_path / "secondary")) == 3
+
+
+def test_local_only_needs_no_secondary_directory(tmp_path: Path) -> None:
+    source, backup_dir = tmp_path / "source.db", tmp_path / "backups"
+    create_source(source)
+    env = backup_env(source, backup_dir)
+    del env["XSEC_SECONDARY_BACKUP_DIR"]
+    result = subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True, timeout=15)
+    assert result.returncode == 0, result.stderr
+    assert "local recovery only" in result.stdout and "NOT protected" in result.stdout
+    assert len(snapshots(backup_dir)) == 1
+    assert not (tmp_path / "secondary").exists()
+    assert not partials(backup_dir)
+    with sqlite3.connect(snapshots(backup_dir)[0]) as conn:
+        assert conn.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+
+
+def test_local_backup_still_enforces_space_reserve(tmp_path: Path) -> None:
+    source, backup_dir = tmp_path / "source.db", tmp_path / "backups"
+    create_source(source)
+    result = run_backup(source, backup_dir, XSEC_SECONDARY_BACKUP_DIR="",
+                        XSEC_PRIMARY_BACKUP_RESERVE_KB="999999999999")
+    assert result.returncode != 0
+    assert "insufficient primary space" in result.stderr
+    assert not snapshots(backup_dir)
+
+
+def test_secondary_same_directory_is_rejected(tmp_path: Path) -> None:
+    source, backup_dir = tmp_path / "source.db", tmp_path / "backups"
+    create_source(source)
+    result = run_backup(source, backup_dir, XSEC_SECONDARY_BACKUP_DIR=str(backup_dir))
+    assert result.returncode != 0
+    assert "directories must differ" in result.stderr

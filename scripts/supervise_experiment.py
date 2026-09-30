@@ -8,7 +8,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils.experiment_supervisor import SECONDARY, register_review, seal_completed, supervise
+from utils.experiment_supervisor import register_review, seal_completed, supervise
 
 
 def main():
@@ -18,7 +18,8 @@ def main():
     parser.add_argument("--no-publish", action="store_true")
     parser.add_argument("--seal-completed", action="store_true")
     parser.add_argument("--no-alert", action="store_true")
-    parser.add_argument("--secondary-backup", type=Path, default=SECONDARY)
+    parser.add_argument("--secondary-backup", type=Path,
+                        help="Optional different-filesystem copy; default is verified local recovery only")
     args = parser.parse_args()
     if args.register:
         register_review()

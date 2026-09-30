@@ -12,7 +12,9 @@ that sealed evidence separately from current live runtime. Direct calls to the
 old `experiment_summary()` still truthfully report current-source mismatch;
 that is not a rewritten historical protocol. See
 [separate regime observation](regime_observation.md) for the new, non-switching
-diagnostic stream. Completed secondary backup remains blocked by disk capacity.
+diagnostic stream. On September 30 the operator explicitly accepted local-only
+recovery: the verified primary checkpoint and restore drill remain required,
+but a second disk is no longer mandatory. Disk-failure protection is absent.
 
 ## Registration
 
