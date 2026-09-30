@@ -56,3 +56,20 @@ def test_default_storage_checks_stay_on_primary_volume(tmp_path, monkeypatch):
     rows = ops_status.operational_checks(tmp_path)
     assert len(visited) == 2
     assert all(row["status"] == "OK" for row in rows[:2])
+
+
+def test_registered_pilot_requires_fresh_processing_and_verified_backup(tmp_path):
+    folder = tmp_path / "output/rotation_pilot"
+    folder.mkdir(parents=True)
+    (folder / "ledger.sqlite").touch()
+    (folder / "summary.json").write_text(json.dumps({"status": "observing", "checked_at": "2026-09-30T03:00:00+00:00"}))
+    parent = tmp_path / "output/experiment_supervision"
+    parent.mkdir()
+    (parent / "status.json").write_text(json.dumps({"checked_at": "2026-09-30T03:00:00+00:00",
+                                                   "rotation_backup": {"restore_verified": True}}))
+    now = datetime(2026, 9, 30, 3, 10, tzinfo=timezone.utc)
+    rows = ops_status.operational_checks(tmp_path, now)
+    assert all(r["status"] == "OK" for r in rows if r["check"].startswith("ROTATION"))
+    (folder / "summary.json").write_text('{"status":"integrity_failure","checked_at":"2026-09-30T03:00:00+00:00"}')
+    rows = ops_status.operational_checks(tmp_path, now)
+    assert next(r for r in rows if r["check"] == "ROTATION_PILOT")["status"] == "FAIL"

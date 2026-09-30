@@ -36,6 +36,13 @@ def operational_checks(root=ROOT, now=None, secondary=None):
     if (root / "output/regime_observation/ledger.sqlite").exists():
         checks.append(("REGIME_BACKUP", state, "checked_at", 30,
                        (state.get("regime_backup") or {}).get("restore_verified") is True))
+    if (root / "output/rotation_pilot/ledger.sqlite").exists():
+        pilot = _load(root / "output/rotation_pilot/summary.json")
+        checks.append(("ROTATION_PILOT", pilot, "checked_at", 30,
+                       pilot.get("status") in ("observing", "insufficient_evidence", "policy_not_exercised",
+                                               "pilot_complete_not_confirmatory")))
+        checks.append(("ROTATION_BACKUP", state, "checked_at", 30,
+                       (state.get("rotation_backup") or {}).get("restore_verified") is True))
     for name, doc, key, max_minutes, good in checks:
         try:
             age = (now - datetime.fromisoformat(doc[key])).total_seconds() / 60

@@ -207,6 +207,37 @@ def test_failed_publish_retries_next_pass(registered, tmp_path):
     assert not state["errors"]
 
 
+def test_rotation_failure_is_reported_without_losing_original_supervision(registered, monkeypatch):
+    from utils import rotation_pilot
+    root, _ = registered
+    def fail(**kwargs):
+        raise ValueError("pilot integrity test failure")
+    monkeypatch.setattr(rotation_pilot, "refresh_pilot", fail)
+    monkeypatch.setattr(rotation_pilot, "backup_pilot", lambda root: {"restore_verified": True})
+    state = monitor.supervise(root, now="2026-09-07T04:10Z")
+    assert state["status"] == "attention"
+    assert state["errors"] == ["rotation_pilot: ValueError: pilot integrity test failure"]
+    assert state["backup"]["restore_verified"]
+    assert state["rotation_backup"]["restore_verified"]
+    assert state["rotation_pilot"] is None
+    assert state["decision"]["code"] == "collecting"
+
+
+def test_rotation_heartbeat_does_not_publish_every_pass(registered, monkeypatch):
+    from utils import rotation_pilot
+    root, _ = registered
+    calls = []
+    monkeypatch.setattr(rotation_pilot, "refresh_pilot", lambda **kwargs: {
+        "status": "observing", "checked_at": trial._utc(kwargs["now"]).isoformat(),
+        "decision": {"counts": {"recorded": 0}},
+    })
+    for now in ("2026-09-07T04:10Z", "2026-09-07T04:20Z"):
+        state = monitor.supervise(root, now=now, publisher=lambda: calls.append(True) or True)
+        assert state["rotation_pilot"]["checked_at"] == trial._utc(now).isoformat()
+        assert not state["errors"]
+    assert len(calls) == 1
+
+
 def test_completed_archive_survives_live_code_changes_but_not_evidence_changes(registered, tmp_path):
     root, plan = registered
     monitor.supervise(root, tmp_path / "secondary", now=plan["hard_review_at"], require_separate=False)
