@@ -478,6 +478,7 @@ def _advance_comparisons(conn, tables, root, current):
         if ok:
             for key, result in results:
                 _append(conn, "comparisons", key, result)
+                tables["comparisons"][key] = result
                 selected[slot] = key
     return selected
 
@@ -512,11 +513,14 @@ def _advance_deliveries(conn, tables, root, current):
         ok, result = _try_input(conn, tables, "report", str(path.relative_to(root)), None, current,
                                 lambda: _report_delivery(path, tables, current))
         if ok and result:
-            _append(conn, "deliveries", result["signal_at"] + "/" + trial._digest(result["report"]), result)
+            key = result["signal_at"] + "/" + trial._digest(result["report"])
+            _append(conn, "deliveries", key, result)
+            tables["deliveries"][key] = result
 
 
 def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None, execution_loader=None):
     root, current = Path(root), trial._utc(now)
+    started = time.monotonic()
     folder = _folder(root)
     if not (folder / "ledger.sqlite").exists():
         return None
@@ -547,6 +551,15 @@ def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None, exe
                         continue
                     _append(conn, "signals", slot, row)
                     tables["signals"][slot] = row
+                # Capture and commit expiring observations before historical evaluation.
+                _advance_deliveries(conn, tables, root, trial._utc(now))
+                from utils.venue_observer import advance_venue, settle_venue, venue_summary
+                from utils.execution_audit import advance_execution, execution_summary
+                from utils.selection_trace import selection_summary
+                advance_venue(conn, tables, policy, root, now=now, quote_loader=quote_loader)
+                advance_execution(conn, tables, policy, now=now, loader=execution_loader)
+                conn.commit()
+                captured = time.monotonic()
                 pending = {}
                 mature = [r["witness"] for slot, r in tables["signals"].items()
                           if r["status"] == "recorded" and slot not in tables["outcomes"]
@@ -577,19 +590,20 @@ def refresh_audit(root=ROOT, now=None, price_loader=None, quote_loader=None, exe
                     else:
                         pending[slot] = reason
                 current_comparisons = _advance_comparisons(conn, tables, root, current)
-                _advance_deliveries(conn, tables, root, current)
-                policy, tables = _read(conn)
-                from utils.venue_observer import advance_venue, venue_summary
-                advance_venue(conn, tables, policy, root, now=now, quote_loader=quote_loader)
-                policy, tables = _read(conn)
-                from utils.execution_audit import advance_execution, execution_summary
-                from utils.selection_trace import selection_summary
-                advance_execution(conn, tables, policy, now=now, loader=execution_loader)
+                settle_venue(conn, tables, policy)
                 policy, tables = _read(conn)
                 state = _summary(policy, tables, trial._utc(now), pending, current_comparisons)
                 state["venue"] = venue_summary(tables)
                 state["execution"] = execution_summary(tables)
                 state["selection"] = selection_summary(tables)
+                from utils.operating_acceptance import cycle_summary, gate_shadow
+                state["lifecycle"] = cycle_summary(policy, tables, now)
+                state["gate_shadow"] = gate_shadow(state, now)
+                finished = time.monotonic()
+                state["timings"] = {"capture_seconds": round(captured - started, 3),
+                                    "settlement_seconds": round(finished - captured, 3),
+                                    "total_seconds": round(finished - started, 3),
+                                    "ledger_rows": sum(len(rows) for rows in tables.values())}
             _write(folder / "summary.json", state)
             return state
     except (Exception, SystemExit) as exc:
@@ -630,8 +644,13 @@ def backup_audit(root=ROOT):
         restored = Path(temporary) / "restored.sqlite"
         shutil.copy2(destination, restored)
         with closing(_connect(restored, "ro")) as conn:
-            if artifact_sha256(restored) != digest or _read(conn) != (policy, tables):
+            # Identical bytes retain the full semantic replay above; verify the copy's SQLite structure too.
+            if (artifact_sha256(restored) != digest or conn.execute("PRAGMA integrity_check").fetchone()[0] != "ok"
+                    or any(conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0] != len(rows)
+                           for table, rows in tables.items() if rows)):
                 raise ValueError("Forecast audit restore verification failed")
+    from utils.operating_acceptance import first_evidence
     return {"status": "verified", "checkpoint": digest, "restore_verified": True,
             "mode": "same_disk", "disk_failure_protected": False,
+            "first_cycle_evidence_sha256": first_evidence(policy, tables)[1],
             "row_counts": {key: len(value) for key, value in tables.items()}}

@@ -218,12 +218,17 @@ def advance_execution(conn, tables, audit_policy, now=None, loader=None):
                     row = {**base, "status": "failed", "reason": f"{type(exc).__name__}: {exc}"[:300], **(response or {})}
                 _append(conn, TABLE, key, row)
                 records[key] = row
+                conn.commit()
         result_key = "result/" + slot
         if result_key not in records:
             result = _result(slot, intent, records, policy)
             if result:
                 _append(conn, TABLE, result_key, result)
                 records[result_key] = result
+    # Funding has a multi-hour deadline; it must not consume a live depth window.
+    for slot, intent in tables["venue_intents"].items():
+        if trial._utc(slot) < trial._utc(policy["first_signal_at"]) or intent["status"] != "recorded":
+            continue
         for market in _members(intent):
             symbol = intent["symbols"][market]
             key = f"funding/{slot}/{symbol}"
@@ -250,6 +255,7 @@ def advance_execution(conn, tables, audit_policy, now=None, loader=None):
                 row = {**base, "status": "failed", "reason": f"{type(exc).__name__}: {exc}"[:300], **(response or {})}
             _append(conn, TABLE, key, row)
             records[key] = row
+            conn.commit()
 
 
 def verify_execution(tables, audit_policy):

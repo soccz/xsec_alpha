@@ -166,6 +166,18 @@ def advance_venue(conn, tables, policy, root, now=None, quote_loader=None):
                              "reason": f"{type(exc).__name__}: {exc}"}
             _append(conn, "quotes", key, quote)
             tables["quotes"][key] = quote
+            conn.commit()
+    settle_venue(conn, tables, policy)
+
+
+def settle_venue(conn, tables, policy):
+    """Settle existing observations without any network calls."""
+    from utils.forecast_audit import _append
+
+    for slot, intent in tables["venue_intents"].items():
+        if intent["status"] != "recorded" or slot in tables["venue_outcomes"]:
+            continue
+        source = tables["signals"][slot]
         entry, exit_quote = (tables["quotes"].get(slot + "/" + p) for p in ("entry", "exit"))
         bad = next((q for q in (entry, exit_quote) if q and q["status"] != "observed"), None)
         upbit = tables["outcomes"].get(slot)
@@ -178,16 +190,17 @@ def advance_venue(conn, tables, policy, root, now=None, quote_loader=None):
         else:
             continue
         _append(conn, "venue_outcomes", slot, result)
+        tables["venue_outcomes"][slot] = result
 
 
 def verify_venue(tables, policy):
+    reports = {trial._digest(r["report"]): r["report"] for r in tables["deliveries"].values()}
     for slot, intent in tables["venue_intents"].items():
         if intent["signal_at"] != slot or slot not in tables["signals"]:
             raise ValueError("Venue intent signal mismatch")
         if intent["status"] == "recorded":
-            reports = [r["report"] for r in tables["deliveries"].values()
-                       if trial._digest(r["report"]) == intent["report_sha256"]]
-            if not reports or make_intent(tables["signals"][slot]["witness"], reports[0], intent["observed_at"]) != intent:
+            report = reports.get(intent["report_sha256"])
+            if report is None or make_intent(tables["signals"][slot]["witness"], report, intent["observed_at"]) != intent:
                 raise ValueError("Venue intent binding mismatch")
         elif intent["status"] not in ("missed", "invalid"):
             raise ValueError("Invalid venue intent state")

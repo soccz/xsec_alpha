@@ -91,3 +91,26 @@ def test_forecast_audit_must_be_fresh_and_backed_up_without_treating_ic_gap_as_f
     (folder / "summary.json").write_text('{"status":"attention","checked_at":"2026-09-30T03:00:00+00:00"}')
     rows = ops_status.operational_checks(tmp_path, now)
     assert next(r for r in rows if r["check"] == "FORECAST_AUDIT")["status"] == "FAIL"
+
+
+def test_runtime_headroom_and_pages_receipt_have_independent_checks(tmp_path):
+    from utils.experiment_supervisor import _write
+
+    folder = tmp_path / "output/forecast_audit"
+    folder.mkdir(parents=True)
+    (folder / "ledger.sqlite").touch()
+    stamp = "2026-09-30T03:40:00+00:00"
+    doc = {"status": "monitoring", "checked_at": stamp, "timings": {"capture_seconds": 61, "total_seconds": 110}}
+    _write(folder / "summary.json", doc)
+    state = {"checked_at": stamp, "operating_acceptance": {"closed": {"closed_at": "2026-09-30T03:00:00+00:00"},
+                                                          "publication": {"status": "waiting"}}}
+    _write(tmp_path / "output/experiment_supervision/status.json", state)
+    now = datetime(2026, 9, 30, 3, 45, tzinfo=timezone.utc)
+    rows = {r["check"]: r["status"] for r in ops_status.operational_checks(tmp_path, now)}
+    assert rows["AUDIT_RUNTIME"] == rows["OPERATING_PUBLICATION"] == "FAIL"
+    doc["timings"] = {"capture_seconds": 2, "total_seconds": 10}
+    state["operating_acceptance"]["publication"]["status"] = "verified"
+    _write(folder / "summary.json", doc)
+    _write(tmp_path / "output/experiment_supervision/status.json", state)
+    rows = {r["check"]: r["status"] for r in ops_status.operational_checks(tmp_path, now)}
+    assert rows["AUDIT_RUNTIME"] == rows["OPERATING_PUBLICATION"] == "OK"

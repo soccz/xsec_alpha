@@ -1219,6 +1219,12 @@ def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
     if public_target is not None:
         public_target.parent.mkdir(parents=True, exist_ok=True)
         public_payload = build_public_summary_payload()
+        acceptance = (payloads["summary.json"].get("experiment_supervision") or {}).get("operating_acceptance") or {}
+        if acceptance.get("closed_sha256"):
+            public_payload["operating_receipt"] = {
+                "closed_sha256": acceptance["closed_sha256"],
+                "summary_sha256": hashlib.sha256(written["summary.json"].read_bytes()).hexdigest(),
+            }
         public_target.write_text(json.dumps(public_payload, ensure_ascii=False, indent=2))
         written["public_summary.json"] = public_target
 

@@ -164,3 +164,20 @@ def test_public_quote_client_has_no_auth_or_order_endpoint(monkeypatch):
     monkeypatch.setattr(venue.urllib.request, "urlopen", fetch)
     payload, observed = venue.fetch_quotes()
     assert len(called) == 1 and len(payload["data"]) == 12 and observed.tzinfo is not None
+
+
+def test_venue_replay_hashes_each_report_once_not_once_per_intent(monkeypatch):
+    reports = [{"test_report": i} for i in range(50)]
+    original = trial._digest
+    intents = {str(i): {"signal_at": str(i), "status": "recorded", "observed_at": "2026-09-30T11:10Z",
+                       "report_sha256": original(report)} for i, report in enumerate(reports)}
+    tables = {"signals": {str(i): {"witness": {}} for i in range(50)}, "venue_intents": intents,
+              "deliveries": {str(i): {"report": r} for i, r in enumerate(reports)}, "quotes": {}, "venue_outcomes": {}}
+    count = []
+    def digest(value):
+        count.append(True)
+        return original(value)
+    monkeypatch.setattr(trial, "_digest", digest)
+    monkeypatch.setattr(venue, "make_intent", lambda witness, report, now: intents[str(report["test_report"])])
+    venue.verify_venue(tables, {})
+    assert len(count) == len(reports)

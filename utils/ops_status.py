@@ -58,6 +58,20 @@ def operational_checks(root=ROOT, now=None, secondary=None):
                            audit["selection"].get("replay_matches") is True and audit["selection"].get("report_matches") is True))
         elif audit.get("selection", {}).get("status") == "error":
             checks.append(("SELECTION_TRACE", audit, "checked_at", 30, False))
+        if audit.get("timings"):
+            timing = audit["timings"]
+            checks.append(("AUDIT_RUNTIME", audit, "checked_at", 30,
+                           timing.get("capture_seconds", float("inf")) <= 60 and timing.get("total_seconds", float("inf")) <= 120))
+        acceptance = state.get("operating_acceptance") or {}
+        closed = acceptance.get("closed")
+        if closed:
+            try:
+                overdue = (now - datetime.fromisoformat(closed["closed_at"])).total_seconds() > 1800
+            except (KeyError, ValueError, TypeError):
+                overdue = True
+            if overdue:
+                checks.append(("OPERATING_PUBLICATION", state, "checked_at", 30,
+                               (acceptance.get("publication") or {}).get("status") == "verified"))
     for name, doc, key, max_minutes, good in checks:
         try:
             age = (now - datetime.fromisoformat(doc[key])).total_seconds() / 60
