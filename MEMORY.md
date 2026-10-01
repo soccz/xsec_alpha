@@ -1,6 +1,18 @@
 # xsec_alpha continuity
 
-Updated 2026-09-30.
+Updated 2026-10-01.
+
+## 2026-10-01 Site Roles and Visualization
+
+- User approved clarifying the two public pages and strengthening visualization. Story is the dated research/decision journal; dashboard is the current operational evidence surface. Shared persistent page switch, explicit current page, preserved historical section/article IDs and working deep links. Never treat successful deployment as proof of intuitive UX.
+- Two HTML files edited in ignored `output/site-preview/projects/xsec-alpha/`, published via the existing isolated six-path publisher (two HTML plus four payloads), never the user's external website checkout. Website commit `224bdca3b5dd8b0be36f216a9b64e16ea1f0a86e`; exact-head Pages run `36820763258` succeeded Oct1 14:40:08 KST. No model, gate, Telegram, evaluator, frozen pilot source, or experiment protocol changes.
+- Story corrects the stale present-tense 60-window introduction; displays the closed trial's mean difference +0.500%p and 95% interval [-0.235,+1.318]%p, plus explicitly conditional research-only 75/25 mixing. Detailed historical chapters are preserved in two native disclosures. A hash link opens the appropriate chapter.
+- Dashboard places timestamp, data checks, signal gate, Telegram acknowledgement, concise warnings, and current coin tiles first; the 360px viewport shows candidate names. Six evidence disclosures retain all old sections. Added 336-window coverage (matured/pending/missed/invalid/future), actual recent paired-difference points with null gaps, and regime sample grid. Missing weekly groups remain unaggregated, never invented zero samples. A completed 60-window result stays separate. Latest report survives chart CDN or historical payload failure. PIN encryption stays unchanged; no decrypted export or browser fixture is published.
+- Verification: `python scripts/verify_site_ui.py` passes 1440/390/360, syntax/anchor checks, nonblank canvas pixels, private-data gating, disclosures/deep links, empty/stale/FREEZE/missing/negative browser-only fixtures, blocked Chart CDN and blocked history payload. Screenshots in `output/site-ux-verification/`. Related pytest (invariants/operator_report/operating_acceptance/dashboard_publish) 50 passed with four existing sklearn warnings; rotation_pilot/trial_diagnostics another 28 passed (78 total). Ruff/compileall pass; `verify_telegram.py --recent 50` matches all rows.
+- Actual Oct1 health: SHORT is WARN (not yesterday's FREEZE). Execution diagnostics attention is two funding boundary_uncertain records; not proof of server outage. First operating cycle closed_with_gaps is preserved and surfaced, not rewritten as success. At 14:30 KST pilot counts were 4 recorded, 2 matured, 2 pending, zero exercised; these are observations, not frozen expectations for future UI tests.
+- Release proof: `python scripts/verify_site_ui.py --url https://soccz.github.io/ --output output/site-ux-public` passes all desktop/mobile, canvas, deep-link, failure and privacy checks. Public screenshots inspected. Served story SHA256 `fcd07c7666d037a9735dd1117348557c55313f21e0b28fa25dc4befa85ac793c`, dashboard `f001d22cfc6611e05e9aadb66313295437c60db64c6fc813a1410c0d84e75b31` equal reviewed files. One initial public check ran before deployment completed and timed out on the old page; it was rerun successfully after exact served hashes matched. UI bundle is deployed, not just locally changed. The verifier's temporary server/browser are self-cleaning; pre-existing services remain untouched.
+
+## Stable Contracts
 
 - Runtime contract: SHORT emits at most five manual-review signals. The repository has no broker/order API.
 - Latest delivery contract: every normal run includes coin names. Blocked recommendations use non-actionable observations; analysis failure uses dated prior references, never fabricated fresh forecasts. This supersedes the first stability pass's empty-heartbeat-only behavior.
