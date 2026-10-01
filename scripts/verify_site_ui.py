@@ -23,6 +23,7 @@ from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,6 +73,81 @@ def assert_canvas(driver, canvas_id):
     ''', canvas_id), canvas_id
 
 
+def check_refresh_regressions(driver, wait):
+    driver.execute_script('''
+        window.originalFetch = window.fetch; window.originalDecrypt = decryptPayload;
+        window.originalNow = Date.now;
+        window.refreshFixture = structuredClone(dashboardState);
+        for (const part of ['summary','history','accuracy']) {
+            window.refreshFixture[part].export_id = 'browser-only-next';
+            window.refreshFixture[part].asof = new Date(Date.now()+1000).toISOString();
+        }
+        window.fixtureMode = 'success';
+        decryptPayload = async (value,pin) => value.browserOnly ?? window.originalDecrypt(value,pin);
+        window.fetch = async (url,options) => {
+            if (window.fixtureMode === 'offline') throw new Error('browser-only offline');
+            if (window.fixtureMode === 'timeout') return new Promise((resolve,reject)=>options.signal.addEventListener('abort',()=>reject(new DOMException('timeout','AbortError'))));
+            const part = String(url).match(/(summary|history|accuracy)\\.json/)[1];
+            let value = structuredClone(window.refreshFixture[part]);
+            if (window.fixtureMode === 'mismatch' && part === 'history') value.export_id = 'different';
+            if (window.fixtureMode === 'older') value.asof = '2020-01-01T00:00:00Z';
+            return {ok:true,json:async()=>({browserOnly:value})};
+        };
+        document.getElementById('selectionDetail').open=true;
+        const select=document.getElementById('selectionMarket');
+        select.selectedIndex=Math.min(1,select.options.length-1); select.onchange(); select.focus();
+        window.selectedBefore=select.selectedOptions[0].dataset.market;
+    ''')
+    assert driver.execute_async_script('refreshDashboard().then(()=>arguments[0](true))')
+    assert driver.execute_script('''
+        return dashboardState.summary.export_id==='browser-only-next' &&
+          document.getElementById('selectionDetail').open &&
+          document.getElementById('selectionMarket').selectedOptions[0].dataset.market===window.selectedBefore &&
+          document.activeElement.id==='selectionMarket';
+    ''')
+    driver.execute_script("window.fixtureMode='offline'")
+    assert driver.execute_async_script('refreshDashboard().then(()=>arguments[0](true))')
+    assert '갱신 확인 필요' in driver.find_element(By.ID, 'refreshStatus').get_attribute('textContent')
+    assert driver.find_elements(By.CSS_SELECTOR, '#operatorCoinTiles .coin-tile')
+    driver.execute_script('''
+        Date.now=()=>window.originalNow()+9*3600000;
+        window.testIntervals.find(r=>r.ms===30000).fn();
+    ''')
+    assert '게시 자료 지연' in driver.find_element(By.ID, 'opsAlerts').get_attribute('textContent')
+    assert driver.find_element(By.ID, 'megaPulseLabel').get_attribute('textContent') == '자료 지연'
+    driver.execute_script('''
+        Date.now=window.originalNow; window.fixtureMode='mismatch';
+        for(const part of ['summary','history','accuracy']) window.refreshFixture[part].export_id='browser-only-newer';
+    ''')
+    assert driver.execute_async_script('refreshDashboard().then(()=>arguments[0](true))')
+    assert '게시 묶음 불일치' in driver.find_element(By.ID, 'refreshStatus').get_attribute('textContent')
+    assert driver.execute_script("return dashboardState.summary.export_id==='browser-only-newer' && dashboardState.history.export_id==='browser-only-next'")
+    assert '이전 게시 묶음' in driver.find_element(By.ID, 'historicalStatus').get_attribute('textContent')
+    driver.execute_script("window.fixtureMode='success'; window.dispatchEvent(new Event('online'))")
+    wait.until(lambda d: d.execute_script("return !dashboardState.busy && !dashboardState.error && dashboardState.history.export_id==='browser-only-newer'"))
+    driver.execute_script("window.fixtureMode='older'")
+    assert driver.execute_async_script('refreshDashboard().then(()=>arguments[0](true))')
+    assert '이전 게시 자료 수신' in driver.find_element(By.ID, 'refreshStatus').get_attribute('textContent')
+    assert driver.execute_script("return dashboardState.summary.asof !== '2020-01-01T00:00:00Z'")
+    driver.execute_script('''
+        window.fixtureMode='success';
+        window.testIntervals.find(r=>r.ms===60000).fn();
+    ''')
+    wait.until(lambda d: d.execute_script('return !dashboardState.busy && !dashboardState.error'))
+    driver.execute_script('''
+        window.fixtureMode='timeout'; window.originalTimeout=setTimeout;
+        window.setTimeout=(fn,ms,...args)=>window.originalTimeout(fn,ms===15000 ? 30 : ms,...args);
+    ''')
+    assert driver.execute_async_script('Promise.all([refreshDashboard(),refreshDashboard()]).then(()=>arguments[0](true))')
+    assert '수신 시간 초과' in driver.find_element(By.ID, 'refreshStatus').get_attribute('textContent')
+    driver.execute_script('''
+        window.setTimeout=window.originalTimeout;
+        window.fetch=window.originalFetch; decryptPayload=window.originalDecrypt;
+        delete window.originalFetch; delete window.originalDecrypt; delete window.refreshFixture;
+    ''')
+    print('Periodic refresh, independent age checks, offline retention, recovery, bundle mismatch and rollback rejection: PASS')
+
+
 def check_browser(base, output):
     drivers = list((Path.home() / '.cache/selenium/chromedriver').glob('**/chromedriver'))
     executable = shutil.which('chromedriver') or (str(max(drivers, key=lambda p: p.stat().st_mtime)) if drivers else None)
@@ -87,6 +163,12 @@ def check_browser(base, output):
         try:
             wait = WebDriverWait(driver, 45)
             driver.set_script_timeout(45)
+            driver.execute_cdp_cmd('Page.addScriptToEvaluateOnNewDocument', {'source': '''
+                window.testIntervals=[]; const originalInterval=window.setInterval;
+                window.setInterval=(fn,ms,...args)=>{
+                    window.testIntervals.push({fn,ms}); return originalInterval(fn,ms,...args);
+                };
+            '''})
             driver.execute_cdp_cmd('Emulation.setEmulatedMedia', {
                 'features': [{'name': 'prefers-reduced-motion', 'value': 'reduce'}],
             })
@@ -155,6 +237,33 @@ def check_browser(base, output):
                     wait.until(lambda d: d.find_element(By.ID, anchor).is_displayed())
                     check_width(driver, width)
                 assert_canvas(driver, 'icChart')
+                for anchor in ('cumulative', 'rolling', 'reliability', 'forecast-audit'):
+                    driver.execute_script('location.hash=arguments[0]', anchor)
+                    time.sleep(0.2)
+                    check_width(driver, width)
+                    driver.save_screenshot(str(output / f'{anchor}-{width}.png'))
+                assert driver.execute_script('''
+                    return [...document.querySelectorAll('.cum-svg text,.roll-svg text,.reli-svg text')]
+                        .filter(e=>e.getBoundingClientRect().width>0)
+                        .every(e=>parseFloat(getComputedStyle(e).fontSize)*e.getScreenCTM().a>=11.5);
+                '''), 'Unreadable SVG labels'
+                assert driver.execute_script("return [...document.querySelectorAll('svg[id],#icChart')].every(e=>e.getAttribute('role')==='img' && e.getAttribute('aria-label'))")
+                clipped = driver.execute_script('''
+                    return [...document.querySelectorAll('.cum-svg text,.roll-svg text,.reli-svg text')]
+                        .filter(e=>e.getBoundingClientRect().width>0)
+                        .filter(e=>{const r=e.getBoundingClientRect(),p=e.closest('svg').getBoundingClientRect();return r.left<p.left-2 || r.right>p.right+2;})
+                        .map(e=>({chart:e.closest('svg').id,text:e.textContent}));
+                ''')
+                assert not clipped, ('SVG label clipped horizontally', clipped)
+                assert len(driver.find_elements(By.CSS_SELECTOR, '#forecast-audit .audit-part')) == 6
+                driver.execute_script("location.hash='executionAuditFailures'")
+                wait.until(lambda d: d.execute_script("return document.getElementById('audit-execution').open"))
+                driver.execute_script("location.hash='history'")
+                wait.until(lambda d: d.find_element(By.CSS_SELECTOR, '#historyTable th[data-key="market"] button').is_displayed())
+                driver.find_element(By.CSS_SELECTOR, '#historyTable th[data-key="market"] button').send_keys(Keys.ENTER)
+                assert driver.find_element(By.CSS_SELECTOR, '#historyTable th[data-key="market"]').get_attribute('aria-sort') == 'descending'
+                driver.switch_to.active_element.send_keys(Keys.SPACE)
+                assert driver.find_element(By.CSS_SELECTOR, '#historyTable th[data-key="market"]').get_attribute('aria-sort') == 'ascending'
                 driver.find_element(By.ID, 'navToggle').click()
                 assert driver.find_element(By.ID, 'navToggle').get_attribute('aria-expanded') == 'true'
                 driver.find_element(By.CSS_SELECTOR, '#navDrawer a[href="#operator-report"]').click()
@@ -162,6 +271,18 @@ def check_browser(base, output):
                 assert not driver.execute_script("return document.querySelector('#navDrawer').inert === false")
                 print(f'Viewport {width}: routing, protected data, first-viewport candidates, charts, disclosures PASS')
 
+            check_refresh_regressions(driver, wait)
+            driver.execute_script('''
+                const d={n:3,n_windows:2,avg:1.6667,avg_net:1.3,avg_gross_per_window:1,avg_cost_per_window:0.4,avg_net_per_window:0.6,tstat_clustered:-3,tstat:4};
+                renderRealizedHero({realized_summary:{SHORT:{d30:d}}});
+            ''')
+            assert driver.execute_script('''
+                const c=document.querySelector('#realizedHeroGrid .realized-card');
+                const values=[...c.querySelectorAll('.rg-val')].slice(0,3).map(e=>e.textContent);
+                return JSON.stringify(values)===JSON.stringify(['+1.00%','+0.40%','+0.60%']) && c.querySelector('.rg-verdict').classList.contains('neg');
+            ''')
+            driver.execute_script('renderRealizedHero(dashboardState.summary)')
+            print('Displayed gross/cost/net use basket weights; negative t is not a green success: PASS')
             # Exercise missing, delayed, failed, and negative results only in memory.
             assert driver.execute_async_script('''
                 const done=arguments[arguments.length-1];
@@ -250,13 +371,27 @@ def check_browser(base, output):
                 wait.until(lambda d: d.find_elements(By.CSS_SELECTOR, '#operatorCoinTiles .coin-tile'))
                 if expected_error:
                     wait.until(lambda d: d.execute_script("return document.body.dataset.loadError === 'true'"))
-                    assert '일부 데이터 로드 실패' in driver.find_element(By.ID, 'heroMeta').text
+                    assert '과거 데이터 수신 실패' in driver.find_element(By.ID, 'refreshStatus').text
                 else:
                     wait.until(lambda d: d.execute_script("return document.body.dataset.loaded === 'true'"))
                     assert '차트 로드 실패' in driver.find_element(By.ID, 'pilotChartNote').text
                 assert driver.find_element(By.ID, 'opsFacts').text
             driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': []})
             print('Chart CDN and historical payload outages preserve current report and warnings: PASS')
+            driver.execute_cdp_cmd('Network.setBlockedURLs', {'urls': ['*/public_summary.json*']})
+            driver.get(urljoin(base, 'projects/xsec-alpha/'))
+            wait.until(lambda d: '갱신 실패' in d.find_element(By.CSS_SELECTOR, '[data-live-asof]').get_attribute('textContent'))
+            assert all(e.get_attribute('textContent') == '—' for e in driver.find_elements(By.CSS_SELECTOR, '[data-live-key]'))
+            driver.execute_script('''
+                window.fetch=async()=>({ok:true,json:async()=>({asof:new Date().toISOString(),realized_30d:{WATCH_LONG:{n:0,net_pct:null}}})});
+                window.dispatchEvent(new Event('online'));
+            ''')
+            wait.until(lambda d: d.find_element(By.CSS_SELECTOR, '[data-live-key="realized_30d.WATCH_LONG.n"]').get_attribute('textContent') == '0')
+            assert driver.find_element(By.CSS_SELECTOR, '[data-live-key="realized_30d.WATCH_LONG.net_pct"]').get_attribute('textContent') == '—'
+            driver.execute_script("window.fetch=async()=>{throw new Error('offline')};window.dispatchEvent(new Event('online'))")
+            wait.until(lambda d: '마지막 수신 자료' in d.find_element(By.CSS_SELECTOR, '[data-live-asof]').get_attribute('textContent'))
+            assert driver.find_element(By.CSS_SELECTOR, '[data-live-key="realized_30d.WATCH_LONG.n"]').get_attribute('textContent') == '0'
+            print('Story initial outage, recovery, zero sample/null return and later outage: PASS')
         finally:
             driver.quit()
 

@@ -17,13 +17,12 @@ import hashlib
 import hmac
 import json
 import math
-import os
 import secrets
 import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.padding import PKCS7
@@ -429,7 +428,8 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
         if n == 0:
             out[f"d{d}"] = {
                 "n": 0, "n_windows": 0, "avg": None, "avg_net": None, "win_pct": None,
-                "avg_net_per_window": None,
+                "avg_net_per_window": None, "avg_gross_per_window": None,
+                "avg_cost_per_window": None,
                 "gross_win_pct": None, "net_win_pct": None,
                 "win_ci_lo": None, "win_ci_hi": None,
                 "gross_win_ci_lo": None, "gross_win_ci_hi": None,
@@ -466,6 +466,13 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
         for ts, value in net_picks:
             by_window.setdefault(ts, []).append(value)
         window_means = [sum(values) / len(values) for values in by_window.values()]
+        gross_by_window = {}
+        for ts, value in gross_picks:
+            gross_by_window.setdefault(ts, []).append(value)
+        mean_gross_window = sum(
+            sum(values) / len(values) for values in gross_by_window.values()
+        ) / len(gross_by_window)
+        mean_net_window = sum(window_means) / len(window_means)
         gross_ci_lo, gross_ci_hi = _wilson_ci(gross_wins, n)
         net_ci_lo, net_ci_hi = _wilson_ci(net_wins, n)
         out[f"d{d}"] = {
@@ -473,7 +480,9 @@ def _realized_stats(history: list[dict], side: str, days_window: list[int]) -> d
             "n_windows": n_windows,
             "avg": round(mean, 4),
             "avg_net": round(mean_net, 4),
-            "avg_net_per_window": round(sum(window_means) / len(window_means), 4),
+            "avg_net_per_window": round(mean_net_window, 4),
+            "avg_gross_per_window": round(mean_gross_window, 4),
+            "avg_cost_per_window": round(mean_gross_window - mean_net_window, 4),
             # Primary inference/hit fields are net of configured costs. Gross
             # counterparts stay explicit for backward-compatible analysis.
             "win_pct": round(100 * net_wins / n, 1),
@@ -956,16 +965,17 @@ def _best_worst(history: list[dict], side: str, k: int = 5) -> dict:
     if not rows:
         return {"best": [], "worst": []}
     rows_sorted = sorted(rows, key=lambda r: float(r["realized_pct"]))
-    pick = lambda r: {
-        "market": r.get("market"),
-        "entry_time": r.get("entry_time"),
-        "exit_time": r.get("exit_time"),
-        "entry_price": r.get("entry_price"),
-        "exit_price": r.get("exit_price"),
-        "horizon_h": r.get("horizon_h"),
-        "realized_pct": float(r["realized_pct"]),
-        "actionable": bool(r.get("actionable")),
-    }
+    def pick(r):
+        return {
+            "market": r.get("market"),
+            "entry_time": r.get("entry_time"),
+            "exit_time": r.get("exit_time"),
+            "entry_price": r.get("entry_price"),
+            "exit_price": r.get("exit_price"),
+            "horizon_h": r.get("horizon_h"),
+            "realized_pct": float(r["realized_pct"]),
+            "actionable": bool(r.get("actionable")),
+        }
     return {
         "best": [pick(r) for r in rows_sorted[-k:][::-1]],
         "worst": [pick(r) for r in rows_sorted[:k]],
@@ -1197,16 +1207,25 @@ def build_public_summary_payload() -> dict:
     }
 
 
-@model_release_guard()
-def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
-              history_days: int = 60, ic_days: int = 60,
-              public_target: Path | None = None) -> dict[str, Path]:
-    target_dir.mkdir(parents=True, exist_ok=True)
+def build_dashboard_payloads(history_days: int = 60, ic_days: int = 60) -> dict:
+    """Identify a publication bundle so clients cannot join mixed exports."""
+    export_id = secrets.token_hex(16)
     payloads = {
         "summary.json": build_summary_payload(),
         "history.json": build_history_payload(history_days=history_days, ic_days=ic_days),
         "accuracy.json": build_accuracy_payload(history_days=history_days),
     }
+    for payload in payloads.values():
+        payload["export_id"] = export_id
+    return payloads
+
+
+@model_release_guard()
+def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
+              history_days: int = 60, ic_days: int = 60,
+              public_target: Path | None = None) -> dict[str, Path]:
+    target_dir.mkdir(parents=True, exist_ok=True)
+    payloads = build_dashboard_payloads(history_days=history_days, ic_days=ic_days)
     written: dict[str, Path] = {}
     for name, plain in payloads.items():
         plaintext = json.dumps(plain, ensure_ascii=False, default=str).encode("utf-8")

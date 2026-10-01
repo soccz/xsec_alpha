@@ -21,10 +21,8 @@ sys.path.insert(0, str(ROOT))
 
 from utils.dashboard_export import (  # noqa: E402
     PIN_DEFAULT,
-    build_accuracy_payload,
-    build_history_payload,
+    build_dashboard_payloads,
     build_public_summary_payload,
-    build_summary_payload,
     encrypt_payload,
 )
 
@@ -56,12 +54,7 @@ def main() -> int:
     target = Path(args.target)
     target.mkdir(parents=True, exist_ok=True)
 
-    payloads = {
-        "summary.json": build_summary_payload(),
-        "history.json": build_history_payload(history_days=args.history_days,
-                                              ic_days=args.ic_days),
-        "accuracy.json": build_accuracy_payload(history_days=args.history_days),
-    }
+    payloads = build_dashboard_payloads(history_days=args.history_days, ic_days=args.ic_days)
 
     for name, plain in payloads.items():
         body = json.dumps(plain, ensure_ascii=False, default=str).encode("utf-8")
