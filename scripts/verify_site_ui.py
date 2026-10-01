@@ -57,7 +57,9 @@ def check_source(site):
 
 def check_width(driver, width):
     assert driver.execute_script('return document.documentElement.scrollWidth') <= width + 2
-    for element in driver.find_elements(By.CSS_SELECTOR, '.page-switch a, .project-brand, .ops-facts dd, .coin-tile h3'):
+    for element in driver.find_elements(By.CSS_SELECTOR, '.page-switch a, .project-brand, .ops-facts dd, .coin-tile h3, .selection-facts dd, .return-row strong, .period-row strong'):
+        if not element.is_displayed():
+            continue
         assert driver.execute_script('return arguments[0].scrollWidth <= arguments[0].clientWidth + 2', element), element.tag_name
 
 
@@ -85,6 +87,9 @@ def check_browser(base, output):
         try:
             wait = WebDriverWait(driver, 45)
             driver.set_script_timeout(45)
+            driver.execute_cdp_cmd('Emulation.setEmulatedMedia', {
+                'features': [{'name': 'prefers-reduced-motion', 'value': 'reduce'}],
+            })
             for width, height in ((1440, 1000), (390, 844), (360, 740)):
                 driver.execute_cdp_cmd('Emulation.setDeviceMetricsOverride', {
                     'width': width, 'height': height, 'deviceScaleFactor': 1, 'mobile': width < 500,
@@ -96,6 +101,18 @@ def check_browser(base, output):
                 check_width(driver, width)
                 assert_canvas(driver, 'trialInterval')
                 driver.save_screenshot(str(output / f'story-{width}.png'))
+                driver.execute_script("location.hash='period-evidence'")
+                time.sleep(0.3)
+                check_width(driver, width)
+                assert [e.text for e in driver.find_elements(By.CSS_SELECTOR, '.period-row strong')] == ['+0.6034', '+1.4652', '−0.5675']
+                assert '탐색 구간' in driver.find_element(By.ID, 'period-evidence').text
+                assert driver.execute_script('''
+                    return [...document.querySelectorAll('.period-track span')].every(b => {
+                        const r=b.getBoundingClientRect(), p=b.parentElement.getBoundingClientRect();
+                        return r.width > 10 && r.left >= p.left && r.right <= p.right;
+                    });
+                ''')
+                driver.save_screenshot(str(output / f'periods-{width}.png'))
                 driver.execute_script("location.hash='post-trial-result'")
                 wait.until(lambda d: d.find_element(By.ID, 'post-trial-result').is_displayed())
                 assert driver.execute_script("return document.querySelector('#post-trial').closest('details').open")
@@ -122,6 +139,14 @@ def check_browser(base, output):
                 assert not driver.find_elements(By.CSS_SELECTOR, '.evidence-group[open]')
                 assert_canvas(driver, 'pilotDifferenceChart')
                 driver.save_screenshot(str(output / f'dashboard-{width}.png'))
+                driver.find_element(By.CSS_SELECTOR, '.coin-evidence-button').click()
+                wait.until(lambda d: d.find_element(By.ID, 'selectionFacts').is_displayed())
+                assert driver.execute_script("return document.activeElement.id === 'selectionMarket'")
+                assert driver.find_element(By.ID, 'selectionSource').text
+                check_width(driver, width)
+                driver.save_screenshot(str(output / f'selection-{width}.png'))
+                driver.execute_script("document.getElementById('selectionDetail').open=false")
+                driver.execute_script("window.scrollTo({top:0,behavior:'instant'})")
                 driver.find_element(By.CSS_SELECTOR, '.hero a[href="#experiment-overview"]').click()
                 time.sleep(0.4)
                 driver.save_screenshot(str(output / f'experiment-{width}.png'))
@@ -147,6 +172,54 @@ def check_browser(base, output):
             assert driver.find_element(By.ID, 'pilotProgressValue').text == '— / —'
             assert '전환 적용 기록 없음' in driver.find_element(By.ID, 'pilotExercise').text
             assert '미집계' in driver.find_element(By.ID, 'regimeOverview').text
+            assert '손익 자료 없음' in driver.find_element(By.ID, 'pilotReturns').get_attribute('textContent')
+            assert not driver.find_element(By.ID, 'selectionDetail').is_displayed()
+            driver.execute_script('''
+                const s=structuredClone(window.fixtureSource);
+                const asof='2026-01-01T00:00:00Z';
+                const signal={market:'KRW-FIXTURE',side:'SHORT',score:-0.0058,actionable:true,entry_time:asof};
+                s.operator_report={data_asof:asof,generated_at:asof,signals:[signal],ideas:[],telegram:{state:'disabled'}};
+                s.forecast_audit=s.forecast_audit || {};
+                s.forecast_audit.selection={status:'recorded',report_matches:true,replay_matches:true,
+                    signal_at:s.operator_report.data_asof, counts:{scored:100,eligible:90,selected:1,actionable:1},
+                    rows:[{...signal,reported:true,rank:7,eligible_rank:5,reason:'selected_rank'}]};
+                window.selectionFixture=s; renderOperatorReport(s);
+                document.getElementById('selectionDetail').open=true;
+            ''')
+            assert '대조 일치' in driver.find_element(By.ID, 'selectionMatch').text
+            assert '7위' in driver.find_element(By.ID, 'selectionFacts').text
+            assert len(driver.find_elements(By.CSS_SELECTOR, '#selectionFlow li')) == 4
+            for mutation in (
+                "s.forecast_audit.selection.signal_at='2000-01-01T00:00:00Z'",
+                "s.forecast_audit.selection.rows[0].score += 0.01",
+                "s.forecast_audit.selection.rows[0].market='KRW-OTHER'",
+                "s.forecast_audit.selection.rows[0].actionable=!s.forecast_audit.selection.rows[0].actionable",
+                "s.forecast_audit.selection.replay_matches=false",
+            ):
+                driver.execute_script('const s=structuredClone(window.selectionFixture);' + mutation + ";renderOperatorReport(s);document.getElementById('selectionDetail').open=true;")
+                assert '연결 보류' in driver.find_element(By.ID, 'selectionMatch').text
+                assert not driver.find_elements(By.CSS_SELECTOR, '#selectionFlow li')
+                assert '7위' not in driver.find_element(By.ID, 'selectionFacts').text
+            driver.execute_script('''
+                const s=structuredClone(window.selectionFixture);
+                s.operator_report.ideas=[{...s.operator_report.signals[0],reference_only:true,source:'prior_report'}];
+                s.operator_report.signals=[];renderOperatorReport(s);
+                document.getElementById('selectionDetail').open=true;
+                delete window.selectionFixture;
+                renderPilotReturns({decision:{counts:{matured:2},statistics:{model_net_pct:-2,mixed_net_pct:-2,paired_pp:0}}});
+            ''')
+            assert '현재 추천 근거와 분리' in driver.find_element(By.ID, 'selectionMatch').text
+            assert not driver.find_elements(By.CSS_SELECTOR, '#selectionFlow li')
+            assert '모델 버전 미확인' in driver.find_element(By.ID, 'selectionSource').text
+            assert '두 방식 모두 비용 가정 후 손실' in driver.find_element(By.ID, 'pilotReturnsNote').get_attribute('textContent')
+            assert [r.get_attribute('textContent') for r in driver.find_elements(By.CSS_SELECTOR, '.return-row strong')] == ['-2.000%', '-2.000%']
+            driver.execute_script('renderPilotReturns({decision:{counts:{matured:2},statistics:{model_net_pct:0,mixed_net_pct:1,paired_pp:1}}});')
+            assert len(driver.find_elements(By.CSS_SELECTOR, '.return-track .zero')) == 1
+            assert '+1.000%p' in driver.find_element(By.ID, 'pilotReturnsNote').get_attribute('textContent')
+            driver.execute_script('renderPilotReturns({decision:{counts:{matured:2},statistics:{model_net_pct:null,mixed_net_pct:1}}});')
+            assert not driver.find_elements(By.CSS_SELECTOR, '.return-row')
+            assert '손익 자료 없음' in driver.find_element(By.ID, 'pilotReturns').get_attribute('textContent')
+            print('Evidence joins reject stale/mismatched/reference data; loss/zero/missing returns remain distinct: PASS')
             driver.execute_script('''
                 const s=structuredClone(window.fixtureSource);
                 s.asof='2020-01-01T00:00:00Z';
