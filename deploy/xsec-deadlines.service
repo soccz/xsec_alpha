@@ -1,0 +1,13 @@
+[Unit]
+Description=xsec_alpha daily governance deadline check (deadlines with defaults live in code)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+EnvironmentFile=/mnt/20t/main/gan_t/.env
+ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/check_deadlines.py
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=120
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/output/deadlines/run.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/output/deadlines/run.log

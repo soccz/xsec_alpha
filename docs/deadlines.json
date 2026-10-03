@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "note": "Governance deadlines with defaults live here, not only in prose. scripts/check_deadlines.py runs daily (xsec-deadlines.timer): reminders before the due time, and after it an unmet condition records the default and sends one Telegram notice. Applying a default that changes live behaviour stays a human/agent action recorded in DECISIONS.md and the journal.",
+  "deadlines": [
+    {
+      "id": "model_zoo_prereg_v1",
+      "title": "국면 선택형 다중 모델(모델 동물원) 사전등록",
+      "due_utc": "2026-10-31T14:59:59Z",
+      "done_if": {"glob": "docs/prereg/model_zoo_v1*.json"},
+      "default": "단일 모델 연구 프로브 유지, 새 모델은 섀도 기록만 (DECISIONS.md §8)",
+      "remind_days_before": [7, 1]
+    },
+    {
+      "id": "rotation_pilot_terminal",
+      "title": "336회 국면 전환 파일럿 종결",
+      "due_utc": "2026-12-25T12:00:00Z",
+      "done_if": {"json_field": {"path": "output/rotation_pilot/summary.json", "field": "decision.terminal", "equals": true}},
+      "default": "미종결 원인을 조사해 공개하고, 파일럿 결과 없이 장세별 실제 전환은 하지 않음",
+      "remind_days_before": [7, 1]
+    },
+    {
+      "id": "model_zoo_v1_deadman",
+      "title": "모델 동물원 v1 판정",
+      "due_utc": "2027-06-30T14:59:59Z",
+      "done_if": {"glob": "docs/prereg/model_zoo_v1_verdict*.json"},
+      "default": "통과한 장세가 없으면 v1 종료, 현행 모델 유지 (DECISIONS.md §8)",
+      "remind_days_before": [14, 1]
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+[Unit]
+Description=xsec_alpha daily governance deadline check (09:25 KST)
+
+[Timer]
+OnCalendar=*-*-* 00:25:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
