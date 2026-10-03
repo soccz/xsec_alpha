@@ -32,6 +32,14 @@ python scripts/health_snapshot.py
 | **Walk-forward holdout IC 측정** | `python scripts/wf_holdout_harness.py --measure-only` |
 | 종합 검증 (큰 수정 이후) | `python scripts/measure_ic.py` + `python scripts/evaluate_holdout.py` |
 
+### 0-bis. 현재 운영 규칙 (2026-10-04 전수조사 반영 — 상세는 `AGENTS.md`)
+- **작업 트리 = 운영.** 서비스가 이 디렉터리를 직접 실행하므로 저장이 곧 배포다. 배포 전에 import 스모크와 관련 pytest를 돌리고, 신호 런 직후 +50분 무렵에 배포한다.
+- **336회 파일럿(종료 약 12-24) 동결 소스 6개는 수정 금지**이며 쓰기 권한도 제거돼 있다. 패키지 고정(numpy 1.26.4 / pandas 2.1.4 / scipy 1.11.4)을 지키고 `pip --user` 사용을 금지한다.
+- **모델 동결:** 주간 재학습은 `--dry-run`으로만 돌린다. 운영 모델 교체는 사용자 결정 사항이다. 새 모델은 섀도 후보(모델 동물원, `docs/prereg/`)로 추가한다.
+- **§14-bis 판정 = KILL 기록(2026-10-04, 부분 집행).** README "14-bis 판정 기록" 절과 DECISIONS.md §8을 참고한다.
+- **health OVERALL FAIL이 `EXECUTION_DIAGNOSTICS` 하나뿐이면 알려진 구조적 원인이다.** 펀딩 정산 ±60s 안에 관측이 걸려 `boundary_uncertain`이 되는 경우로, 타이머 이동으로 해소할 예정이다. `boundary_uncertain` 외의 실패 상태가 보일 때만 조사한다.
+- **health_snapshot 실행의 부수효과:** 결과가 PIN 대시보드 ops 블록에 시각 표시 없이 실린다.
+
 ---
 
 ## 1. 뭘 만드는가
