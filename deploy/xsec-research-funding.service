@@ -1,0 +1,13 @@
+[Unit]
+Description=xsec_alpha research: preserve Bitget funding history (90-day API retention)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/dump_bitget_funding.py
+Nice=19
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+TimeoutStartSec=3h
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/output/research/bitget_funding/run.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/output/research/bitget_funding/run.log

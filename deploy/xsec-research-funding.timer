@@ -1,0 +1,10 @@
+[Unit]
+Description=xsec_alpha research: weekly Bitget funding-history preservation (Sun 12:30 KST)
+
+[Timer]
+OnCalendar=Sun *-*-* 03:30:00 UTC
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
