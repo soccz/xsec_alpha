@@ -1,0 +1,10 @@
+[Unit]
+Description=xsec_alpha daily off-host evidence copy (03:40 KST, after the DB backup)
+
+[Timer]
+OnCalendar=*-*-* 18:40:00 UTC
+Persistent=true
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

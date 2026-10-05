@@ -1,0 +1,12 @@
+[Unit]
+Description=xsec_alpha daily off-host evidence copy (private GitHub repo xsec_alpha-evidence)
+
+[Service]
+Type=oneshot
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/backup_evidence_offhost.py
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=20min
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/output/evidence_offhost/run.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/output/evidence_offhost/run.log
