@@ -1,5 +1,6 @@
 [Unit]
 Description=xsec_alpha daily holdout IC measurement (F1)
+OnFailure=xsec-unit-failure@%n.service
 After=network.target xsec-alpha.service xsec-retrain.service
 
 [Service]

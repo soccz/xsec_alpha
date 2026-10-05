@@ -114,3 +114,33 @@ def test_runtime_headroom_and_pages_receipt_have_independent_checks(tmp_path):
     _write(tmp_path / "output/experiment_supervision/status.json", state)
     rows = {r["check"]: r["status"] for r in ops_status.operational_checks(tmp_path, now)}
     assert rows["AUDIT_RUNTIME"] == rows["OPERATING_PUBLICATION"] == "OK"
+
+
+def test_daily_db_backup_and_offhost_evidence_must_be_recent(tmp_path, monkeypatch):
+    monkeypatch.setattr(ops_status.shutil, "disk_usage", lambda path: SimpleNamespace(free=10 * 1024**3))
+    log = tmp_path / "logs/backup.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("[backup_db] ok: /b/crypto_data_20261004T180447Z_1.db (kept 9)\n"
+                   "[backup_db] insufficient secondary space: need 1 KiB\n")
+    offhost = tmp_path / "output/evidence_offhost/status.json"
+    offhost.parent.mkdir(parents=True)
+    offhost.write_text(json.dumps({"checked_at": "2026-10-05T02:27:25+00:00", "ok": True}))
+    rows = {r["check"]: r["status"] for r in ops_status.operational_checks(
+        tmp_path, datetime(2026, 10, 5, 12, 0, tzinfo=timezone.utc), tmp_path)}
+    assert rows["DB_BACKUP"] == "OK" and rows["EVIDENCE_OFFHOST"] == "OK"
+    rows = {r["check"]: r["status"] for r in ops_status.operational_checks(
+        tmp_path, datetime(2026, 10, 6, 0, 30, tzinfo=timezone.utc), tmp_path)}
+    assert rows["DB_BACKUP"] == "FAIL" and rows["EVIDENCE_OFFHOST"] == "OK"  # 30.4 h vs 22 h
+    offhost.write_text(json.dumps({"checked_at": "2026-10-06T12:00:00+00:00", "ok": False}))
+    rows = {r["check"]: r["status"] for r in ops_status.operational_checks(
+        tmp_path, datetime(2026, 10, 6, 12, 30, tzinfo=timezone.utc), tmp_path)}
+    assert rows["EVIDENCE_OFFHOST"] == "FAIL"
+
+
+def test_backup_log_without_any_success_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr(ops_status.shutil, "disk_usage", lambda path: SimpleNamespace(free=10 * 1024**3))
+    log = tmp_path / "logs/backup.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("[backup_db] insufficient secondary space\n")
+    rows = {r["check"]: r for r in ops_status.operational_checks(tmp_path, secondary=tmp_path)}
+    assert rows["DB_BACKUP"]["status"] == "FAIL" and rows["DB_BACKUP"]["detail"] == "missing or invalid status"

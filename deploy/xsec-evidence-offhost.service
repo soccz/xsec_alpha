@@ -1,5 +1,6 @@
 [Unit]
 Description=xsec_alpha daily off-host evidence copy (private GitHub repo xsec_alpha-evidence)
+OnFailure=xsec-unit-failure-user@%n.service
 
 [Service]
 Type=oneshot

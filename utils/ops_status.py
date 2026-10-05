@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import re
 import shutil
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -12,6 +13,19 @@ def _load(path):
         return json.loads(path.read_text())
     except (OSError, ValueError):
         return {}
+
+
+def _last_db_backup(log_path):
+    """UTC time of the newest successful crypto DB snapshot recorded by scripts/backup_db.sh."""
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()[-400:]
+    except OSError:
+        return None
+    for line in reversed(lines):
+        match = re.search(r"\] ok: .*crypto_data_(\d{8}T\d{6}Z)_", line)
+        if match:
+            return datetime.strptime(match.group(1), "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc).isoformat()
+    return None
 
 
 def operational_checks(root=ROOT, now=None, secondary=None):
@@ -33,6 +47,12 @@ def operational_checks(root=ROOT, now=None, secondary=None):
         ("BACKUP", state, "checked_at", 30, (state.get("backup") or {}).get("restore_verified") is True),
         ("PUBLICATION", pub, "checked_at", 90, pub.get("status") == "published"),
     ]
+    # Daily jobs: a missed or failing run must surface within ~30 h, not after 20 silent days.
+    if (root / "logs/backup.log").exists():
+        checks.append(("DB_BACKUP", {"checked_at": _last_db_backup(root / "logs/backup.log")}, "checked_at", 1800, True))
+    if (root / "output/evidence_offhost/status.json").exists():
+        offhost = _load(root / "output/evidence_offhost/status.json")
+        checks.append(("EVIDENCE_OFFHOST", offhost, "checked_at", 1800, offhost.get("ok") is True))
     if (root / "output/regime_observation/ledger.sqlite").exists():
         checks.append(("REGIME_BACKUP", state, "checked_at", 30,
                        (state.get("regime_backup") or {}).get("restore_verified") is True))

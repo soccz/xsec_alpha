@@ -1,0 +1,12 @@
+[Unit]
+Description=xsec_alpha failure notice for %i
+
+[Service]
+Type=oneshot
+User=soccz
+WorkingDirectory=/mnt/20t/main/gan_t/xsec_alpha
+EnvironmentFile=/mnt/20t/main/gan_t/.env
+ExecStart=/home/soccz/.pyenv/versions/3.12.9/bin/python scripts/notify_unit_failure.py %i
+TimeoutStartSec=120
+StandardOutput=append:/mnt/20t/main/gan_t/xsec_alpha/output/unit_failures/notify.log
+StandardError=append:/mnt/20t/main/gan_t/xsec_alpha/output/unit_failures/notify.log

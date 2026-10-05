@@ -1,5 +1,7 @@
 [Unit]
 Description=xsec_alpha cross-sectional ranking
+StartLimitIntervalSec=3600
+StartLimitBurst=3
 After=network.target
 Before=xsec-retrain.service xsec-measure.service
 OnFailure=xsec-telegram-failure.service

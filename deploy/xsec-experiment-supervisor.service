@@ -1,5 +1,6 @@
 [Unit]
 Description=xsec_alpha frozen trial backup, monitoring and final review
+OnFailure=xsec-unit-failure-user@%n.service
 After=network-online.target
 
 [Service]

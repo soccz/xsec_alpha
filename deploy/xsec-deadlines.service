@@ -1,5 +1,6 @@
 [Unit]
 Description=xsec_alpha daily governance deadline check (deadlines with defaults live in code)
+OnFailure=xsec-unit-failure-user@%n.service
 
 [Service]
 Type=oneshot

@@ -1,5 +1,6 @@
 [Unit]
 Description=xsec_alpha research: preserve Bitget funding history (90-day API retention)
+OnFailure=xsec-unit-failure-user@%n.service
 
 [Service]
 Type=oneshot

@@ -1,6 +1,7 @@
 # User unit. Install with: bash deploy/install_backup.sh
 [Unit]
 Description=xsec_alpha SQLite DB backup (hot, integrity-checked)
+OnFailure=xsec-unit-failure-user@%n.service
 
 [Service]
 Type=oneshot

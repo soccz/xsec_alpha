@@ -1,5 +1,8 @@
 [Unit]
 Description=xsec_alpha weekly model retrain (F1 pipeline: unified features, absolute target, promotion gate)
+OnFailure=xsec-unit-failure@%n.service
+StartLimitIntervalSec=7200
+StartLimitBurst=3
 After=network.target xsec-alpha.service
 Before=xsec-measure.service
 
