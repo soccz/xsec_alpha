@@ -2,7 +2,7 @@
 Description=xsec_alpha supervise the registered trial every ten minutes
 
 [Timer]
-OnCalendar=*-*-* *:00/10:00 UTC
+OnCalendar=*-*-* *:01/10:30 UTC
 Persistent=true
 AccuracySec=10s
 

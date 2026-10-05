@@ -9,7 +9,7 @@ Codex, Claude 등 이 저장소를 수정하는 모든 에이전트에 적용한
   - 관련 pytest
 - 배포 시각:
   - 신호 런(KST 02/08/14/20시) 직후 +50분 무렵에 한다.
-  - 감독 틱(매 10분 :X0:00 UTC)과 겹치지 않게 한다.
+  - 감독 틱(매 10분 :X1:30 UTC — 2026-10-05에 정시+90초로 이동, 펀딩 정산 ±60초 경계 회피)과 겹치지 않게 한다.
 
 ## 2. 336회 국면 전환 파일럿 보호 (등록 2026-09-30, 종료 약 2026-12-24, hard review 2026-12-25 21:00 KST)
 - 동결 소스 6개는 수정 금지이며 쓰기 권한도 제거돼 있다: `utils/rotation_pilot.py`, `utils/rotation_research.py`, `utils/prospective.py`, `utils/regime_observer.py`, `utils/eval_metrics.py`, `scripts/rotation_pilot.py`.
