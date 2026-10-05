@@ -109,3 +109,32 @@ def test_depth_one_fetch_can_follow_a_normal_remote_child(site, tmp_path):
     head = git(remote, "rev-parse", "main")
     assert publish_files(repo, cache=cache, remote=remote.as_uri())
     assert git(remote, "rev-parse", "main") == head
+
+
+def test_partial_cache_publishes_without_fetching_unrelated_blobs(site, tmp_path):
+    repo, remote = site
+    (repo / "big.bin").write_bytes(bytes(range(256)) * 800)
+    git(repo, "add", "big.bin")
+    git(repo, "commit", "-m", "large unrelated file from another project")
+    git(repo, "push", "origin", "main")
+    git(remote, "config", "uploadpack.allowFilter", "true")
+    git(remote, "config", "uploadpack.allowAnySHA1InWant", "true")
+    big = git(remote, "rev-parse", "main:big.bin")
+    cache = tmp_path / "publisher"
+    assert publish_files(repo, cache=cache, remote=remote.as_uri())
+    assert git(remote, "show", f"main:{PAYLOAD_PATHS[0]}") == '{"encrypted": "new"}'
+    assert git(remote, "rev-parse", "main:big.bin") == big
+    missing = git(cache, "rev-list", "--objects", "--missing=print", "refs/remotes/origin/main")
+    assert f"?{big}" in missing.split()
+
+
+def test_cache_with_pack_garbage_is_rebuilt(site, tmp_path):
+    repo, remote = site
+    cache = tmp_path / "publisher"
+    assert publish_files(repo, cache=cache, remote=remote.as_uri())
+    garbage = cache / "objects/pack/tmp_pack_dead"
+    garbage.write_bytes(b"partial")
+    (repo / "projects/xsec-alpha/dashboard/data/summary.json").write_text('{"encrypted": "newer"}')
+    assert publish_files(repo, cache=cache, remote=remote.as_uri())
+    assert not garbage.exists()
+    assert git(remote, "show", f"main:{PAYLOAD_PATHS[0]}") == '{"encrypted": "newer"}'
