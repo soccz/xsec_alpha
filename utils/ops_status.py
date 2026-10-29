@@ -1,11 +1,29 @@
 """Read-only operational coverage beyond signal/data freshness."""
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 import re
 import shutil
 
 ROOT = Path(__file__).resolve().parent.parent
+RECORD_ONLY_CHECKS = {"AUDIT_RUNTIME", "EXECUTION_DIAGNOSTICS", "VENUE_OBSERVATION"}
+NOTICE_QUIET = timedelta(hours=6)
+SERVICE_FOR_CHECK = {
+    "SUPERVISOR": "xsec-experiment-supervisor.service",
+    "BACKUP": "xsec-experiment-supervisor.service",
+    "REGIME_BACKUP": "xsec-experiment-supervisor.service",
+    "ROTATION_BACKUP": "xsec-experiment-supervisor.service",
+    "FORECAST_BACKUP": "xsec-experiment-supervisor.service",
+    "DB_BACKUP": "xsec-backup.service",
+    "EVIDENCE_OFFHOST": "xsec-evidence-offhost.service",
+}
+
+
+def _recent_notice(stamp, now):
+    try:
+        return timedelta(0) <= now - datetime.fromisoformat(stamp) < NOTICE_QUIET
+    except (TypeError, ValueError):
+        return False
 
 
 def _load(path):
@@ -117,20 +135,41 @@ def notify_operations(root=ROOT, now=None, secondary=None, sender=None):
         failed = sorted(row["check"] for row in checks if row["status"] != "OK")
         folder = root / "output/operations_notices"
         previous = _load(folder / "latest.json")
-        if previous.get("failed") == failed and previous.get("acknowledged"):
+        notify_failed = sorted(set(failed) - RECORD_ONLY_CHECKS)
+        # Preserve acknowledged incidents across upgrades and partial recovery.
+        legacy_active = previous.get("failed", []) if previous.get("acknowledged") else []
+        active = set(previous.get("notified_active", legacy_active)) & set(notify_failed)
+        last_notified = dict(previous.get("last_notified") or {})
+        if "notified_active" not in previous and previous.get("acknowledged"):
+            last_notified.update({check: previous.get("checked_at") for check in active})
+        services = _load(root / "output/unit_failures/state.json")
+        for check in notify_failed:
+            stamp = services.get(SERVICE_FOR_CHECK.get(check))
+            if _recent_notice(stamp, now):
+                active.add(check)
+                last_notified[check] = stamp
+        due = [check for check in notify_failed
+               if check not in active and not _recent_notice(last_notified.get(check), now)]
+        event = {"checked_at": now.isoformat(), "failed": failed, "notify_failed": notify_failed,
+                 "notified_active": sorted(active), "last_notified": last_notified,
+                 "acknowledged": False,
+                 "telegram_state": "pending" if due else "rate_limited" if set(notify_failed) - active else "recorded_only"}
+        _write(folder / "latest.json", event)
+        if not due:
+            if previous.get("failed") != failed or previous.get("telegram_state") != event["telegram_state"]:
+                _write(folder / (now.strftime("%Y%m%dT%H%M%S%f") + ".json"), event)
             return True
-        if not previous and not failed:
-            return True
-        # Only issue categories leave the server, never paths or raw exceptions.
-        message = "<b>xsec 운영 점검</b>\n" + (
-            "확인 필요: " + ", ".join(failed) if failed else "백업·배포 운영 점검이 정상으로 복구됐습니다."
-        )
+        # Only new critical categories leave the server; research diagnostics and
+        # recovery stay in the operational record instead of generating chatter.
+        message = "<b>xsec 운영 점검</b>\n확인 필요: " + ", ".join(due)
         message += '\n정기 코인 보고와 별도 상태입니다.\n<a href="https://soccz.github.io/projects/xsec-alpha/dashboard/">대시보드</a>'
         if secondary is None:
             message += "\n동일 디스크 복구용 사본을 사용합니다. 디스크 자체 고장에는 대비되지 않습니다."
-        event = {"checked_at": now.isoformat(), "failed": failed, "acknowledged": False}
-        _write(folder / "latest.json", event)
         event["acknowledged"] = bool((sender or send_message)(message))
+        event["telegram_state"] = "sent" if event["acknowledged"] else "pending"
+        if event["acknowledged"]:
+            event["notified_active"] = sorted(active | set(due))
+            event["last_notified"].update({check: now.isoformat() for check in due})
         _write(folder / "latest.json", event)
         _write(folder / (now.strftime("%Y%m%dT%H%M%S%f") + ".json"), event)
         return event["acknowledged"]

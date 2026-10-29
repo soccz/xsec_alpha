@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from types import SimpleNamespace
 
@@ -28,7 +28,7 @@ def test_all_operational_evidence_must_be_fresh(tmp_path, monkeypatch):
     assert next(r for r in rows if r["check"] == "PUBLICATION")["status"] == "FAIL"
 
 
-def test_notifications_deduplicate_acknowledged_incidents_and_recovery(tmp_path, monkeypatch):
+def test_notifications_retry_failure_and_record_recovery_without_sending(tmp_path, monkeypatch):
     checks = [{"check": "BACKUP", "status": "FAIL"}]
     monkeypatch.setattr(ops_status, "operational_checks", lambda *args: checks)
     messages = []
@@ -41,9 +41,93 @@ def test_notifications_deduplicate_acknowledged_incidents_and_recovery(tmp_path,
     assert len(messages) == 2
     checks[0]["status"] = "OK"
     assert ops_status.notify_operations(tmp_path, sender=send)
-    assert len(messages) == 3
-    assert "복구" in messages[-1]
+    assert len(messages) == 2
     assert "디스크 자체 고장" in messages[-1]
+    state = json.loads((tmp_path / "output/operations_notices/latest.json").read_text())
+    assert state["failed"] == [] and state["telegram_state"] == "recorded_only"
+
+
+def test_research_diagnostics_and_recovery_are_recorded_without_telegram(tmp_path, monkeypatch):
+    checks = [{"check": name, "status": "FAIL"} for name in
+              ("AUDIT_RUNTIME", "EXECUTION_DIAGNOSTICS", "VENUE_OBSERVATION")]
+    monkeypatch.setattr(ops_status, "operational_checks", lambda *args: checks)
+    messages = []
+    for _ in range(2):
+        assert ops_status.notify_operations(tmp_path, sender=lambda text: messages.append(text))
+    folder = tmp_path / "output/operations_notices"
+    state = json.loads((folder / "latest.json").read_text())
+    assert len(state["failed"]) == 3 and state["notify_failed"] == []
+    assert state["telegram_state"] == "recorded_only" and not state["acknowledged"]
+    checks.clear()
+    assert ops_status.notify_operations(tmp_path, sender=lambda text: messages.append(text))
+    assert not messages
+    assert len(list(folder.glob("2*.json"))) == 2
+
+
+def test_new_critical_fault_alerts_even_when_research_warnings_change(tmp_path, monkeypatch):
+    checks = [{"check": "AUDIT_RUNTIME", "status": "FAIL"}]
+    monkeypatch.setattr(ops_status, "operational_checks", lambda *args: checks)
+    messages = []
+    def send(text):
+        messages.append(text)
+        return True
+    now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
+    assert ops_status.notify_operations(tmp_path, now, sender=send)
+    checks.append({"check": "BACKUP", "status": "FAIL"})
+    assert ops_status.notify_operations(tmp_path, now, sender=send)
+    checks[0]["check"] = "VENUE_OBSERVATION"
+    assert ops_status.notify_operations(tmp_path, now + timedelta(minutes=10), sender=send)
+    checks.append({"check": "PUBLICATION", "status": "FAIL"})
+    assert ops_status.notify_operations(tmp_path, now + timedelta(minutes=20), sender=send)
+    assert len(messages) == 2
+    assert "BACKUP" in messages[0] and "PUBLICATION" in messages[1]
+    assert all("AUDIT_RUNTIME" not in text and "VENUE_OBSERVATION" not in text for text in messages)
+
+
+def test_flapping_cooldown_survives_recovery_and_does_not_repeat_open_incident(tmp_path, monkeypatch):
+    checks = [{"check": "BACKUP", "status": "FAIL"}]
+    monkeypatch.setattr(ops_status, "operational_checks", lambda *args: checks)
+    messages = []
+    def send(text):
+        messages.append(text)
+        return True
+    now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
+    assert ops_status.notify_operations(tmp_path, now, sender=send)
+    checks[0]["status"] = "OK"
+    assert ops_status.notify_operations(tmp_path, now + timedelta(minutes=10), sender=send)
+    checks[0]["status"] = "FAIL"
+    assert ops_status.notify_operations(tmp_path, now + timedelta(minutes=20), sender=send)
+    assert len(messages) == 1
+    assert ops_status.notify_operations(tmp_path, now + timedelta(hours=6), sender=send)
+    assert len(messages) == 2
+    assert ops_status.notify_operations(tmp_path, now + timedelta(days=2), sender=send)
+    assert len(messages) == 2
+
+
+def test_recent_service_notice_prevents_duplicate_operational_alert(tmp_path, monkeypatch):
+    checks = [{"check": "SUPERVISOR", "status": "FAIL"}]
+    monkeypatch.setattr(ops_status, "operational_checks", lambda *args: checks)
+    now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
+    path = tmp_path / "output/unit_failures/state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"xsec-experiment-supervisor.service": now.isoformat()}))
+    messages = []
+    assert ops_status.notify_operations(tmp_path, now + timedelta(minutes=10), sender=lambda t: messages.append(t))
+    assert not messages
+    state = json.loads((tmp_path / "output/operations_notices/latest.json").read_text())
+    assert state["notified_active"] == ["SUPERVISOR"]
+
+
+def test_legacy_acknowledged_incident_does_not_resend_after_upgrade(tmp_path, monkeypatch):
+    now = datetime(2026, 10, 29, 12, tzinfo=timezone.utc)
+    folder = tmp_path / "output/operations_notices"
+    folder.mkdir(parents=True)
+    (folder / "latest.json").write_text(json.dumps({"checked_at": now.isoformat(),
+                                                  "failed": ["BACKUP", "AUDIT_RUNTIME"], "acknowledged": True}))
+    monkeypatch.setattr(ops_status, "operational_checks", lambda *args: [{"check": "BACKUP", "status": "FAIL"}])
+    messages = []
+    assert ops_status.notify_operations(tmp_path, now + timedelta(days=1), sender=lambda t: messages.append(t))
+    assert not messages
 
 
 def test_default_storage_checks_stay_on_primary_volume(tmp_path, monkeypatch):

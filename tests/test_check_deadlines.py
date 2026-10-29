@@ -1,4 +1,7 @@
 import json
+from pathlib import Path
+import subprocess
+import sys
 from datetime import datetime, timedelta, timezone
 
 from scripts import check_deadlines as cd
@@ -89,3 +92,26 @@ def test_repository_registry_is_valid_and_currently_pending():
     ids = {row["id"]: row["status"] for row in status["deadlines"]}
     assert set(ids) == {"model_zoo_prereg_v1", "rotation_pilot_terminal", "model_zoo_v1_deadman"}
     assert all(s in ("pending", "done") for s in ids.values())
+
+
+def test_direct_script_launch_can_import_notification_package(tmp_path):
+    registry = _registry(tmp_path, NOW - timedelta(hours=1))
+    script = Path(cd.__file__).resolve()
+    code = '''
+import json, runpy, sys, types
+from pathlib import Path
+ns = runpy.run_path(sys.argv[1], run_name="deadline_validation")
+import utils
+fake = types.ModuleType("utils.telegram")
+messages = []
+fake.send_message = lambda text: messages.append(text) or True
+sys.modules["utils.telegram"] = fake
+status = ns["run"](root=Path(sys.argv[2]), registry_path=Path(sys.argv[3]),
+                   state_dir=Path(sys.argv[2])/"child-state")
+assert len(messages) == 1 and status["notices_sent"] == ["d1:overdue"]
+print("direct launch notification import passed")
+'''
+    result = subprocess.run([sys.executable, "-I", "-c", code, str(script), str(tmp_path), str(registry)],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert "direct launch notification import passed" in result.stdout

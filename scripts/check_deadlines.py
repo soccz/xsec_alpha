@@ -21,10 +21,12 @@ import argparse
 import glob
 import json
 import os
+import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 REGISTRY = ROOT / "docs" / "deadlines.json"
 STATE_DIR = ROOT / "output" / "deadlines"
 KST = timezone(timedelta(hours=9))
