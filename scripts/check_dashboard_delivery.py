@@ -42,6 +42,7 @@ def _optional_dict(path):
 
 
 def round_check(folder, summary_hash, now):
+    now = now.astimezone(timezone.utc)
     # Allow the scheduled collection 45 minutes; never use export time as market time.
     cutoff = (now - timedelta(minutes=45)).replace(minute=0, second=0, microsecond=0)
     due = cutoff - timedelta(hours=(cutoff.hour - 5) % 6)

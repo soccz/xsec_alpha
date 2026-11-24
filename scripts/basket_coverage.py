@@ -186,6 +186,7 @@ def collect(db, raw, backup, backup_at):
         WHERE a.slot IS NULL ORDER BY o.slot"""):
         db.execute("SAVEPOINT audit_slot")
         try:
+            utc(slot)
             obs = json.loads(payload)
             if obs["status"] == "missed":
                 db.execute(
@@ -194,7 +195,7 @@ def collect(db, raw, backup, backup_at):
                 )
             elif obs["status"] != "recorded":
                 raise ValueError("unexpected observation status")
-            elif not result or utc(obs["exit_at"]) + timedelta(hours=1) > cutoff:
+            elif utc(obs["exit_at"]) + timedelta(hours=1) > cutoff or result is None:
                 pending += 1
             else:
                 outcome = json.loads(result)
@@ -343,9 +344,9 @@ def pilot_comparison(db):
 
 
 def aggregates(db, now, backup, pending):
-    last = db.execute("""SELECT slot FROM observer.observations
-                       WHERE CASE WHEN json_valid(payload) THEN json_extract(payload,'$.status') END='recorded'
-                       ORDER BY slot DESC LIMIT 1""").fetchone()
+    last = db.execute("""SELECT o.slot FROM observer.observations o LEFT JOIN quarantine q USING(slot)
+                       WHERE q.slot IS NULL AND CASE WHEN json_valid(o.payload) THEN json_extract(o.payload,'$.status') END='recorded'
+                       ORDER BY o.slot DESC LIMIT 1""").fetchone()
     return {
         "schema": 1,
         "checked_at": now.isoformat(),

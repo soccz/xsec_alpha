@@ -150,17 +150,18 @@ def test_corrupt_slots_are_isolated_even_after_partial_price_writes(tmp_path):
             "UPDATE observations SET payload=? WHERE slot=?", (json.dumps(row), slot)
         )
         db.execute("INSERT INTO observations VALUES ('2026-12-31T18:00:00Z','{')")
+        db.execute("INSERT INTO observations VALUES ('bad-slot',?)",(json.dumps(row),))
     for _ in range(2):
         report = audit.run(tmp_path, backups, 0, now)
-        assert report["observer"] == {"quarantined": 2, "missed": 1}
-        assert len(report["quarantine_recent"]) == 2
+        assert report["observer"] == {"quarantined": 3, "missed": 1}
+        assert len(report["quarantine_recent"]) == 3 and report["latest_capture"] is None
     with closing(
         sqlite3.connect(tmp_path / "output/basket_coverage/audit.sqlite")
     ) as db:
         assert db.execute("SELECT count(*) FROM prices").fetchone()[0] == 0
         assert db.execute(
             "SELECT length(observation_sha256) FROM quarantine"
-        ).fetchall() == [(64,), (64,)]
+        ).fetchall() == [(64,), (64,), (64,)]
 
 
 def test_database_failure_is_not_a_bad_input_slot(tmp_path, monkeypatch):
