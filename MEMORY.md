@@ -2,6 +2,13 @@
 
 Updated 2026-11-24.
 
+## 2026-11-24 Recommendation Delivery Chain
+
+- Authorized early activation between service ticks after isolated tests. Slot-level audit errors now roll back only the affected price rows, persist input hashes and remain unscored; storage failures still fail the job. Immutable pilot outcomes, ranking and models are untouched.
+- Latest-only Telegram delivery keeps the missed API-ack count across supersessions/expiry, includes it on the newest message, then stops repeating it after acknowledgement. The private dashboard retains a cumulative count and the last eight IDs from rollout; older archives are not relabeled. No real message was used for testing.
+- Normal exports write a private witness outside the website payload tree. The independent verifier ties exact served summary bytes to the exported run ID, market timestamp, candidate digest and Telegram state, then compares with the latest local report. The UI distinguishes market-slot freshness, API acknowledgement and identical web candidates. A later export conveys proof from the last completed check, not evidence of human reading or strategy performance.
+- Verified on a separate clone: 84 related tests passed; real-layout three-viewport browser check covers stale/same, different, missing and restored display. Operational records: output/basket_coverage/summary.json, output/dashboard_publication/{report_witness,delivery}.json and report-round-transitions.jsonl.
+
 ## 2026-11-24 Continuous Basket Coverage
 
 - User wants continuing observation, not an extended or re-scored trial. The independent daily worker reads the unbounded regime observer, the registered pilot for attribution only, and a read-only nightly raw-price backup. The official 336 slots, terminal rules, six frozen sources, two model hashes, signal gates and Telegram path are unchanged. No new governance deadline or automatic promotion.

@@ -132,6 +132,49 @@ def test_lag_and_stale_backup_do_not_freeze_false_gaps(tmp_path):
         audit.run(tmp_path, backups, 0, now + timedelta(days=3))
 
 
+def test_corrupt_slots_are_isolated_even_after_partial_price_writes(tmp_path):
+    backups, _, now, slot, _ = fixture(tmp_path)
+    with (
+        closing(
+            sqlite3.connect(tmp_path / "output/regime_observation/ledger.sqlite")
+        ) as db,
+        db,
+    ):
+        row = json.loads(
+            db.execute(
+                "SELECT payload FROM observations WHERE slot=?", (slot,)
+            ).fetchone()[0]
+        )
+        del row["evaluation"]
+        db.execute(
+            "UPDATE observations SET payload=? WHERE slot=?", (json.dumps(row), slot)
+        )
+        db.execute("INSERT INTO observations VALUES ('2026-12-31T18:00:00Z','{')")
+    for _ in range(2):
+        report = audit.run(tmp_path, backups, 0, now)
+        assert report["observer"] == {"quarantined": 2, "missed": 1}
+        assert len(report["quarantine_recent"]) == 2
+    with closing(
+        sqlite3.connect(tmp_path / "output/basket_coverage/audit.sqlite")
+    ) as db:
+        assert db.execute("SELECT count(*) FROM prices").fetchone()[0] == 0
+        assert db.execute(
+            "SELECT length(observation_sha256) FROM quarantine"
+        ).fetchall() == [(64,), (64,)]
+
+
+def test_database_failure_is_not_a_bad_input_slot(tmp_path, monkeypatch):
+    backups, _, now, _, _ = fixture(tmp_path)
+
+    def storage_failure(*args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(audit, "inspect_slot", storage_failure)
+    with pytest.raises(sqlite3.OperationalError, match="I/O"):
+        audit.run(tmp_path, backups, 0, now)
+    assert not (tmp_path / "output/basket_coverage/summary.json").exists()
+
+
 def test_probe_never_backfills_prices(tmp_path, monkeypatch):
     backups, _, now, _, _ = fixture(tmp_path)
     audit.run(tmp_path, backups, 0, now)

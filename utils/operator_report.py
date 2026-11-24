@@ -124,6 +124,9 @@ def format_report(report, realized_summary=None):
             text += f"\n  <b>{escape(row['market'].replace('KRW-', ''))}</b> · {label}"
             text += f"\n  <code>자료: {escape(stamp)}</code>"
         text += "\n<code>actionable=false · 과거 수치로 신규 진입 판단 금지</code>"
+    gap_count = report.get("delivery_gaps", {}).get("since_ack", 0)
+    if gap_count:
+        text += f"\n이전 보고 {gap_count}건 전달 미확인 · 이력은 대시보드 참고"
     return text + f'\n\n<a href="{DASHBOARD_URL}">대시보드</a>'
 
 
@@ -149,11 +152,25 @@ def _deliver(report, root):
     return sent
 
 
+def _carry_gaps(report, prior, reason=None):
+    previous = prior.get("delivery_gaps") or {}
+    gaps = {"total": previous.get("total", 0), "recent": list(previous.get("recent", [])),
+            "since_ack": 0 if prior.get("telegram", {}).get("state") == "sent" else previous.get("since_ack", 0)}
+    if reason and prior["run_id"] != report["run_id"]:
+        event = {key: prior.get(key) for key in ("run_id", "generated_at", "data_asof")}
+        gaps["total"] += 1
+        gaps["since_ack"] += 1
+        gaps["recent"] = (gaps["recent"] + [dict(event, reason=reason)])[-8:]
+    report["delivery_gaps"] = gaps
+
+
 def publish_report(report, *, send=True, realized_summary=None, root=ROOT):
     root = Path(root)
     with run_lock("operator_report", lock_dir=str(root / "logs" / "locks"), timeout_sec=45, exit_code=75):
         previous = _read(root / "output" / "latest_operator_report.json")
-        if previous and previous.get("telegram", {}).get("state") == "pending":
+        pending = previous.get("telegram", {}).get("state") == "pending"
+        _carry_gaps(report, previous, "superseded" if pending else None)
+        if pending and previous["run_id"] != report["run_id"]:
             previous["telegram"].update(state="superseded", superseded_by=report["run_id"])
             _write(root / "output" / "operator_reports" / f"{previous['run_id']}.json", previous)
         report["message"] = format_report(report, realized_summary)
@@ -173,6 +190,7 @@ def retry_latest(root=ROOT, now=None):
         if report.get("signals") and now - created >= timedelta(hours=6):
             replacement = build_report(reason="전송 지연으로 추천 기간 만료 · 이전 후보 참고용", root=root)
             replacement["replaces_run_id"] = report["run_id"]
+            _carry_gaps(replacement, report, "expired")
             replacement["message"] = format_report(replacement)
             report["telegram"].update(state="expired", superseded_by=replacement["run_id"])
             _write(root / "output" / "operator_reports" / f"{report['run_id']}.json", report)

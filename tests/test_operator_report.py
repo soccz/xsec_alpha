@@ -104,3 +104,21 @@ def test_expired_delivery_does_not_resend_an_old_actionable_signal(tmp_path, mon
     assert not replacement["signals"]
     assert replacement["ideas"][0]["reference_only"]
     assert '-9' not in messages[0] and 'actionable=false' in messages[0]
+    assert '이전 보고 1건 전달 미확인' in messages[0]
+    assert replacement["delivery_gaps"]["recent"][0]["reason"] == "expired"
+
+
+def test_recovery_attaches_gap_once_and_retains_dashboard_history(tmp_path, monkeypatch):
+    answers = iter([False,False,False,True,True])
+    messages = []
+    monkeypatch.setattr(telegram,"send_message",lambda msg: messages.append(msg) or next(answers))
+    reports = [operator_report.build_report(root=tmp_path) for _ in range(4)]
+    for report in reports[:3]:
+        operator_report.publish_report(report,root=tmp_path)
+    assert operator_report.retry_latest(tmp_path)
+    assert messages[-1] == messages[-2] and '이전 보고 2건 전달 미확인' in messages[-1]
+    assert latest(tmp_path)["delivery_gaps"]["total"] == 2
+    operator_report.publish_report(reports[-1],root=tmp_path)
+    final = latest(tmp_path)
+    assert '전달 미확인' not in messages[-1]
+    assert [r["run_id"] for r in final["delivery_gaps"]["recent"]] == [r["run_id"] for r in reports[:2]]

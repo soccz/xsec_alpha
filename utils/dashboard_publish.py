@@ -121,7 +121,8 @@ def publish_dashboard(push=True):
         with run_lock("dashboard_publish", lock_dir=str(ROOT / "logs/locks"), timeout_sec=90, exit_code=75):
             source = folder / "payloads"
             target = source / PREFIX
-            export_to(target / "dashboard/data", PIN_DEFAULT, public_target=target / "public_summary.json")
+            export_to(target / "dashboard/data", PIN_DEFAULT, public_target=target / "public_summary.json",
+                      private_receipt=folder / "report_witness.json")
             success = publish_files(source) if push else True
             if push:
                 _write(folder / "status.json", {"checked_at": _utc().isoformat(),

@@ -48,6 +48,23 @@
 
 ## 운용
 
+### 회차 단위 오류와 전달 이력
+
+- 자료 오류는 회차별 SQLite savepoint로 부분 가격까지 취소하고 `quarantine`에
+  회차·검출 시각·사유·입력 해시를 한 번 기록한다. 이후 회차는 계속 감사한다.
+  격리는 결측 수익 0이나 공식 판정이 아니다. 저장 공간·DB 오류는 잡아 삼키지 않는다.
+- 새 추천이 미확인 보고를 대체하거나 오래된 보고가 만료되면 해당 ID와 원자료
+  시각을 남긴다. 복구 시 최신 메시지에만 미확인 건수를 붙인다. API 성공 뒤 다음
+  보고에서는 안내를 반복하지 않는다. PIN 대시보드에는 도입 이후 합계·최근 8건,
+  전체 원본은 로컬 operator_reports에 남는다. 사람의 열람 실패로 단정하지 않는다.
+- 발행 과정에서 공개하지 않는 report_witness.json에 암호화 요약 해시와 정확히
+  그 요약에 넣은 회차 ID·자료 시각·후보 해시·Telegram 응답 상태를 연결한다.
+  15분 점검은 실제 공개 요약 파일의 일치, 마지막 서버 보고와 같은 회차·후보인지,
+  API 응답 일치 여부를 따로 기록한다. 6시간 정규 슬롯에서 45분 유예 후 자료가
+  뒤처지면 지연이다. 발행 시간으로 추천 시간을 대체하지 않는다. 화면에 보이는
+  점검은 게시 시점의 기록이며 새 회차의 확인은 다음 점검 및 게시를 기다린다.
+  상태 변화는 로컬 report-round-transitions.jsonl에 보존한다.
+
 ```bash
 bash deploy/install_basket_coverage.sh
 systemctl --user list-timers xsec-basket-coverage.timer xsec-dashboard-delivery.timer

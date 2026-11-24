@@ -715,7 +715,7 @@ def build_summary_payload() -> dict:
         "score_evidence": _safe_load_json(OUTPUT_DIR / "score_evidence/status.json"),
         "forecast_audit": _safe_load_json(OUTPUT_DIR / "forecast_audit/summary.json"),
         "operator_report": {key: operator_report.get(key) for key in (
-            "run_id", "generated_at", "data_asof", "status", "reason", "signals", "ideas", "telegram",
+            "run_id", "generated_at", "data_asof", "status", "reason", "signals", "ideas", "telegram", "delivery_gaps",
         )} if operator_report else None,
         "drift": _drift_rows(drift),
         "drift_generated_at": drift.get("generated_at"),
@@ -1225,7 +1225,7 @@ def build_dashboard_payloads(history_days: int = 60, ic_days: int = 60) -> dict:
 @model_release_guard()
 def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
               history_days: int = 60, ic_days: int = 60,
-              public_target: Path | None = None) -> dict[str, Path]:
+              public_target: Path | None = None, private_receipt: Path | None = None) -> dict[str, Path]:
     target_dir.mkdir(parents=True, exist_ok=True)
     payloads = build_dashboard_payloads(history_days=history_days, ic_days=ic_days)
     written: dict[str, Path] = {}
@@ -1248,5 +1248,13 @@ def export_to(target_dir: Path, pin: str = PIN_DEFAULT,
             }
         public_target.write_text(json.dumps(public_payload, ensure_ascii=False, indent=2))
         written["public_summary.json"] = public_target
+    if private_receipt is not None:
+        from utils.experiment_supervisor import _write
+        from utils.report_identity import report_identity
+        report = payloads["summary.json"].get("operator_report") or {}
+        _write(private_receipt, {
+            "summary_sha256": hashlib.sha256(written["summary.json"].read_bytes()).hexdigest(),
+            "report": report_identity(report),
+        })
 
     return written

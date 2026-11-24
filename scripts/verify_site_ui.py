@@ -170,6 +170,20 @@ def check_coverage_view(driver, wait, base, output, width):
     driver.save_screenshot(str(output / f'coverage-{width}.png'))
     driver.execute_script("document.getElementById('basketCoverageDetail').open=true")
     assert driver.find_element(By.ID, 'basketCoverageRegimes').is_displayed()
+    assert driver.execute_script("""
+      const id='test-round', r={run_id:id, data_asof:'2000-01-01T05:00:00Z',telegram:{state:'sent'},
+        delivery_gaps:{total:1,recent:[{run_id:'missed-test',reason:'superseded'}]}};
+      const proof={status:'verified',round:{match:'same',served_run_id:id,data_asof:r.data_asof,same_picks:true,same_ack:true}};
+      renderReportChain({operator_report:r,dashboard_delivery:proof});
+      const msg=document.getElementById('reportChain'), gaps=document.getElementById('reportGapHistory');
+      const stale=msg.textContent.includes('추천 자료 지연') && msg.textContent.includes('동일 회차·후보 확인') && gaps.textContent.includes('missed-test');
+      proof.round.served_run_id='old';
+      renderReportChain({operator_report:r,dashboard_delivery:proof});
+      const mismatch=msg.textContent.includes('다른 회차 확인');
+      renderReportChain({}); const empty=!gaps.children.length && msg.textContent.includes('회차 미확인');
+      renderReportChain(dashboardState.summary);
+      return stale && mismatch && empty;
+    """)
     assert '미확인' in driver.find_element(By.ID, 'basketCoverageProbes').text
     assert driver.execute_script("return document.documentElement.scrollWidth") <= width + 2
     driver.execute_script('renderBasketCoverage({})')

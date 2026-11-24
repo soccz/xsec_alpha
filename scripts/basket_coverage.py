@@ -4,6 +4,7 @@ import argparse
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import fcntl
+import hashlib
 from http.client import HTTPException
 import json
 import math
@@ -34,6 +35,9 @@ CREATE TABLE IF NOT EXISTS probes (
  PRIMARY KEY(market,candle));
 CREATE TABLE IF NOT EXISTS probe_attempts (
  market TEXT, candle TEXT, checked_at TEXT, result TEXT, detail TEXT);
+CREATE TABLE IF NOT EXISTS quarantine (
+ slot TEXT PRIMARY KEY, detected_at TEXT NOT NULL, reason TEXT NOT NULL,
+ observation_sha256 TEXT NOT NULL, outcome_sha256 TEXT);
 """
 
 
@@ -48,6 +52,12 @@ def utc(value):
 
 def ro(path):
     return path.resolve().as_uri() + "?mode=ro"
+
+
+def source_hash(raw):
+    return hashlib.sha256(
+        raw if isinstance(raw, bytes) else str(raw).encode()
+    ).hexdigest()
 
 
 def summary_file(path, data):
@@ -169,23 +179,45 @@ def collect(db, raw, backup, backup_at):
     if not latest:
         raise ValueError("empty price backup")
     pending = 0
+    cutoff = min(utc(latest), backup_at)
     for slot, payload, result in db.execute("""
         SELECT o.slot,o.payload,r.payload FROM observer.observations o
         LEFT JOIN observer.outcomes r USING(slot) LEFT JOIN slots a USING(slot)
         WHERE a.slot IS NULL ORDER BY o.slot"""):
-        obs = json.loads(payload)
-        if obs["status"] == "missed":
+        db.execute("SAVEPOINT audit_slot")
+        try:
+            obs = json.loads(payload)
+            if obs["status"] == "missed":
+                db.execute(
+                    "INSERT INTO slots(slot,official,state) VALUES (?,'missed','missed')",
+                    (slot,),
+                )
+            elif obs["status"] != "recorded":
+                raise ValueError("unexpected observation status")
+            elif not result or utc(obs["exit_at"]) + timedelta(hours=1) > cutoff:
+                pending += 1
+            else:
+                outcome = json.loads(result)
+                if outcome["status"] not in ("matured", "invalid_prices"):
+                    raise ValueError("unexpected outcome status")
+                inspect_slot(db, raw, slot, obs, outcome, backup.name)
+        except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
+            db.execute("ROLLBACK TO audit_slot")
             db.execute(
-                "INSERT INTO slots(slot,official,state) VALUES (?,'missed','missed')",
-                (slot,),
+                "INSERT INTO slots(slot,official,backup,state) VALUES (?,'unverified',?,'quarantined')",
+                (slot, backup.name),
             )
-            continue
-        if not result or utc(obs["exit_at"]) + timedelta(hours=1) > min(
-            utc(latest), backup_at
-        ):
-            pending += 1
-            continue
-        inspect_slot(db, raw, slot, obs, json.loads(result), backup.name)
+            db.execute(
+                "INSERT INTO quarantine VALUES (?,?,?,?,?)",
+                (
+                    slot,
+                    datetime.now(timezone.utc).isoformat(),
+                    f"{type(exc).__name__}: {exc}"[:160],
+                    source_hash(payload),
+                    source_hash(result) if result is not None else None,
+                ),
+            )
+        db.execute("RELEASE audit_slot")
     return pending
 
 
@@ -312,7 +344,8 @@ def pilot_comparison(db):
 
 def aggregates(db, now, backup, pending):
     last = db.execute("""SELECT slot FROM observer.observations
-                       WHERE json_extract(payload,'$.status')='recorded' ORDER BY slot DESC LIMIT 1""").fetchone()
+                       WHERE CASE WHEN json_valid(payload) THEN json_extract(payload,'$.status') END='recorded'
+                       ORDER BY slot DESC LIMIT 1""").fetchone()
     return {
         "schema": 1,
         "checked_at": now.isoformat(),
@@ -321,6 +354,12 @@ def aggregates(db, now, backup, pending):
         "latest_capture": last[0] if last else None,
         "capture_stale": not last or now - utc(last[0]) > timedelta(hours=8),
         "observer": dict(db.execute("SELECT state,count(*) FROM slots GROUP BY state")),
+        "quarantine_recent": [
+            dict(slot=s, reason=r)
+            for s, r in db.execute(
+                "SELECT slot,reason FROM quarantine ORDER BY slot DESC LIMIT 8"
+            )
+        ],
         "by_regime": [
             dict(regime=r, state=s, n=n)
             for r, s, n in db.execute(

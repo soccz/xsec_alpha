@@ -1,4 +1,5 @@
 import json
+from datetime import datetime, timezone
 
 from scripts import check_dashboard_delivery as delivery
 
@@ -60,3 +61,42 @@ def test_failure_recovery_and_supersession(tmp_path):
     assert unavailable["last_verified"] == good["last_verified"]
     status.write_text('{"status":"failed"}')
     assert delivery.verify(tmp_path, timeout)["status"] == "no_confirmed_push"
+
+
+def test_file_confirmation_round_and_freshness_are_independent(tmp_path):
+    folder = tmp_path / "dashboard_publication"
+    folder.mkdir()
+    now = datetime(2026, 11, 24, 5, 45, tzinfo=timezone.utc)
+    report = {
+        "run_id": "A",
+        "data_asof": "2026-11-24T05:00:00Z",
+        "telegram": {"state": "sent", "acknowledged_at": "proof"},
+    }
+    latest = tmp_path / "latest_operator_report.json"
+    latest.write_text(json.dumps(report))
+    witness = folder / "report_witness.json"
+    witness.write_text(
+        json.dumps(
+            {"report": delivery.report_identity(report), "summary_sha256": "abc"}
+        )
+    )
+    result = delivery.round_check(folder, "abc", now)
+    assert (
+        result["match"] == "same"
+        and result["freshness"] == "current"
+        and result["same_ack"]
+        and result["same_picks"]
+    )
+    latest.write_text(json.dumps(dict(report, ideas=[{"market": "KRW-DIFFERENT"}])))
+    assert not delivery.round_check(folder, "abc", now)["same_picks"]
+    assert delivery.round_check(folder, "wrong", now)["match"] == "unknown"
+    latest.write_text(json.dumps(dict(report, run_id="B")))
+    assert delivery.round_check(folder, "abc", now)["match"] == "different"
+    latest.write_text(json.dumps(dict(report, data_asof="2026-11-23T23:00:00Z")))
+    assert delivery.round_check(folder, "abc", now)["freshness"] == "stale"
+    assert (
+        delivery.round_check(folder, "abc", now.replace(minute=44))["freshness"]
+        == "current"
+    )
+    latest.write_text(json.dumps(dict(report, data_asof=None)))
+    assert delivery.round_check(folder, "abc", now)["freshness"] == "unknown"

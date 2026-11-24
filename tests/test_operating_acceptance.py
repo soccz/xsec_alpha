@@ -139,7 +139,11 @@ def test_export_receipt_binds_only_closure_hash_and_exact_private_bytes(tmp_path
     monkeypatch.setattr(export, "build_history_payload", lambda **k: {})
     monkeypatch.setattr(export, "build_accuracy_payload", lambda **k: {})
     monkeypatch.setattr(export, "build_public_summary_payload", lambda: {"public": "aggregate"})
-    files = export.export_to(tmp_path / "data", pin="test-only", public_target=tmp_path / "public_summary.json")
+    witness = tmp_path / "private" / "report_witness.json"
+    files = export.export_to(tmp_path / "data", pin="test-only", public_target=tmp_path / "public_summary.json",
+                             private_receipt=witness)
     receipt = json.loads(files["public_summary.json"].read_text())["operating_receipt"]
     assert set(receipt) == {"closed_sha256", "summary_sha256"}
+    assert witness not in files.values()
+    assert json.loads(witness.read_text())["summary_sha256"] == receipt["summary_sha256"]
     assert receipt == {"closed_sha256": digest, "summary_sha256": hashlib.sha256(files["summary.json"].read_bytes()).hexdigest()}
