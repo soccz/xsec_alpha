@@ -1,0 +1,9 @@
+[Unit]
+Description=xsec_alpha compare pushed summaries with actual Pages responses
+
+[Timer]
+OnCalendar=*-*-* *:07,22,37,52:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

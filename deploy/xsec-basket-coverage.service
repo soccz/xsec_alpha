@@ -1,0 +1,13 @@
+[Unit]
+Description=xsec_alpha independent basket price coverage audit
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/22tb/main/gan_t/xsec_alpha
+ExecStart=%h/.pyenv/versions/3.12.9/bin/python scripts/basket_coverage.py
+Nice=19
+IOSchedulingClass=idle
+UMask=0077
+TimeoutStartSec=300
+NoNewPrivileges=true

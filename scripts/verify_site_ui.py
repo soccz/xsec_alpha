@@ -148,7 +148,37 @@ def check_refresh_regressions(driver, wait):
     print('Periodic refresh, independent age checks, offline retention, recovery, bundle mismatch and rollback rejection: PASS')
 
 
-def check_browser(base, output):
+def check_coverage_view(driver, wait, base, output, width):
+    driver.get(urljoin(base, 'projects/xsec-alpha/#basket-coverage-journal'))
+    wait.until(lambda d: d.find_element(By.ID, 'basket-coverage-journal').is_displayed())
+    assert '68회' in driver.find_element(By.ID, 'basket-coverage-journal').text
+    driver.get(urljoin(base, 'projects/xsec-alpha/dashboard/#rotation-pilot'))
+    field = wait.until(lambda d: d.find_element(By.ID, 'pinInput'))
+    assert not driver.find_elements(By.CSS_SELECTOR, '#basketCoverageTable tr')
+    field.send_keys(PIN_DEFAULT)
+    driver.find_element(By.ID, 'pinSubmit').click()
+    wait.until(lambda d: d.execute_script("return document.body.dataset.loaded === 'true'"))
+    wait.until(lambda d: d.find_element(By.ID, 'basketCoverageTable').is_displayed())
+    assert driver.execute_script("""
+      const s=dashboardState.summary, t=document.getElementById('basketCoverageTable');
+      const i=s.basket_coverage?.pilot_invalid;
+      return t.rows.length === 5 && s.basket_coverage?.checked_at && s.dashboard_delivery?.last_verified &&
+        t.rows[2].cells[1].textContent === (i ? [i.basket_only ?? 0,i.basket_incomplete ?? 0,i.full ?? 0].join(' / ')+'회' : '파일럿 원장 확인 불가');
+    """)
+    driver.execute_script("document.getElementById('basketCoverageMeta').scrollIntoView({block:'start',behavior:'instant'});window.scrollBy(0,-120)")
+    assert driver.execute_script("return document.documentElement.scrollWidth") <= width + 2
+    driver.save_screenshot(str(output / f'coverage-{width}.png'))
+    driver.execute_script("document.getElementById('basketCoverageDetail').open=true")
+    assert driver.find_element(By.ID, 'basketCoverageRegimes').is_displayed()
+    assert '미확인' in driver.find_element(By.ID, 'basketCoverageProbes').text
+    assert driver.execute_script("return document.documentElement.scrollWidth") <= width + 2
+    driver.execute_script('renderBasketCoverage({})')
+    assert not driver.find_elements(By.CSS_SELECTOR, '#basketCoverageTable tr')
+    assert '자료 없음' in driver.find_element(By.ID, 'basketCoverageMeta').text
+    driver.execute_script('renderBasketCoverage(dashboardState.summary)')
+
+
+def check_browser(base, output, coverage_only=False):
     drivers = list((Path.home() / '.cache/selenium/chromedriver').glob('**/chromedriver'))
     executable = shutil.which('chromedriver') or (str(max(drivers, key=lambda p: p.stat().st_mtime)) if drivers else None)
     if not executable:
@@ -176,6 +206,9 @@ def check_browser(base, output):
                 driver.execute_cdp_cmd('Emulation.setDeviceMetricsOverride', {
                     'width': width, 'height': height, 'deviceScaleFactor': 1, 'mobile': width < 500,
                 })
+                if coverage_only:
+                    check_coverage_view(driver, wait, base, output, width)
+                    continue
                 driver.get(urljoin(base, 'projects/xsec-alpha/'))
                 wait.until(lambda d: len(d.find_elements(By.CSS_SELECTOR, '.chapter-group')) == 2)
                 assert driver.find_element(By.CSS_SELECTOR, '.page-switch [aria-current]').text == '개발일지'
@@ -271,6 +304,9 @@ def check_browser(base, output):
                 assert not driver.execute_script("return document.querySelector('#navDrawer').inert === false")
                 print(f'Viewport {width}: routing, protected data, first-viewport candidates, charts, disclosures PASS')
 
+            if coverage_only:
+                print('Coverage journal, PIN gate, real counts, missing state and three viewport widths: PASS')
+                return
             check_refresh_regressions(driver, wait)
             driver.execute_script('''
                 const d={n:3,n_windows:2,avg:1.6667,avg_net:1.3,avg_gross_per_window:1,avg_cost_per_window:0.4,avg_net_per_window:0.6,tstat_clustered:-3,tstat:4};
@@ -399,6 +435,7 @@ def check_browser(base, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--url', help='Public site origin, e.g. https://soccz.github.io/')
+    parser.add_argument('--coverage-only', action='store_true', help='Check continuous basket audit with real exports')
     parser.add_argument('--output', default=str(ROOT / 'output/site-ux-verification'))
     args = parser.parse_args()
     site = ROOT / 'output/site-preview'
@@ -406,13 +443,13 @@ def main():
     output.mkdir(parents=True, exist_ok=True)
     check_source(site)
     if args.url:
-        check_browser(args.url, output)
+        check_browser(args.url, output, args.coverage_only)
     else:
         server = ThreadingHTTPServer(('127.0.0.1', 0), partial(QuietHandler, directory=str(site)))
         thread = Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            check_browser(f'http://127.0.0.1:{server.server_port}/', output)
+            check_browser(f'http://127.0.0.1:{server.server_port}/', output, args.coverage_only)
         finally:
             server.shutdown()
             server.server_close()

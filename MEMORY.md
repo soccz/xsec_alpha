@@ -1,6 +1,14 @@
 # xsec_alpha continuity
 
-Updated 2026-10-29.
+Updated 2026-11-24.
+
+## 2026-11-24 Continuous Basket Coverage
+
+- User wants continuing observation, not an extended or re-scored trial. The independent daily worker reads the unbounded regime observer, the registered pilot for attribution only, and a read-only nightly raw-price backup. The official 336 slots, terminal rules, six frozen sources, two model hashes, signal gates and Telegram path are unchanged. No new governance deadline or automatic promotion.
+- First read-only comparison: all 74 official invalid-price slots matched the backup row deficits; 68 had both selected baskets intact, 6 did not. The latter include two widespread gaps (89/88 rows); contemporaneous market-list connection timeouts are evidence, not an established cause of all missing candles. Four pilot capture failures are tracked separately from observer misses. Zero observed reversal exposure is not a negative profitability result.
+- Local artifacts: output/basket_coverage/audit.sqlite (slot/market/leg and later probes), checked same-disk recovery.sqlite, summary.json; output/dashboard_publication/delivery.json and transitions log. User timers xsec-basket-coverage (03:43 KST) and xsec-dashboard-delivery (15 min), persistent, enabled, user linger=yes. No OnFailure/Telegram hooks. Scripts, deploy units/installer, tests, docs/basket_coverage.md, README and private dashboard export wiring are scoped to this feature. Stop only these two timers for maintenance; don't stop alpha or the pilot.
+- Kickoff showed pre-existing SHORT FREEZE and forecast audit attention (legacy_comparison_missing); neither was reclassified or repaired by this audit. Basic import checks, 25 pilot/publisher and 13 export/report baseline tests passed. Integrated 48 passed before further probe tests, latest focused workers 14 passed. Browser coverage 1440/390/360, complete local UI regression, source/model hashes and last-50 Telegram arithmetic checked.
+- Release: integrated 52 tests passed plus a new private-export regression (missing data is null, audit markers never reach public JSON); 15 export/delivery/report tests green on the deployed exporter. Both user services exited 0 and an automatic delivery tick matched the actual public and encrypted summary. Website commit a88643b71df6b400e5400a57bdbd9ba300eac272 changed only the two xsec HTML and four payloads, Pages run 45335654556. The dated journal records the 68/6 split; the PIN dashboard reads current audit and delivery summaries in normal exports. For the current served generation, read delivery.json rather than treating a push as proof.
 
 ## 2026-10-29 Non-Recommendation Telegram Noise
 

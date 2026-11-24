@@ -1,0 +1,73 @@
+# 선택 바스켓 가격 감사 (2026-11-24)
+
+**운영 계약:** 연구용 가격 감사에는 종료일이 없다. 매일 완료된 새 관찰을 기록한다.
+등록한 336회 전환 파일럿은 원래 종결 규칙을 유지한다. 종료 뒤에도 국면 관찰의
+선택 바스켓·전체 종목 가격은 감사하지만 새 전환 비중, 모델 승격, 주문은 생성하지 않는다.
+새 성과 실험이 필요하면 별도 미래 자료에 사전등록한다.
+
+## 11월 24일에 판단이 바뀐 이유
+
+14:13 KST 기준 공식 가격 무효 74회에서 백업의 가격 누락 수가 회차별 공식 집계와
+일치했다. 68회는 양쪽 선택 5종목의 진입·종료 가격이 모두 있었고, 6회는 선택
+종목에도 결측이 있었다. 당시까지 파일럿에서 저장된 216회 모두 반전 비중은 0.
+공식 무효를 복구한 것이 아니며 시즌의 수익 효과를 판정할 수 없다.
+
+큰 결측은 10월 18일과 11월 8일 20시 KST 신호(각 89·88행)에서 나왔다.
+두 회차 모두 다음날 02시 신호의 파일럿 캡처도 늦었다. 10월 19일 02:15 및
+11월 9일 02:04 이후 수집 로그에는 업비트 시장 목록 요청 연결 타임아웃이 있다.
+시간대가 겹친다는 증거이지 모든 결측이 서버 또는 거래소 장애 때문이라는 증거는 아니다.
+
+## 입력, 기준과 결과
+
+- 일일 타이머: 매일 03:43 KST. 최신 완료 가격 백업을 읽기 전용으로 열고, 시간대를
+  UTC로 맞춰 당시 관찰 원장의 종목·진입·종료 시각과 대조한다. 아직 정산되지 않은
+  회차, 백업 범위를 넘는 회차는 다음 실행까지 대기한다. 아직 관찰 원장에 없는
+  예정 회차를 추정해서 만들지 않는다. 최근 관찰 저장이 8시간을 넘기면 지연 표시한다.
+- 키는 (신호 시각, 종목, 진입/종료). 원시 시가가 하나이고 유한한 양수여야 한다.
+  전체 완전, 선택만 완전, 선택도 불완전, 관찰 누락, 대기를 구분한다. 최초 진단에
+  사용한 백업 이름을 남기고 이후 조회로 원래 판정·가격·공식 IC를 바꾸지 않는다.
+- `slots`와 `prices`는 회차와 가격 단위 표다. 순위 IC는 원래 전체 종목으로
+  계산된 공식 값만 별도 보관한다. 선택 바스켓은 양쪽이 모두 완전한 쌍에서만
+  동일 비중 SHORT 수익률에 원래 수수료·슬리피지 가정을 차감한다.
+  파일럿 비중이 있을 때만 고정 대비 차이를 구하며 직전 대비 비중 변경 비용도 차감한다.
+  비중이 바뀐 회차만 고르지 않는다. 업비트 대리 가격이지 실체결 손익이 아니다.
+- 없는 봉은 시장·UTC 시각별로 중복을 제거하고 하루 정상 실행에서 최대 30개만
+  공식 60분 캔들 API로 재조회한다. 응답에 같은 봉이 있으면 '지금 조회됨', 더
+  과거 봉이나 빈 응답이면 '현재 미반환', 타임아웃·오류면 '미확인'이다. 429 등은
+  해당 실행에서 중단하고 오류 조회는 최대 3회로 제한한다. 이전 가격 또는 0으로
+  메우지 않는다. 거래 없는 시간에는 봉이 생성되지 않을 수 있다
+  ([업비트 명세](https://docs.upbit.com/kr/reference/list-candles-minutes)).
+- 결과는 `output/basket_coverage/{audit.sqlite,recovery.sqlite,summary.json}`에 저장한다.
+  최신 복구 사본은 SQLite 백업 후 quick_check를 통과해야 교체한다(동일 디스크).
+  파일럿 원장이 없어도 관찰 감사는 계속한다. 매일 같은 신호를 다시 집계하지 않는다.
+- 별도 타이머가 매 15분 공개·암호화 요약의 SHA-256을 로컬 발행본과 대조한다.
+  다른 버전 응답, 확인 실패, 대조 도중 새 발행을 구분하고 마지막 확인 시각을
+  보존한다. 상태가 바뀌면 `output/dashboard_publication/delivery-transitions.jsonl`에도
+  남긴다. 이는 브라우저 수신 가능한 두 파일의 증거이지 모든 페이지나 텔레그램
+  열람 증명은 아니다. 공개 확인 자체로 새 배포를 일으키지 않는다.
+
+## 운용
+
+```bash
+bash deploy/install_basket_coverage.sh
+systemctl --user list-timers xsec-basket-coverage.timer xsec-dashboard-delivery.timer
+journalctl --user -u xsec-basket-coverage.service -u xsec-dashboard-delivery.service
+sqlite3 -readonly output/basket_coverage/audit.sqlite 'SELECT state,count(*) FROM slots GROUP BY state'
+```
+
+특정 회차의 가격 결측과 사후 거래소 재조회를 분리해 보려면 감사 DB에서 아래처럼 조회한다.
+같은 UTC 봉이 여러 회차에서 쓰여도 재조회 증거는 (종목, 캔들 시각) 하나에만 연결한다.
+
+```sql
+SELECT p.slot,p.leg,p.market,p.model,p.reversal,p.status,p.candle,
+       s.backup,a.checked_at,a.result AS later_exchange_check
+FROM prices p JOIN slots s USING(slot) LEFT JOIN probes a USING(market,candle)
+WHERE p.status <> 'ok'
+ORDER BY p.slot,p.leg,p.market;
+```
+
+두 유닛 모두 추천 서비스와 독립적이며 텔레그램 알림을 보내지 않는다.
+기존 추천·서비스 및 마감 알림의 계약은 그대로다. 서버가 꺼져 있는 동안 작업할 수
+없으며, 재부팅 후 Persistent 타이머가 밀린 점검을 수행한다. 놓친 과거 추천을 생성하지 않는다.
+다시 설계할 때 이 두 점검만 정지하려면
+`systemctl --user disable --now xsec-basket-coverage.timer xsec-dashboard-delivery.timer`를 사용한다.

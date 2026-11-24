@@ -709,6 +709,8 @@ def build_summary_payload() -> dict:
         "regime_observation": _safe_load_json(OUTPUT_DIR / "regime_observation/summary.json"),
         "trial_diagnostics": _safe_load_json(OUTPUT_DIR / "trial_diagnostics/summary.json"),
         "rotation_pilot": _safe_load_json(OUTPUT_DIR / "rotation_pilot/summary.json"),
+        "basket_coverage": _safe_load_json(OUTPUT_DIR / "basket_coverage/summary.json"),
+        "dashboard_delivery": _safe_load_json(OUTPUT_DIR / "dashboard_publication/delivery.json"),
         "ic_incident": _safe_load_json(OUTPUT_DIR / "ic_incident/summary.json"),
         "score_evidence": _safe_load_json(OUTPUT_DIR / "score_evidence/status.json"),
         "forecast_audit": _safe_load_json(OUTPUT_DIR / "forecast_audit/summary.json"),

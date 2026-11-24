@@ -1,0 +1,10 @@
+[Unit]
+Description=xsec_alpha audit closed observations after the nightly price backup
+
+[Timer]
+OnCalendar=*-*-* 18:43:00 UTC
+Persistent=true
+Unit=xsec-basket-coverage.service
+
+[Install]
+WantedBy=timers.target
